@@ -29,12 +29,9 @@ def test_valid_dagger_full_suffix_boundary_count() -> None:
 def test_combined_invalid_dagger_annotation_accumulates_unique_codes() -> None:
     annotation = FinalAnnotation(start_subtask_index=1, boundaries=[5, 4, 301])
     issues = validate_annotation(annotation, "dagger_patch", 4, 300, 8)
-    assert {issue.code for issue in issues} == {
-        "boundary_order",
-        "boundary_range",
-        "segment_too_short",
-        "dagger_suffix_length",
-    }
+    codes = [issue.code for issue in issues]
+    assert codes == ["boundary_order", "boundary_range", "segment_too_short", "dagger_suffix_length"]
+    assert len(codes) == len(set(codes))
 
 
 @pytest.mark.parametrize(
@@ -92,3 +89,25 @@ def test_invalid_caller_arguments_raise_value_error(kwargs) -> None:
     args.update(kwargs)
     with pytest.raises(ValueError):
         validate_annotation(annotation, **args)
+
+
+@pytest.mark.parametrize("name", ["subtask_count", "episode_length", "min_segment_frames"])
+@pytest.mark.parametrize("value", [True, 1.5, "1"])
+def test_invalid_caller_argument_types_raise_value_error(name, value) -> None:
+    annotation = FinalAnnotation(start_subtask_index=0, boundaries=[])
+    args = {"mode": "complete", "subtask_count": 1, "episode_length": 10, "min_segment_frames": 1}
+    args[name] = value
+    with pytest.raises(ValueError):
+        validate_annotation(annotation, **args)
+
+
+@pytest.mark.parametrize("observed", [[0, True], [0, 1.5], [0, "1"]])
+def test_coarse_sequence_rejects_non_integer_observed_indices(observed) -> None:
+    assert coarse_sequence_is_legal(observed, "complete", 2) is False
+
+
+def test_dagger_out_of_range_start_has_no_negative_suffix_issue() -> None:
+    annotation = FinalAnnotation(start_subtask_index=4, boundaries=[])
+    issues = validate_annotation(annotation, "dagger_patch", 4, 100, 8)
+    assert [issue.code for issue in issues] == ["start_subtask_range"]
+    assert "-1" not in issues[0].message

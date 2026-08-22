@@ -7,12 +7,20 @@ from .models import FinalAnnotation, ValidationIssue
 Mode = Literal["complete", "dagger_patch"]
 
 
+def _valid_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
 def coarse_sequence_is_legal(observed: list[int], mode: Mode, subtask_count: int) -> bool:
     """Return whether a coarse model's observed sequence matches the run mode."""
     if mode not in ("complete", "dagger_patch"):
         raise ValueError(f"unsupported mode: {mode!r}")
-    if subtask_count < 1:
+    if not _valid_positive_int(subtask_count):
         raise ValueError("subtask_count must be >= 1")
+    if not isinstance(observed, list) or not all(
+        isinstance(index, int) and not isinstance(index, bool) for index in observed
+    ):
+        return False
     if mode == "complete":
         return observed == list(range(subtask_count))
     if not observed:
@@ -33,11 +41,11 @@ def validate_annotation(
     """Accumulate all deterministic validity issues in a final annotation."""
     if mode not in ("complete", "dagger_patch"):
         raise ValueError(f"unsupported mode: {mode!r}")
-    if subtask_count < 1:
+    if not _valid_positive_int(subtask_count):
         raise ValueError("subtask_count must be >= 1")
-    if episode_length < 1:
+    if not _valid_positive_int(episode_length):
         raise ValueError("episode_length must be >= 1")
-    if min_segment_frames < 1:
+    if not _valid_positive_int(min_segment_frames):
         raise ValueError("min_segment_frames must be >= 1")
 
     issues: list[ValidationIssue] = []
@@ -57,11 +65,6 @@ def validate_annotation(
             issues.append(ValidationIssue(code="complete_boundary_count", message=(
                 f"complete mode requires {subtask_count - 1} boundaries, got {len(boundaries)}"
             )))
-    elif len(boundaries) not in (0, subtask_count - start - 1):
-        issues.append(ValidationIssue(code="dagger_suffix_length", message=(
-            f"dagger_patch requires 0 or {subtask_count - start - 1} boundaries, got {len(boundaries)}"
-        )))
-
     if any(left >= right for left, right in zip(boundaries, boundaries[1:])):
         issues.append(ValidationIssue(code="boundary_order", message="boundaries must be strictly increasing"))
     if any(boundary <= 0 or boundary >= episode_length for boundary in boundaries):
@@ -73,5 +76,9 @@ def validate_annotation(
     if any(right - left < min_segment_frames for left, right in zip(points, points[1:])):
         issues.append(ValidationIssue(code="segment_too_short", message=(
             f"each consecutive segment must be at least {min_segment_frames} frames"
+        )))
+    if mode == "dagger_patch" and start < subtask_count and len(boundaries) not in (0, subtask_count - start - 1):
+        issues.append(ValidationIssue(code="dagger_suffix_length", message=(
+            f"dagger_patch requires 0 or {subtask_count - start - 1} boundaries, got {len(boundaries)}"
         )))
     return issues

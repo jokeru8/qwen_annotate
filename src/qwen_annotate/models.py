@@ -1,5 +1,7 @@
 """Immutable, strict data models exchanged by annotation stages."""
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -37,6 +39,17 @@ class FinalAnnotation(FrozenModel):
     boundaries: list[int]
 
 
+IssueCode = Literal[
+    "start_subtask_range",
+    "complete_start_index",
+    "complete_boundary_count",
+    "dagger_suffix_length",
+    "boundary_order",
+    "boundary_range",
+    "segment_too_short",
+]
+
+
 class ValidationIssue(FrozenModel):
-    code: str
+    code: IssueCode
     message: str
