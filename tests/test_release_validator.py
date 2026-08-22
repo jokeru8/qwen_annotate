@@ -115,3 +115,44 @@ def test_real_reference_dataset_is_accepted_read_only() -> None:
     report = validate_release(REFERENCE, services={"probe_video": probe, "extract_frames": extractor})
     assert report.valid and report.episode_count == 47 and report.mode == "complete"
     assert (REFERENCE / "meta/lerobot_annotations.json").stat().st_mtime_ns == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("source_root", "relative/source"),
+        ("source_root", "/different/source"),
+        ("work_dir", "relative/meta"),
+        ("work_dir", "/absolute/private_workspace"),
+        ("work_dir", "/absolute/private_workspace/meta"),
+    ],
+)
+def test_release_validator_checks_public_path_provenance(
+    tmp_path: Path, field: str, value: str,
+) -> None:
+    source, work, services = _fixture(tmp_path)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    annotation_path = output / "meta/lerobot_annotations.json"
+    annotations = json.loads(annotation_path.read_text())
+    annotations[field] = value
+    annotation_path.write_text(json.dumps(annotations))
+    with pytest.raises(ValueError):
+        validate_release(
+            output,
+            source=source,
+            services=services,
+            _expected_output_root=output,
+        )
+
+
+def test_expected_output_root_is_checked_during_staging_validation(tmp_path: Path) -> None:
+    _, work, services = _fixture(tmp_path)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    with pytest.raises(ValueError, match="work_dir"):
+        validate_release(
+            output,
+            services=services,
+            _expected_output_root=tmp_path / "other-release",
+        )

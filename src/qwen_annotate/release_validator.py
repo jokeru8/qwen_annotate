@@ -80,7 +80,13 @@ class _Services:
     extract_frames: Callable[..., list[Any]]
 
 
-def validate_release(path: Path, source: Path | None = None, *, services: Any = None) -> ReleaseReport:
+def validate_release(
+    path: Path,
+    source: Path | None = None,
+    *,
+    services: Any = None,
+    _expected_output_root: Path | None = None,
+) -> ReleaseReport:
     """Validate a converted release without consulting an annotation workspace."""
     root = _safe_root(path, "release")
     source_root = _safe_root(source, "source") if source is not None else None
@@ -176,6 +182,20 @@ def validate_release(path: Path, source: Path | None = None, *, services: Any = 
     _aware_utc(annotations["updated_at"], "updated_at")
     for field in ("source_root", "work_dir"):
         _string(annotations, field)
+    declared_source = Path(annotations["source_root"])
+    if not declared_source.is_absolute():
+        raise ValueError("annotation source_root must be an absolute path")
+    if source_root is not None and declared_source.resolve(strict=False) != source_root:
+        raise ValueError("annotation source_root does not match supplied source")
+    declared_work = Path(annotations["work_dir"])
+    if not declared_work.is_absolute() or declared_work.name != "meta":
+        raise ValueError("annotation work_dir must be an absolute path ending in meta")
+    if _expected_output_root is not None:
+        if not isinstance(_expected_output_root, Path):
+            raise TypeError("_expected_output_root must be a Path")
+        expected_work = _expected_output_root.resolve(strict=False) / "meta"
+        if declared_work.resolve(strict=False) != expected_work:
+            raise ValueError("annotation work_dir does not match expected output/meta")
     primary = _string(annotations, "primary_camera")
     if primary not in cameras:
         raise ValueError("primary camera is absent from features")

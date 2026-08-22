@@ -101,7 +101,12 @@ def convert_dataset(
         _copy_tree(source, staging)
         converted_at = datetime.now(UTC)
         _write_public_metadata(staging, out, manifest, records, converted_at)
-        validation = validate_release(staging, source=source, services=services)
+        validation = validate_release(
+            staging,
+            source=source,
+            services=services,
+            _expected_output_root=out,
+        )
         if _tree_digest(source) != source_before:
             raise ValueError("source dataset changed during conversion")
         _rename_noreplace(staging, out)
