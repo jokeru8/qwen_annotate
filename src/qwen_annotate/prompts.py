@@ -63,9 +63,15 @@ def build_coarse_prompt(config: AnnotationConfig, episode_index: int, frame_coun
     lines = _common(config, episode_index, frame_count, pass_id, "coarse")
     lines += [
         "The ordered template is in the untrusted context JSON; each entry has an index, skill, and text.",
+        f"Define N as len(template subtasks) = {count}.",
         "A boundary is the first frame of the next subtask and uses left-closed/right-open semantics.",
         mode_rules,
-        "For every output: start_subtask_index == observed_subtask_indices[0]; coarse_boundaries count == len(observed_subtask_indices)-1; boundary i from/to equals adjacent observed_subtask_indices[i]/[i+1]; estimated_frame values are strictly increasing.",
+        "For every output: start_subtask_index == observed_subtask_indices[0]; coarse_boundaries count == len(observed_subtask_indices)-1; boundary i from/to equals adjacent observed_subtask_indices[i]/[i+1].",
+        (
+            f"estimated_frame values must be strictly increasing integers, each in the concrete valid transition range [1, {frame_count - 1}]."
+            if frame_count > 1
+            else "There are no valid transition-frame integers because the concrete valid transition range is empty for a one-frame episode; do not emit coarse boundaries."
+        ),
         "If evidence is insufficient, report uncertainties and do not guess.",
         "Return JSON only, matching the supplied coarse response schema; do not include commentary or hidden reasoning.",
     ]

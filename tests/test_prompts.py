@@ -45,6 +45,23 @@ def test_complete_prompt_requires_full_sequence_and_boundaries():
     assert "boundaries consecutive" in prompt
 
 
+def test_coarse_prompt_defines_n_and_concrete_transition_frame_range():
+    prompt = build_coarse_prompt(
+        config("complete", [{"skill": "a", "text": "A"}, {"skill": "b", "text": "B"}]),
+        0,
+        5,
+        0,
+    )
+    assert "Define N as len(template subtasks) = 2." in prompt
+    assert "estimated_frame values must be strictly increasing integers" in prompt
+    assert "concrete valid transition range [1, 4]" in prompt
+
+
+def test_coarse_prompt_handles_one_frame_transition_range():
+    prompt = build_coarse_prompt(config(), 0, 1, 0)
+    assert "concrete valid transition range is empty for a one-frame episode" in prompt
+
+
 def test_template_escaping_preserves_unicode_and_quotes():
     prompt = build_coarse_prompt(config(subtasks=[{"skill": 'café "tool"', "text": "do \"this\""}]), 0, 2, 0)
     context_text = prompt.split("BEGIN_UNTRUSTED_CONTEXT_JSON\n", 1)[1].split("\nEND_UNTRUSTED_CONTEXT_JSON", 1)[0]
