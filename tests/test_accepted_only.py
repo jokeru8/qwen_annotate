@@ -219,7 +219,7 @@ def test_accepted_only_requires_at_least_one_approved_episode(tmp_path: Path) ->
 @pytest.mark.parametrize(
     "mutation",
     [
-        "missing_camera", "camera_shape", "camera_range", "nonfinite", "camera_count",
+        "missing_camera", "camera_shape", "camera_range", "camera_zero", "nonfinite", "camera_count",
         "numeric_count", "quantile_order", "episode_missing", "episode_shape", "episode_count",
     ],
 )
@@ -247,6 +247,9 @@ def test_release_validator_rejects_stats_corruption(tmp_path: Path, mutation: st
             stats["cam.eye"]["mean"] = [0.5, 0.5, 0.5]
         elif mutation == "camera_range":
             stats["cam.eye"]["min"] = [[[-1.0]], [[-1.0]], [[-1.0]]]
+        elif mutation == "camera_zero":
+            for metric in ("min", "max", "mean", "std", "q01", "q10", "q50", "q90", "q99"):
+                stats["cam.eye"][metric] = [[[0.0]], [[0.0]], [[0.0]]]
         elif mutation == "nonfinite":
             stats["cam.eye"]["mean"][0][0][0] = 1e999
         elif mutation == "camera_count":
@@ -257,6 +260,10 @@ def test_release_validator_rejects_stats_corruption(tmp_path: Path, mutation: st
             release_info.pop("data_files_size_in_mb")
             release_info.pop("video_files_size_in_mb")
             info_path.write_text(json.dumps(release_info))
+            annotation_path = output / "meta/lerobot_annotations.json"
+            release_annotations = json.loads(annotation_path.read_text())
+            release_annotations["work_dir"] = "/moved/generated/meta"
+            annotation_path.write_text(json.dumps(release_annotations))
         elif mutation == "numeric_count":
             stats["action"]["count"] = [999]
         else:
@@ -264,3 +271,22 @@ def test_release_validator_rejects_stats_corruption(tmp_path: Path, mutation: st
         stats_path.write_text(json.dumps(stats))
     with pytest.raises(ValueError, match="stat"):
         validate_release(output, services=services)
+
+
+def test_accepted_only_never_copies_unselected_payloads(monkeypatch, tmp_path: Path) -> None:
+    """Catches full-tree copying followed by deletion of rejected episode payloads."""
+    _, work, services = _mixed_workspace(tmp_path)
+    import qwen_annotate.converter as converter
+    real_copy = converter.shutil.copy2
+
+    def guarded_copy(source, destination, *args, **kwargs):
+        source_path = Path(source)
+        if source_path.name == "episode_000001.parquet" or (
+            source_path.name == "episode_000001.mp4" and source_path.parent.parent.parent.name == "videos"
+        ):
+            raise AssertionError("unselected payload was copied")
+        return real_copy(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(converter.shutil, "copy2", guarded_copy)
+    report = convert_dataset(work, tmp_path / "accepted", accepted_only=True, services=services)
+    assert report.episode_count == 2

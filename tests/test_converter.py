@@ -14,13 +14,16 @@ from qwen_annotate.config import AnnotationConfig
 from qwen_annotate.converter import ConversionReport, convert_dataset
 from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo, VideoProbe
 from qwen_annotate.models import FinalAnnotation
+from qwen_annotate.release_validator import validate_release
 from qwen_annotate.workspace import EpisodeRecord, WorkspaceStore
 
 
 NOW = datetime(2026, 8, 22, 12, tzinfo=UTC)
 
 
-def _fixture(tmp_path: Path, *, mode: str = "complete") -> tuple[Path, Path, dict]:
+def _fixture(
+    tmp_path: Path, *, mode: str = "complete", legacy_stats: bool = False,
+) -> tuple[Path, Path, dict]:
     source, work = tmp_path / "source", tmp_path / "work"
     (source / "meta").mkdir(parents=True)
     info = {
@@ -59,38 +62,23 @@ def _fixture(tmp_path: Path, *, mode: str = "complete") -> tuple[Path, Path, dic
         video.write_bytes((f"video-{i}").encode())
         episodes.append(EpisodeInfo(episode_index=i, length=length, task="Arrange.", parquet=parquet, videos={"cam.eye": video}))
     (source / "meta/episodes.jsonl").write_text("\n".join(rows) + "\n")
-    def feature_stats(low: float, high: float, count: int):
-        midpoint = (low + high) / 2
-        return {
-            "min": [low], "max": [high], "mean": [midpoint], "std": [0.0], "count": [count],
-            "q01": [low], "q10": [low], "q50": [midpoint], "q90": [high], "q99": [high],
-        }
-    aggregate_stats = {
-        "frame_index": feature_stats(0, 19, 40),
-        "episode_index": feature_stats(0, 1, 40),
-        "index": feature_stats(0, 39, 40),
-        "task_index": feature_stats(0, 0, 40),
-        "timestamp": feature_stats(0, 1.9, 40),
-        "cam.eye": {
-            # Historical LeRobot releases sampled pixels for image stats.
-            metric: ([24] if metric == "count" else [[[value]], [[value]], [[value]]])
-            for metric, value in {
-                "min": 0.0, "max": 1.0, "mean": 0.5, "std": 0.1,
-                "q01": 0.0, "q10": 0.1, "q50": 0.5, "q90": 0.9, "q99": 1.0,
-                "count": 0,
-            }.items()
-        },
-    }
+    from qwen_annotate.stats import recompute_stats
+    aggregate_stats = recompute_stats([episode.parquet for episode in episodes])
+    image_values = (
+        {"min": 0.0, "max": 1.0, "mean": 0.5, "std": 0.1,
+         "q01": 0.0, "q10": 0.1, "q50": 0.5, "q90": 0.9, "q99": 1.0}
+        if legacy_stats else
+        {"min": 0.0, "max": 50 / 255, "mean": 25 / 255, "std": 25 / 255,
+         "q01": 0.0, "q10": 0.0, "q50": 25 / 255, "q90": 50 / 255, "q99": 50 / 255}
+    )
+    aggregate_stats["cam.eye"] = {
+        metric: [[[value]], [[value]], [[value]]] for metric, value in image_values.items()
+    } | {"count": [24 if legacy_stats else 40 * 4 * 6]}
     (source / "meta/stats.json").write_text(json.dumps(aggregate_stats))
-    episode_stats = []
-    for i in range(2):
-        episode_stats.append({"episode_index": i, "stats": {
-            "frame_index": feature_stats(0, 19, 20),
-            "episode_index": feature_stats(i, i, 20),
-            "index": feature_stats(i * 20, i * 20 + 19, 20),
-            "task_index": feature_stats(0, 0, 20),
-            "timestamp": feature_stats(0, 1.9, 20),
-        }})
+    episode_stats = [
+        {"episode_index": i, "stats": recompute_stats([episode.parquet])}
+        for i, episode in enumerate(episodes)
+    ]
     (source / "meta/episodes_stats.jsonl").write_text(
         "\n".join(json.dumps(row) for row in episode_stats) + "\n"
     )
@@ -155,6 +143,20 @@ def test_full_conversion_preserves_payload_and_writes_reference_schema(tmp_path:
             {"start_frame": 10, "end_frame": 20, "action_text": "Place.", "skill": "place"},
         ]}},
     ]
+
+
+def test_full_conversion_preserves_legacy_stats_without_pixel_decode(tmp_path: Path) -> None:
+    source, work, services = _fixture(tmp_path, legacy_stats=True)
+    source_stats = (source / "meta/stats.json").read_bytes()
+    services["iter_video_rgb_frames"] = lambda path: (_ for _ in ()).throw(AssertionError("decoded pixels"))
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    assert (output / "meta/stats.json").read_bytes() == source_stats
+    with pytest.raises(ValueError, match="stats"):
+        validate_release(output, services=services)
+    assert validate_release(
+        output, source=source, services=services, allow_legacy_sampled_image_stats=True,
+    ).valid
 
 
 def test_dagger_serializes_explicit_start_including_singleton(tmp_path: Path) -> None:

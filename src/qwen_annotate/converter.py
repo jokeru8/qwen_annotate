@@ -130,7 +130,7 @@ def convert_dataset(
         source_before = _tree_digest(source)
         staging = out.parent / f"{out.name}.staging-{secrets.token_hex(16)}"
         os.mkdir(staging, 0o700)
-        _copy_tree(source, staging)
+        _copy_tree(source, staging, include_payload=not accepted_only)
         converted_at = datetime.now(UTC)
         if accepted_only:
             frame_count = _rewrite_accepted_subset(
@@ -138,7 +138,7 @@ def convert_dataset(
             )
         else:
             frame_count = manifest.total_frames
-            _rewrite_full_stats(staging, source, manifest, dataset, services)
+            _write_payload_sizes(staging)
             _write_public_metadata(staging, out, manifest, records, converted_at)
         validation = validate_release(
             staging,
@@ -146,6 +146,8 @@ def convert_dataset(
             services=services,
             _expected_output_root=out,
             _expected_stats_source=source,
+            allow_legacy_sampled_image_stats=not accepted_only,
+            deep_video_stats=accepted_only,
         )
         if _tree_digest(source) != source_before:
             raise ValueError("source dataset changed during conversion")
@@ -397,29 +399,6 @@ def _rewrite_accepted_subset(
     return offset
 
 
-def _rewrite_full_stats(
-    staging: Path,
-    source: Path,
-    manifest: RunManifest,
-    dataset: DatasetIndex,
-    services: Any,
-) -> None:
-    info = _read_source_json(staging / "meta/info.json")
-    episodes = sorted(dataset.episodes, key=lambda episode: episode.episode_index)
-    parquets = [episode.parquet for episode in episodes]
-    videos = {
-        camera: [episode.videos[camera] for episode in episodes]
-        for camera in manifest.camera_keys
-    }
-    lengths = [episode.length for episode in episodes]
-    aggregate, per_episode = _compute_release_stats(
-        info, parquets, videos, lengths, manifest.camera_keys, services,
-    )
-    _check_source_stats_keys(source, aggregate)
-    _atomic_json(staging / "meta/stats.json", aggregate, sort_keys=False)
-    _atomic_jsonl(staging / "meta/episodes_stats.jsonl", per_episode)
-
-
 def _compute_release_stats(
     info: dict[str, Any],
     parquets: list[Path],
@@ -459,11 +438,13 @@ def _check_source_stats_keys(source: Path, aggregate: dict[str, Any]) -> None:
             raise ValueError("source stats keys differ from declared selected feature coverage")
 
 
-def _copy_tree(source: Path, staging: Path) -> None:
+def _copy_tree(source: Path, staging: Path, *, include_payload: bool) -> None:
     source_stat = source.stat(follow_symlinks=False)
     for current, dirs, files in os.walk(source, topdown=True, followlinks=False):
         current_path = Path(current)
         relative = current_path.relative_to(source)
+        if relative == Path(".") and not include_payload:
+            dirs[:] = [name for name in dirs if name not in {"data", "videos"}]
         destination = staging / relative
         for directory in dirs:
             src = current_path / directory
@@ -491,10 +472,21 @@ def _copy_tree(source: Path, staging: Path) -> None:
 
 
 def _clear_payload_directory(path: Path, staging: Path) -> None:
-    if path.parent != staging or path.name not in {"data", "videos"} or path.is_symlink() or not path.is_dir():
+    if path.parent != staging or path.name not in {"data", "videos"} or path.is_symlink():
         raise ValueError("copied payload directory is unsafe")
-    shutil.rmtree(path)
+    if path.exists():
+        if not path.is_dir():
+            raise ValueError("copied payload directory is unsafe")
+        shutil.rmtree(path)
     path.mkdir()
+
+
+def _write_payload_sizes(staging: Path) -> None:
+    info_path = staging / "meta/info.json"
+    info = _read_source_json(info_path)
+    info["data_files_size_in_mb"] = _payload_size_mb(staging / "data", ".parquet")
+    info["video_files_size_in_mb"] = _payload_size_mb(staging / "videos", ".mp4")
+    _atomic_json(info_path, info)
 
 
 def _render_payload_path(

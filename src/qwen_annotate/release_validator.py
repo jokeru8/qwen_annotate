@@ -21,6 +21,7 @@ from .config import Subtask
 from .constraints import validate_annotation
 from .lerobot import VideoProbe, probe_video, video_fps_matches
 from .models import FinalAnnotation
+from .stats import iter_video_rgb_frames, recompute_stats, recompute_video_stats
 from .video import extract_frames
 
 
@@ -79,6 +80,7 @@ class ReleaseReport(_Report):
 class _Services:
     probe_video: Callable[[Path], VideoProbe]
     extract_frames: Callable[..., list[Any]]
+    iter_video_rgb_frames: Callable[[Path], Any]
 
 
 def validate_release(
@@ -88,8 +90,12 @@ def validate_release(
     services: Any = None,
     _expected_output_root: Path | None = None,
     _expected_stats_source: Path | None = None,
+    allow_legacy_sampled_image_stats: bool = False,
+    deep_video_stats: bool = True,
 ) -> ReleaseReport:
     """Validate a converted release without consulting an annotation workspace."""
+    if type(allow_legacy_sampled_image_stats) is not bool or type(deep_video_stats) is not bool:
+        raise TypeError("statistics validation options must be bools")
     root = _safe_root(path, "release")
     source_root = _safe_root(source, "source") if source is not None else None
     stats_source = _safe_root(_expected_stats_source, "stats source") if _expected_stats_source is not None else source_root
@@ -148,6 +154,7 @@ def validate_release(
     instructions: list[str] = []
     expected_payload: set[str] = set()
     schemas: list[pa.Schema] = []
+    parquet_paths: list[Path] = []
     video_paths: dict[tuple[int, str], Path] = {}
     global_offset = 0
     for expected, row in enumerate(episode_rows):
@@ -166,6 +173,7 @@ def validate_release(
         expected_payload.add(parquet_rel.as_posix())
         schema = _validate_parquet(parquet, expected, length, global_offset, expected_task_index, fps, features)
         schemas.append(schema)
+        parquet_paths.append(parquet)
         for camera in cameras:
             video_rel = _render(video_template, values | {"video_key": camera}, "video_path")
             video = _regular_under(root, video_rel)
@@ -206,13 +214,9 @@ def validate_release(
         expected_work = _expected_output_root.resolve(strict=False) / "meta"
         if declared_work.resolve(strict=False) != expected_work:
             raise ValueError("annotation work_dir does not match expected output/meta")
-    generated_release = (
-        _expected_output_root is not None
-        or declared_work.resolve(strict=False) == root / "meta"
-    )
     _validate_optional_metadata(
         root, total_episodes, total_frames, lengths, features, cameras, stats_source,
-        strict_image_counts=generated_release,
+        parquet_paths, video_paths, svc, allow_legacy_sampled_image_stats, deep_video_stats,
     )
     primary = _string(annotations, "primary_camera")
     if primary not in cameras:
@@ -292,12 +296,14 @@ def validate_release(
 
 def _services(value: Any) -> _Services:
     if value is None:
-        return _Services(probe_video, extract_frames)
+        return _Services(probe_video, extract_frames, iter_video_rgb_frames)
     getter = value.get if isinstance(value, dict) else lambda name, default: getattr(value, name, default)
-    probe, extractor = getter("probe_video", probe_video), getter("extract_frames", extract_frames)
-    if not callable(probe) or not callable(extractor):
+    probe = getter("probe_video", probe_video)
+    extractor = getter("extract_frames", extract_frames)
+    frame_iterator = getter("iter_video_rgb_frames", iter_video_rgb_frames)
+    if not callable(probe) or not callable(extractor) or not callable(frame_iterator):
         raise TypeError("release services must be callable")
-    return _Services(probe, extractor)
+    return _Services(probe, extractor, frame_iterator)
 
 
 def _safe_root(path: Path | None, label: str) -> Path:
@@ -580,8 +586,11 @@ def _validate_optional_metadata(
     features: dict[str, Any],
     cameras: list[str],
     stats_source: Path | None,
-    *,
-    strict_image_counts: bool,
+    parquet_paths: list[Path],
+    video_paths: dict[tuple[int, str], Path],
+    services: _Services,
+    allow_legacy_sampled_image_stats: bool,
+    deep_video_stats: bool,
 ) -> None:
     aggregate_path = root / "meta/stats.json"
     episode_path = root / "meta/episodes_stats.jsonl"
@@ -617,7 +626,7 @@ def _validate_optional_metadata(
         shape = declared.get("shape") if isinstance(declared, dict) else None
         if not isinstance(shape, list) or len(shape) != 3 or shape[-1] != 3:
             raise ValueError(f"stats camera shape metadata is invalid: {camera}")
-        expected_pixels = total_frames * shape[0] * shape[1] if strict_image_counts else None
+        expected_pixels = None if allow_legacy_sampled_image_stats else total_frames * shape[0] * shape[1]
         _validate_feature_stats(
             aggregate[camera], 3, expected_pixels, image=True, context=f"stats {camera}",
         )
@@ -636,6 +645,83 @@ def _validate_optional_metadata(
                 stats[feature], width, lengths[index], image=False,
                 context=f"episode stats {index}/{feature}",
             )
+
+    recomputed = recompute_stats(parquet_paths)
+    metrics = {"min", "max", "mean", "std", "count"} if allow_legacy_sampled_image_stats else _STAT_METRICS
+    for feature in numeric:
+        _compare_feature_stats(
+            aggregate[feature], recomputed[feature], metrics, f"stats {feature}",
+            legacy_tolerance=allow_legacy_sampled_image_stats,
+        )
+    for index, parquet in enumerate(parquet_paths):
+        actual = recompute_stats([parquet])
+        for feature in numeric:
+            _compare_feature_stats(
+                rows[index]["stats"][feature], actual[feature], metrics, f"episode stats {index}/{feature}",
+                legacy_tolerance=allow_legacy_sampled_image_stats,
+            )
+
+    if allow_legacy_sampled_image_stats:
+        if stats_source is not None:
+            source_rows = _read_jsonl(stats_source / "meta/episodes_stats.jsonl")
+            if aggregate != _read_object(stats_source / "meta/stats.json") or rows != source_rows:
+                raise ValueError("legacy release stats must exactly preserve source statistics")
+    elif deep_video_stats:
+        frame_iterator = services.iter_video_rgb_frames
+        for camera in cameras:
+            shape = features[camera]["shape"]
+            paths = [video_paths[(index, camera)] for index in range(episode_count)]
+            actual = recompute_video_stats(paths, lengths, shape, frame_iterator=frame_iterator)
+            _compare_feature_stats(aggregate[camera], actual, _STAT_METRICS, f"stats {camera}")
+
+    _validate_payload_sizes(root, allow_legacy_sampled_image_stats)
+
+
+def _compare_feature_stats(
+    published: dict[str, Any],
+    actual: dict[str, Any],
+    metrics: set[str],
+    context: str,
+    *,
+    legacy_tolerance: bool = False,
+) -> None:
+    for metric in metrics:
+        left = _flatten_numbers(published[metric])
+        right = _flatten_numbers(actual[metric])
+        if len(left) != len(right):
+            raise ValueError(f"{context} recomputed stats shape mismatch")
+        tolerance = (1e-4 if legacy_tolerance else 5e-8) if metric in {"mean", "std"} else 1e-8
+        if any(abs(a - b) > tolerance * max(1.0, abs(b)) for a, b in zip(left, right, strict=True)):
+            raise ValueError(f"{context} differs from recomputed stats")
+
+
+def _flatten_numbers(value: Any) -> list[float]:
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            result.extend(_flatten_numbers(item))
+        return result
+    return [float(value)]
+
+
+def _validate_payload_sizes(root: Path, allow_legacy: bool) -> None:
+    info = _read_object(root / "meta/info.json")
+    fields = ("data_files_size_in_mb", "video_files_size_in_mb")
+    present = [field in info for field in fields]
+    if not all(present):
+        if allow_legacy and not any(present):
+            return
+        raise ValueError("payload size metadata is required")
+    for field, directory, suffix in (
+        (fields[0], root / "data", ".parquet"),
+        (fields[1], root / "videos", ".mp4"),
+    ):
+        declared = info[field]
+        if isinstance(declared, bool) or not isinstance(declared, (int, float)) or not math.isfinite(declared) or declared < 0:
+            raise ValueError(f"{field} must be finite and nonnegative")
+        actual = sum(path.stat(follow_symlinks=False).st_size for path in directory.rglob(f"*{suffix}")) / (2**20)
+        if abs(float(declared) - actual) > max(1e-9, actual * 1e-6):
+            raise ValueError(f"{field} differs from actual payload size")
 
 
 def _validate_feature_stats(

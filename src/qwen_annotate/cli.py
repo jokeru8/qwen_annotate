@@ -136,9 +136,19 @@ def convert_command(
 
 
 @app.command("validate")
-def validate_command(path: Path, source: Path | None = typer.Option(None, "--source")) -> None:
+def validate_command(
+    path: Path,
+    source: Path | None = typer.Option(None, "--source"),
+    allow_legacy_sampled_image_stats: bool = typer.Option(False, "--allow-legacy-sampled-image-stats"),
+    deep_video_stats: bool = typer.Option(True, "--deep-video-stats/--no-deep-video-stats"),
+) -> None:
     try:
-        report = validate_release(path, source=source)
+        report = validate_release(
+            path,
+            source=source,
+            allow_legacy_sampled_image_stats=allow_legacy_sampled_image_stats,
+            deep_video_stats=deep_video_stats,
+        )
     except Exception:
         typer.echo("Release validation failed.", err=True)
         raise typer.Exit(1)

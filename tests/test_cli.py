@@ -33,9 +33,18 @@ def test_convert_and_validate_cli_delegate_and_map_failures(monkeypatch, tmp_pat
     monkeypatch.setattr("qwen_annotate.cli.convert_dataset", lambda work, output, accepted_only=False: calls.append((work, output, accepted_only)) or report)
     converted = runner.invoke(app, ["convert", str(tmp_path / "work"), "--output", str(tmp_path / "out"), "--accepted-only"])
     assert converted.exit_code == 0 and "episodes=2" in converted.stdout and calls
-    monkeypatch.setattr("qwen_annotate.cli.validate_release", lambda path, source=None: report)
-    validated = runner.invoke(app, ["validate", str(tmp_path / "out"), "--source", str(tmp_path / "source")])
+    validate_calls = []
+    monkeypatch.setattr(
+        "qwen_annotate.cli.validate_release",
+        lambda path, source=None, allow_legacy_sampled_image_stats=False, deep_video_stats=True:
+            validate_calls.append((path, source, allow_legacy_sampled_image_stats, deep_video_stats)) or report,
+    )
+    validated = runner.invoke(app, [
+        "validate", str(tmp_path / "out"), "--source", str(tmp_path / "source"),
+        "--allow-legacy-sampled-image-stats", "--no-deep-video-stats",
+    ])
     assert validated.exit_code == 0 and "valid" in validated.stdout.lower()
+    assert validate_calls == [(tmp_path / "out", tmp_path / "source", True, False)]
     monkeypatch.setattr("qwen_annotate.cli.validate_release", lambda *a, **k: (_ for _ in ()).throw(ValueError("secret details")))
     failed = runner.invoke(app, ["validate", str(tmp_path / "out")])
     assert failed.exit_code == 1 and "secret details" not in failed.output and "Traceback" not in failed.output

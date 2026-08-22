@@ -7,7 +7,7 @@ import pytest
 
 import numpy as np
 
-from qwen_annotate.stats import recompute_stats, recompute_video_stats
+from qwen_annotate.stats import iter_video_rgb_frames, recompute_stats, recompute_video_stats
 
 
 def test_recompute_stats_preserves_scalar_and_fixed_list_shapes(tmp_path: Path) -> None:
@@ -106,3 +106,47 @@ def test_recompute_video_stats_checks_shape_and_frame_count(tmp_path: Path) -> N
             [path], [1], [2, 1, 3],
             frame_iterator=lambda _: iter([np.zeros((1, 1, 3), dtype=np.uint8)]),
         )
+
+
+def test_real_video_iterator_closes_container_when_consumer_stops_early(monkeypatch, tmp_path: Path) -> None:
+    """Catches leaking a decoder when deep validation exits before consuming every frame."""
+    av = pytest.importorskip("av")
+    path = tmp_path / "tiny.mp4"
+    try:
+        container = av.open(str(path), mode="w")
+        stream = container.add_stream("mpeg4", rate=2)
+        stream.width = 4
+        stream.height = 4
+        stream.pix_fmt = "yuv420p"
+        for value in (0, 80):
+            frame = av.VideoFrame.from_ndarray(np.full((4, 4, 3), value, dtype=np.uint8), format="rgb24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+        container.close()
+    except Exception as exc:
+        pytest.skip(f"mpeg4 encoder unavailable: {exc}")
+
+    real_open = av.open
+    wrappers = []
+    class TrackedContainer:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.closed = False
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+        def close(self):
+            self.closed = True
+            self.wrapped.close()
+    def tracked_open(*args, **kwargs):
+        wrapper = TrackedContainer(real_open(*args, **kwargs))
+        wrappers.append(wrapper)
+        return wrapper
+    monkeypatch.setattr(av, "open", tracked_open)
+
+    frames = iter_video_rgb_frames(path)
+    first = next(frames)
+    assert first.shape == (4, 4, 3) and first.dtype == np.uint8
+    frames.close()
+    assert wrappers and wrappers[0].closed

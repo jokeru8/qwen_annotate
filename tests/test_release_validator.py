@@ -136,7 +136,13 @@ def test_real_reference_dataset_is_accepted_read_only() -> None:
         return VideoProbe(frames=lengths[episode], fps=28, width=960, height=744)
 
     extractor = lambda path, camera, indices, fps: [type("S", (), {"frame_index": n, "camera_key": camera})() for n in indices]
-    report = validate_release(REFERENCE, services={"probe_video": probe, "extract_frames": extractor})
+    with pytest.raises(ValueError, match="stats"):
+        validate_release(REFERENCE, services={"probe_video": probe, "extract_frames": extractor})
+    report = validate_release(
+        REFERENCE,
+        services={"probe_video": probe, "extract_frames": extractor},
+        allow_legacy_sampled_image_stats=True,
+    )
     assert report.valid and report.episode_count == 47 and report.mode == "complete"
     assert (REFERENCE / "meta/lerobot_annotations.json").stat().st_mtime_ns == before
 
@@ -224,3 +230,33 @@ def test_release_video_fps_uses_import_tolerance(
     else:
         with pytest.raises(ValueError, match="video metadata mismatch"):
             validate_release(output, services=adjusted)
+
+
+def test_release_validator_recomputes_numeric_stats_instead_of_trusting_ordered_values(tmp_path: Path) -> None:
+    """Catches fabricated but structurally valid zero statistics."""
+    _, work, services = _fixture(tmp_path)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    path = output / "meta/stats.json"
+    stats = json.loads(path.read_text())
+    for metric in ("min", "max", "mean", "std", "q01", "q10", "q50", "q90", "q99"):
+        stats["index"][metric] = [0.0]
+    path.write_text(json.dumps(stats))
+    with pytest.raises(ValueError, match="stats"):
+        validate_release(output, services=services)
+
+
+@pytest.mark.parametrize("mutation", ["remove", "inflate"])
+def test_generated_release_requires_exact_payload_size_metadata(tmp_path: Path, mutation: str) -> None:
+    _, work, services = _fixture(tmp_path)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    path = output / "meta/info.json"
+    info = json.loads(path.read_text())
+    if mutation == "remove":
+        info.pop("data_files_size_in_mb")
+    else:
+        info["video_files_size_in_mb"] = 999999
+    path.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match="size"):
+        validate_release(output, services=services, allow_legacy_sampled_image_stats=True)
