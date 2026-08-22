@@ -1,21 +1,30 @@
 """Read-only inspection of LeRobot v2.1 datasets."""
 
 import json
+import math
 from collections.abc import Callable
 from pathlib import Path
+from string import Formatter
 from typing import Any
 
 import pyarrow.parquet as pq
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from qwen_annotate.config import AnnotationConfig
 
 
 class VideoProbe(BaseModel):
-    frames: int
-    fps: float
-    width: int
-    height: int
+    frames: int = Field(ge=0)
+    fps: float = Field(gt=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+
+    @field_validator("fps")
+    @classmethod
+    def fps_must_be_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("fps must be finite")
+        return value
 
 
 class EpisodeInfo(BaseModel):
@@ -29,9 +38,16 @@ class EpisodeInfo(BaseModel):
 class DatasetIndex(BaseModel):
     root: Path
     version: str
-    fps: float
+    fps: float = Field(gt=0)
     camera_keys: list[str]
     episodes: list[EpisodeInfo]
+
+    @field_validator("fps")
+    @classmethod
+    def fps_must_be_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("fps must be finite")
+        return value
 
 
 def probe_video(path: Path) -> VideoProbe:
@@ -49,18 +65,24 @@ def probe_video(path: Path) -> VideoProbe:
         stream = next((item for item in container.streams if item.type == "video"), None)
         if stream is None:
             raise ValueError(f"Video {path} has no video stream")
-        if stream.average_rate is None or float(stream.average_rate) <= 0:
+        if stream.average_rate is None:
+            raise ValueError(f"Video {path} has invalid fps")
+        try:
+            fps = float(stream.average_rate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Video {path} has invalid fps") from exc
+        if not math.isfinite(fps) or fps <= 0:
             raise ValueError(f"Video {path} has invalid fps")
         if stream.width <= 0 or stream.height <= 0:
             raise ValueError(f"Video {path} has invalid dimensions")
         frames = stream.frames
-        if frames <= 0:
+        if type(frames) is not int or frames <= 0:
             frames = sum(1 for _ in container.decode(stream))
         if frames <= 0:
             raise ValueError(f"Video {path} has no frames")
         return VideoProbe(
             frames=frames,
-            fps=float(stream.average_rate),
+            fps=fps,
             width=stream.width,
             height=stream.height,
         )
@@ -73,7 +95,7 @@ def inspect_dataset(
     probe: Callable[[Path], VideoProbe] = probe_video,
 ) -> DatasetIndex:
     """Validate and index a local LeRobot v2.1 dataset without writing to it."""
-    root = config.source
+    root = config.source.resolve()
     info = _read_json_object(root / "meta" / "info.json")
     version = _required_string(info, "codebase_version", "info.json")
     if version != "v2.1":
@@ -85,39 +107,60 @@ def inspect_dataset(
     expected_total_frames = _nonnegative_int(info, "total_frames", "info.json")
     data_path_format = _required_string(info, "data_path", "info.json")
     video_path_format = _required_string(info, "video_path", "info.json")
+    _validate_path_template(data_path_format, "data_path", {"episode_index"})
+    _validate_path_template(video_path_format, "video_path", {"episode_index", "video_key"})
     camera_keys = _camera_keys(info)
     _require_configured_cameras(config, camera_keys)
     task_texts = _task_texts(root / "meta" / "tasks.jsonl")
+    total_tasks = _nonnegative_int(info, "total_tasks", "info.json")
+    if len(task_texts) != total_tasks:
+        raise ValueError(f"info.total_tasks is {total_tasks}, but tasks.jsonl has {len(task_texts)} rows")
     episode_rows = _read_jsonl(root / "meta" / "episodes.jsonl")
 
     if len(episode_rows) != total_episodes:
         raise ValueError(
             f"info.total_episodes is {total_episodes}, but episodes.jsonl has {len(episode_rows)} rows"
         )
+    total_chunks = _nonnegative_int(info, "total_chunks", "info.json")
+    expected_chunks = (total_episodes + chunks_size - 1) // chunks_size
+    if total_chunks != expected_chunks:
+        raise ValueError(f"info.total_chunks is {total_chunks}, expected {expected_chunks}")
 
     episodes: list[EpisodeInfo] = []
     total_frames = 0
+    seen_parquets: set[Path] = set()
+    seen_videos: set[Path] = set()
     for expected_index, row in enumerate(episode_rows):
         episode_index = _required_int(row, "episode_index", f"episodes.jsonl row {expected_index}")
         if episode_index != expected_index:
             raise ValueError("Episode indices must be contiguous from 0 through N-1")
         length = _positive_int(row, "length", f"episodes.jsonl row {expected_index}")
-        task = _episode_task(row, expected_index)
-        if task not in task_texts:
-            raise ValueError(
-                f"Episode {episode_index} references task {task!r}, absent from meta/tasks.jsonl"
-            )
+        episode_tasks = _episode_tasks(row, expected_index)
+        for task in episode_tasks:
+            if task not in task_texts.values():
+                raise ValueError(
+                    f"Episode {episode_index} references task {task!r}, absent from meta/tasks.jsonl"
+                )
+        task = episode_tasks[0]
         values = {
             "episode_chunk": episode_index // chunks_size,
             "episode_index": episode_index,
         }
-        parquet = root / _format_path(data_path_format, values, "data_path")
+        parquet = _resolve_dataset_path(root, _format_path(data_path_format, values, "data_path"), "data_path")
+        if parquet in seen_parquets:
+            raise ValueError(f"data_path resolves duplicate parquet path: {parquet}")
+        seen_parquets.add(parquet)
         _verify_parquet_rows(parquet, length, episode_index)
         videos: dict[str, Path] = {}
         for video_key in camera_keys:
-            video = root / _format_path(
-                video_path_format, values | {"video_key": video_key}, "video_path"
+            video = _resolve_dataset_path(
+                root,
+                _format_path(video_path_format, values | {"video_key": video_key}, "video_path"),
+                "video_path",
             )
+            if video in seen_videos:
+                raise ValueError(f"video_path resolves duplicate video path: {video}")
+            seen_videos.add(video)
             if not video.is_file():
                 raise FileNotFoundError(f"Missing video for episode {episode_index}: {video}")
             video_probe = probe(video)
@@ -167,8 +210,8 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"Missing required metadata file: {path}")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"Malformed JSON in {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"Malformed JSON in {path}: expected an object")
@@ -187,8 +230,8 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         if not line.strip():
             raise ValueError(f"Malformed JSONL in {path}: blank line {line_number}")
         try:
-            value = json.loads(line)
-        except json.JSONDecodeError as exc:
+            value = json.loads(line, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"Malformed JSONL in {path} line {line_number}: {exc}") from exc
         if not isinstance(value, dict):
             raise ValueError(f"Malformed JSONL in {path} line {line_number}: expected object")
@@ -216,30 +259,39 @@ def _require_configured_cameras(config: AnnotationConfig, camera_keys: list[str]
             raise ValueError(f"Configured camera {camera!r} is not a video feature in info.json")
 
 
-def _task_texts(path: Path) -> set[str]:
-    tasks: set[str] = set()
+def _task_texts(path: Path) -> dict[int, str]:
+    tasks: dict[int, str] = {}
     for row_number, row in enumerate(_read_jsonl(path), start=1):
-        tasks.add(_required_string(row, "task", f"tasks.jsonl row {row_number}"))
+        task_index = _nonnegative_int(row, "task_index", f"tasks.jsonl row {row_number}")
+        if task_index in tasks:
+            raise ValueError(f"tasks.jsonl has duplicate task_index {task_index}")
+        tasks[task_index] = _required_string(row, "task", f"tasks.jsonl row {row_number}")
+    if set(tasks) != set(range(len(tasks))):
+        raise ValueError("tasks.jsonl task_index values must be contiguous from 0 through N-1")
     return tasks
 
 
-def _episode_task(row: dict[str, Any], row_number: int) -> str:
+def _episode_tasks(row: dict[str, Any], row_number: int) -> list[str]:
     tasks = row.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         raise ValueError(f"episodes.jsonl row {row_number}: tasks must be a nonempty list")
-    task = tasks[0]
-    if not isinstance(task, str) or not task:
-        raise ValueError(f"episodes.jsonl row {row_number}: first task must be a nonempty string")
-    return task
+    if any(not isinstance(task, str) or not task for task in tasks):
+        raise ValueError(f"episodes.jsonl row {row_number}: tasks must contain nonempty strings")
+    return tasks
 
 
 def _verify_parquet_rows(path: Path, length: int, episode_index: int) -> None:
     if not path.is_file():
         raise FileNotFoundError(f"Missing parquet for episode {episode_index}: {path}")
+    parquet_file: pq.ParquetFile | None = None
     try:
-        row_count = pq.ParquetFile(path).metadata.num_rows
+        parquet_file = pq.ParquetFile(path)
+        row_count = parquet_file.metadata.num_rows
     except Exception as exc:
         raise ValueError(f"Unable to read parquet metadata for episode {episode_index}: {path}") from exc
+    finally:
+        if parquet_file is not None:
+            parquet_file.close()
     if row_count != length:
         raise ValueError(
             f"Parquet row count for episode {episode_index} is {row_count}, expected {length}"
@@ -249,8 +301,45 @@ def _verify_parquet_rows(path: Path, length: int, episode_index: int) -> None:
 def _format_path(template: str, values: dict[str, Any], field: str) -> Path:
     try:
         return Path(template.format(**values))
-    except (KeyError, ValueError, IndexError) as exc:
+    except Exception as exc:
         raise ValueError(f"Malformed {field} format in info.json: {exc}") from exc
+
+
+def _validate_path_template(template: str, field: str, required_fields: set[str]) -> None:
+    try:
+        parsed = list(Formatter().parse(template))
+    except ValueError as exc:
+        raise ValueError(f"Malformed {field} format in info.json: {exc}") from exc
+    fields: set[str] = set()
+    allowed_fields = {"episode_chunk", "episode_index", "video_key"}
+    for _, field_name, format_spec, _ in parsed:
+        if field_name is None:
+            continue
+        if field_name not in allowed_fields:
+            raise ValueError(f"Malformed {field} format in info.json: unsupported field {field_name!r}")
+        if "{" in format_spec or "}" in format_spec:
+            raise ValueError(f"Malformed {field} format in info.json: nested format fields are not allowed")
+        fields.add(field_name)
+    missing = required_fields - fields
+    if missing:
+        raise ValueError(
+            f"Malformed {field} format in info.json: missing required field(s) {sorted(missing)}"
+        )
+
+
+def _resolve_dataset_path(root: Path, formatted: Path, field: str) -> Path:
+    if formatted.is_absolute():
+        raise ValueError(f"Malformed {field} format in info.json: absolute paths are not allowed")
+    target = (root / formatted).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"Malformed {field} format in info.json: path escapes dataset root") from exc
+    return target
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON number {value!r} is not allowed")
 
 
 def _required_string(value: dict[str, Any], key: str, context: str) -> str:
@@ -283,6 +372,6 @@ def _nonnegative_int(value: dict[str, Any], key: str, context: str) -> int:
 
 def _positive_number(value: dict[str, Any], key: str, context: str) -> float:
     item = value.get(key)
-    if type(item) not in (int, float) or item <= 0:
+    if type(item) not in (int, float) or not math.isfinite(item) or item <= 0:
         raise ValueError(f"Malformed {context}: {key} must be positive")
     return float(item)
