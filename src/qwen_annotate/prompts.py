@@ -115,6 +115,28 @@ def build_coarse_prompt(config: AnnotationConfig, episode_index: int, frame_coun
     return "\n".join(lines)
 
 
+def _refine_instruction_lines(
+    from_subtask_index: int,
+    to_subtask_index: int,
+    coarse_frame: int,
+    frame_count: int,
+) -> tuple[str, ...]:
+    """Return the single ordered source of refine-stage trusted instructions."""
+    return (
+        f"Refine exactly one consecutive pair: from_subtask_index={from_subtask_index}, to_subtask_index={to_subtask_index}.",
+        "The exact skill/text for both entries is in the untrusted context JSON; use those values without rewriting them.",
+        f"The coarse center frame is {coarse_frame}; inspect visible cues around it.",
+        "BEGIN_REFINE_ONSET_POLICY",
+        _REFINE_ONSET_POLICY,
+        "END_REFINE_ONSET_POLICY",
+        "Return last_frame_before, first_frame_after, and boundary_frame for this transition only.",
+        f"Require from_subtask_index == {from_subtask_index} and to_subtask_index == {to_subtask_index}. Frame values must be in range [0, {frame_count - 1}].",
+        "Require last_frame_before + 1 == first_frame_after == boundary_frame; these are adjacent original episode frames, not merely sampled evidence frames.",
+        "Use visible_cues only, report uncertainty through confidence, and identify no other transition.",
+        "Return JSON only, matching the supplied refine response schema; do not include commentary or hidden reasoning.",
+    )
+
+
 def build_refine_prompt(
     config: AnnotationConfig,
     episode_index: int,
@@ -140,19 +162,7 @@ def build_refine_prompt(
     if not 0 <= coarse_frame < frame_count:
         raise ValueError("coarse_frame must be within the episode")
     lines = _common(config, episode_index, frame_count, pass_id, "refine")
-    lines += [
-        f"Refine exactly one consecutive pair: from_subtask_index={from_subtask_index}, to_subtask_index={to_subtask_index}.",
-        "The exact skill/text for both entries is in the untrusted context JSON; use those values without rewriting them.",
-        f"The coarse center frame is {coarse_frame}; inspect visible cues around it.",
-        "BEGIN_REFINE_ONSET_POLICY",
-        _REFINE_ONSET_POLICY,
-        "END_REFINE_ONSET_POLICY",
-        "Return last_frame_before, first_frame_after, and boundary_frame for this transition only.",
-        f"Require from_subtask_index == {from_subtask_index} and to_subtask_index == {to_subtask_index}. Frame values must be in range [0, {frame_count - 1}].",
-        "Require last_frame_before + 1 == first_frame_after == boundary_frame; these are adjacent original episode frames, not merely sampled evidence frames.",
-        "Use visible_cues only, report uncertainty through confidence, and identify no other transition.",
-        "Return JSON only, matching the supplied refine response schema; do not include commentary or hidden reasoning.",
-    ]
+    lines += _refine_instruction_lines(from_subtask_index, to_subtask_index, coarse_frame, frame_count)
     return "\n".join(lines)
 
 

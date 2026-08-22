@@ -19,10 +19,10 @@ uv run qwen-annotate inspect examples/complete.yaml
 2026-08-22 的只读预检结果如下，不能视为模型 smoke 结果：
 
 - 机器可见 8 张 NVIDIA H20，每张总显存 97,871 MiB；检查时每张约有 97,284 MiB 空闲。
-- `/mnt/data/user/zhoukr/envs/vllm` 中安装的 vLLM package 版本为 `0.27.1`；`vllm --version` 在 10 秒预检超时内未返回，因此启动前仍需现场确认 CLI 可用。
+- `/mnt/data/user/zhoukr/envs/vllm` 中安装并实际用于探索性运行的 vLLM 版本为 `0.27.1`；最初 `vllm --version` 的 10 秒预检曾超时，后续 serving 运行已确认引擎可用。
 - 后续已在精确目标目录 `/mnt/data/user/zhoukr/models/Qwen3.8-27B` 完成校验，`model-install.json` 记录固定 revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`。
 - 本机存在 `/mnt/data/user/zhoukr/models/Qwen3.8-27B-FP8`，但它不是本项目要求的精确 repo/path，不能替代经过本 CLI 固定 revision 并验证的安装。
-- 已得到 5 episode 的真实 partial 失败基线（见第 8 节）；47 episode golden benchmark 和并发 1/2/4 吞吐测试仍未执行。本文不填写未实测的延迟、显存或吞吐数值。
+- 已得到 5 episode 的真实 partial 失败基线（见第 8 节），并探索过单引擎并发 2/4；47 episode golden benchmark 和受控 8 episode 并发吞吐基准仍未执行。本文不填写未实测的延迟、显存或吞吐数值。
 
 ## 2. 配置
 
@@ -90,6 +90,8 @@ PY
 
 若网络中断，保留目标目录中的 resumable partial files，再运行同一命令；未通过 verify 时不会保留可信的 `model-install.json`。不要手工伪造该文件，也不要把 mutable `main` 当作已固定 revision。
 
+本次 revision 验证通过了仓库要求的 32 个文件，同时报告 36 个本地额外文件 warning。因此结论是“固定 revision 的 required files 完整”，不是“local directory 与仓库完全一致或目录纯净”；额外文件不会被 `model-install.json` 隐去。
+
 ## 4. vLLM 单 episode smoke
 
 初始服务命令必须先以单 GPU 验证：
@@ -99,9 +101,13 @@ CUDA_VISIBLE_DEVICES=0 /mnt/data/user/zhoukr/envs/vllm/bin/vllm serve \
   /mnt/data/user/zhoukr/models/Qwen3.8-27B \
   --served-model-name Qwen/Qwen3.8-27B \
   --tensor-parallel-size 1 \
+  --max-model-len 131072 \
+  --max-num-seqs 8 \
   --trust-remote-code \
   --port 8000
 ```
+
+这两个容量参数是当前单 GPU 实测所需：以 32k 上限运行时，一个真实 refine broad 请求达到 77,273 tokens/111 images 并返回 HTTP 400；模型 `config.json` 的 `text_config.max_position_embeddings` 为 262,144，本手册采用 131,072 上限覆盖该请求，同时用 `--max-num-seqs 8` 限制调度容量。若 GPU 已被其他进程占用，可降低 `--gpu-memory-utilization`，但这会改变 KV cache 容量，必须重新跑单 episode 和目标并发验证，不能沿用这里的稳定性结论。
 
 另一个终端只跑参考 episode 0：
 
@@ -114,19 +120,24 @@ uv run qwen-annotate status \
 
 检查 `episodes/episode_000000.json`：应保存两次合法 coarse attempt、每个候选边界的 broad/dense refine attempt、真实 frame index/camera 采样 provenance、`prompt_version` 和固定模型 SHA。客户端对每次结构化 completion 最多发出 4 次请求（包括瞬态重试与最多一次格式修复），默认单请求 timeout 为 120 秒。
 
-当前已有 episode 0--4 的真实 partial 评测，但当次没有记录完整 smoke 遥测；缺失值保持明确，不可估算：
+当前可从真实 workspace `/mnt/data/user/zhoukr/annotations/arrange_orange_juice_and_green_tea_2_v6` 的 episode 0--4 JSON 重建以下 partial 评测计数：
 
 ```text
 model_revision: 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
-vllm_version: 0.27.1 package; exact serving-process banner not retained here
+vllm_version: 0.27.1
 episodes: 0,1,2,3,4 partial evaluation
-coarse_valid_responses: NOT_RECORDED_IN_PARTIAL_BASELINE
-refine_valid_responses: NOT_RECORDED_IN_PARTIAL_BASELINE
-visual_frame_count: NOT_RECORDED_IN_PARTIAL_BASELINE
+coarse_valid_responses: 10
+refine_valid_responses: 30
+coarse_logical_visual_samples: 294
+refine_provenance_logical_visual_samples: 2970
+logical_visual_samples_total: 3264
+logical_visual_samples_per_episode_0_to_4: 656,652,662,650,644
 request_latency_seconds: NOT_RECORDED_IN_PARTIAL_BASELINE
 peak_gpu_memory_mib: NOT_RECORDED_IN_PARTIAL_BASELINE
 result: FAILED_BOUNDARY_ACCURACY_BASELINE; see section 8
 ```
+
+这里的“合法响应”是 episode JSON 中成功解析并持久化的 attempt 数；“逻辑视觉样本”是 coarse `sampled_frame_indices` 与 refine provenance 中各 camera/frame 引用的计数，不是去重帧数。它们不等于实际网络发送的图片总数：timeout/瞬态重试或格式 repair 可能重复发送，而逐请求 attempt、request latency、peak GPU memory 和重试后的总发送图数没有持久化，不能从 workspace 还原。
 
 ## 5. 批量运行、两阶段 prompt 与恢复
 
@@ -237,7 +248,9 @@ refine-v1 的 5 episode（0--4）真实结果仅是 **partial 失败基线**，�
 
 ## 9. 并发、安全扩容与记录模板
 
-先以 `--max-concurrency 1` 验证正确性。该选项限制单进程同时处理的 episode 数和对同一 endpoint 的并发请求，并不自动启动多张 GPU 或多个 vLLM server。当前配置只有一个 endpoint；要使用多 worker，应在多个单 GPU vLLM replica 前放置一个保持相同 URL/served-model-name 的负载均衡入口。不要让多个不同 endpoint 配置写同一 workspace，因为 endpoint 属于 run fingerprint。
+新模型、prompt 或容量配置仍应先以 `--max-concurrency 1` 做单 episode 正确性验证。该选项限制单进程同时处理的 episode 数和对同一 endpoint 的并发请求，并不自动启动多张 GPU 或多个 vLLM server。当前配置只有一个 endpoint；要使用多 worker，应在多个单 GPU vLLM replica 前放置一个保持相同 URL/served-model-name 的负载均衡入口。不要让多个不同 endpoint 配置写同一 workspace，因为 endpoint 属于 run fingerprint。
+
+当前单引擎探索性观测中，并发 2 能稳定推进；并发 4 出现超过客户端 120 秒 timeout 和 deferred 请求。因此这台机器当前更有依据的批量起点是 2，4 不应直接用于长批次。这些观测没有固定同一 8 episode 集、没有记录吞吐/显存等完整指标，不是下面的受控吞吐 benchmark，也不能外推到其他 GPU 占用、vLLM 参数或模型 revision。
 
 同一 workspace 的持久化使用文件锁和原子替换，但基准测试时仍应让外部进程使用互不重叠的 `--episodes` shard，避免重复昂贵推理。不要把 worker 数硬编码为 8。
 
@@ -258,12 +271,12 @@ concurrency | model_revision | episodes/hour | peak GPU MiB | decode CPU % | err
 4           | PENDING        | PENDING       | PENDING      | PENDING      | PENDING    | PENDING
 ```
 
-默认采用零 OOM、零额外 `needs_review` 前提下最快的配置；目前没有真实数据，因此项目默认仍使用安全的并发 1。
+受控基准完成后，采用零 OOM、零额外 `needs_review` 前提下最快的配置。当前只有上述探索性证据：单 episode 验证用 1，批量可从 2 开始，4 需先解决 timeout/deferred 并重新验证；不要把其中任一数值写成跨环境默认值。
 
 ## 10. 故障恢复
 
 - timeout/临时 5xx/限流：客户端在有限预算内退避重试。服务恢复后再次执行相同 annotate 命令，`pending`/中间状态会恢复；`failed` 是终态，需要新 workspace 重跑。
-- OOM：多相机 broad 首次 OOM 时会退化为仅主相机并加大 stride；再次 OOM 或 dense OOM 记为 `failed/model_oom`。降低 vLLM 显存压力或 `--max-concurrency`，然后用新 workspace 重跑，不要手改 episode JSON。
+- OOM：多相机 broad 首次 OOM 时会退化为仅主相机并加大 stride；再次 OOM 或 dense OOM 记为 `failed/model_oom`。降低 `--max-concurrency`，或在显存已被占用时降低 vLLM `--gpu-memory-utilization`；后者会改变容量，必须重新验证单 episode/并发。然后用新 workspace 重跑，不要手改 episode JSON。
 - 损坏/缺失视频：`inspect` 或推理记为 `source_or_video`。先在 source 所属采集/修复流程恢复合法 v2.1 payload，再重新 inspect，并使用新 workspace；source 指纹改变时旧结果会被拒绝。
 - 中断/进程退出：原子 stage 状态保留；直接重复 annotate。status 的 summary 可由权威 episode 文件恢复。
 - workspace/provenance 损坏：保留目录取证，使用新空 workspace。不要删除 manifest 后继续写旧 episode。
