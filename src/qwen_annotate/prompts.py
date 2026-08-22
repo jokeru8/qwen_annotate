@@ -7,7 +7,16 @@ from .config import AnnotationConfig
 from .models import CoarseResult, RefineResult
 
 
-PROMPT_VERSION = "coarse-v2/refine-v1"
+PROMPT_VERSION = "coarse-v3/refine-v1"
+
+_COARSE_UNCERTAINTY_POLICY = (
+    "Uncertainty policy: If any of the subtask order, starting subtask, or approximate "
+    "transition neighborhood cannot be determined from sparse evidence, you MUST add a "
+    "concise item to uncertainties and MUST NOT guess that semantic fact.\n"
+    "If all three are clear and only the exact transition frame is uncertain, set "
+    "uncertainties=[] and return the best approximate estimated_frame; refine will "
+    "determine the exact frame."
+)
 
 
 def _integer(name: str, value: object) -> int:
@@ -80,8 +89,9 @@ def build_coarse_prompt(config: AnnotationConfig, episode_index: int, frame_coun
             if frame_count > 1
             else "There are no valid transition-frame integers because the concrete valid transition range is empty for a one-frame episode; do not emit coarse boundaries."
         ),
-        "Uncertainty policy: If any of the subtask order, starting subtask, or approximate transition neighborhood cannot be determined from sparse evidence, you MUST add a concise item to uncertainties and MUST NOT guess that semantic fact.",
-        "If all three are clear and only the exact transition frame is uncertain, set uncertainties=[] and return the best approximate estimated_frame; refine will determine the exact frame.",
+        "BEGIN_COARSE_UNCERTAINTY_POLICY",
+        _COARSE_UNCERTAINTY_POLICY,
+        "END_COARSE_UNCERTAINTY_POLICY",
         "Return JSON only, matching the supplied coarse response schema; do not include commentary or hidden reasoning.",
     ]
     return "\n".join(lines)
