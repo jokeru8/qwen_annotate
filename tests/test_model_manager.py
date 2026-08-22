@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import re
+import stat
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +23,35 @@ from qwen_annotate.model_manager import (
 
 
 SHA = "a" * 40
+
+
+def _concurrent_download_worker(
+    target: Path,
+    revision: str,
+    started: Any,
+    entered: Any,
+    release: Any,
+    outcomes: Any,
+) -> None:
+    started.set()
+    call_count = 0
+
+    def runner(args: list[str], env: dict[str, str]) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            entered.set()
+            if not release.wait(10):
+                raise TimeoutError("test did not release transaction")
+
+    try:
+        download_model(
+            "Qwen/Qwen3.8-27B", target, revision=revision, runner=runner
+        )
+    except BaseException as exc:
+        outcomes.put(("error", type(exc).__name__, str(exc)))
+    else:
+        outcomes.put(("ok", revision))
 
 
 class FakeResponse:
@@ -174,18 +205,72 @@ def test_command_failure_leaves_no_metadata(tmp_path: Path, failure_call: int) -
     assert not (tmp_path / "model" / "model-install.json").exists()
 
 
-def test_failed_rerun_preserves_previous_success_metadata(tmp_path: Path) -> None:
+def test_failed_rerun_invalidates_previous_success_metadata(tmp_path: Path) -> None:
     target = tmp_path / "model"
-    first = download_model("Qwen/Qwen3.8-27B", target, revision=SHA, runner=lambda *_: None)
-    original = (target / "model-install.json").read_bytes()
+    download_model("Qwen/Qwen3.8-27B", target, revision=SHA, runner=lambda *_: None)
+    assert (target / "model-install.json").exists()
 
     def fail(*_: object) -> None:
         raise subprocess.CalledProcessError(2, ["hf"])
 
     with pytest.raises(subprocess.CalledProcessError):
         download_model("Qwen/Qwen3.8-27B", target, revision=SHA, runner=fail)
-    assert (target / "model-install.json").read_bytes() == original
-    assert ModelInstall.from_dict(json.loads(original)) == first
+    assert not (target / "model-install.json").exists()
+
+
+def test_explicit_empty_revision_does_not_default_to_main(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="revision"):
+        download_model(
+            "Qwen/Qwen3.8-27B", tmp_path / "model", revision="", runner=lambda *_: None
+        )
+
+
+def test_download_transactions_are_serialized_across_processes(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    target = tmp_path / "model"
+    first_started, first_entered, first_release = (
+        context.Event(), context.Event(), context.Event()
+    )
+    second_started, second_entered, second_release = (
+        context.Event(), context.Event(), context.Event()
+    )
+    second_release.set()
+    outcomes = context.Queue()
+    first = context.Process(
+        target=_concurrent_download_worker,
+        args=(target, "a" * 40, first_started, first_entered, first_release, outcomes),
+    )
+    second = context.Process(
+        target=_concurrent_download_worker,
+        args=(target, "b" * 40, second_started, second_entered, second_release, outcomes),
+    )
+    try:
+        first.start()
+        assert first_started.wait(5)
+        assert first_entered.wait(5)
+        second.start()
+        assert second_started.wait(5)
+        assert not second_entered.wait(0.25)
+        first_release.set()
+        assert second_entered.wait(5)
+        first.join(5)
+        second.join(5)
+        assert first.exitcode == 0
+        assert second.exitcode == 0
+        assert sorted(outcomes.get(timeout=1) for _ in range(2)) == [
+            ("ok", "a" * 40),
+            ("ok", "b" * 40),
+        ]
+        metadata = json.loads((target / "model-install.json").read_text())
+        assert metadata["revision"] == "b" * 40
+    finally:
+        first_release.set()
+        second_release.set()
+        for process in (first, second):
+            if process.pid is not None and process.is_alive():
+                process.terminate()
+            if process.pid is not None:
+                process.join(5)
 
 
 def test_atomic_metadata_cleanup_when_replace_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -196,6 +281,43 @@ def test_atomic_metadata_cleanup_when_replace_fails(tmp_path: Path, monkeypatch:
 
     monkeypatch.setattr("qwen_annotate.model_manager.os.replace", fail_replace)
     with pytest.raises(OSError, match="replace failed"):
+        download_model("Qwen/Qwen3.8-27B", target, revision=SHA, runner=lambda *_: None)
+    assert not (target / "model-install.json").exists()
+    assert list(target.glob(".model-install.json.*.tmp")) == []
+
+
+def test_metadata_invalidation_and_commit_fsync_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "model"
+    download_model("Qwen/Qwen3.8-27B", target, revision=SHA, runner=lambda *_: None)
+    original_fsync = os.fsync
+    fsynced_directory = 0
+
+    def recording_fsync(descriptor: int) -> None:
+        nonlocal fsynced_directory
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            fsynced_directory += 1
+        original_fsync(descriptor)
+
+    monkeypatch.setattr("qwen_annotate.model_manager.os.fsync", recording_fsync)
+    download_model("Qwen/Qwen3.8-27B", target, revision=SHA, runner=lambda *_: None)
+    assert fsynced_directory == 2
+
+
+def test_directory_fsync_failure_removes_uncommitted_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "model"
+    original_fsync = os.fsync
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("directory fsync failed")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr("qwen_annotate.model_manager.os.fsync", fail_directory_fsync)
+    with pytest.raises(OSError, match="directory fsync failed"):
         download_model("Qwen/Qwen3.8-27B", target, revision=SHA, runner=lambda *_: None)
     assert not (target / "model-install.json").exists()
     assert list(target.glob(".model-install.json.*.tmp")) == []

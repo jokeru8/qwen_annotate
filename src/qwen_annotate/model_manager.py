@@ -7,13 +7,15 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import fcntl
 import httpx
 
 
@@ -136,34 +138,38 @@ def download_model(
     if type(max_workers) is not int or max_workers <= 0:
         raise ValueError("max_workers must be a positive non-boolean integer")
     target = _absolute_local_path(local_path)
-    sha = resolve_revision(repo, revision or "main", client=client)
+    requested_revision = "main" if revision is None else revision
+    sha = resolve_revision(repo, requested_revision, client=client)
     command_runner = runner or _default_runner
 
-    target.mkdir(parents=True, exist_ok=True)
-    command_runner(
-        [
-            "hf",
-            "download",
-            repo,
-            "--revision",
-            sha,
-            "--local-dir",
-            str(target),
-            "--max-workers",
-            str(max_workers),
-        ],
-        _proxy_isolated_env(),
-    )
-    verify_model(repo, sha, target, runner=command_runner)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with _transaction_lock(target):
+        target.mkdir(parents=True, exist_ok=True)
+        _invalidate_install_metadata(target)
+        command_runner(
+            [
+                "hf",
+                "download",
+                repo,
+                "--revision",
+                sha,
+                "--local-dir",
+                str(target),
+                "--max-workers",
+                str(max_workers),
+            ],
+            _proxy_isolated_env(),
+        )
+        verify_model(repo, sha, target, runner=command_runner)
 
-    install = ModelInstall(
-        repo=repo,
-        revision=sha,
-        local_path=target,
-        verified_at=datetime.now(UTC),
-    )
-    _write_install_metadata(install)
-    return install
+        install = ModelInstall(
+            repo=repo,
+            revision=sha,
+            local_path=target,
+            verified_at=datetime.now(UTC),
+        )
+        _write_install_metadata(install)
+        return install
 
 
 def verify_model(
@@ -256,6 +262,45 @@ def _write_install_metadata(install: ModelInstall) -> None:
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
+    try:
+        _fsync_directory(install.local_path)
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        try:
+            _fsync_directory(install.local_path)
+        except OSError:
+            pass
+        raise
+
+
+def _invalidate_install_metadata(target: Path) -> None:
+    metadata = target / _METADATA_NAME
+    try:
+        metadata.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(target)
+
+
+def _fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _transaction_lock(target: Path) -> Iterator[None]:
+    """Serialize all install mutations for one canonical target directory."""
+    lock_path = target.parent / f".{target.name}.model-install.lock"
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _validate_repo(repo: str) -> None:
