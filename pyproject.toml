@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
@@ -33,4 +33,3 @@ asyncio_mode = "auto"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/qwen_annotate"]
-

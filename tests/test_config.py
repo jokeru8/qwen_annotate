@@ -4,7 +4,13 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from qwen_annotate.config import AnnotationConfig, load_config
+from qwen_annotate.config import (
+    AnnotationConfig,
+    ModelConfig,
+    SamplingConfig,
+    Subtask,
+    load_config,
+)
 
 
 def test_load_config_valid_yaml_and_stable_hash(tmp_path: Path) -> None:
@@ -28,6 +34,24 @@ def test_load_config_valid_yaml_and_stable_hash(tmp_path: Path) -> None:
     assert loaded.source == Path("/data/source")
     assert loaded.stable_hash() == equivalent.stable_hash()
 
+    reordered = dict(reversed(list(payload.items())))
+    reordered["subtasks"] = [{"text": "Pick the item", "skill": "pick"}]
+    reordered_path = tmp_path / "reordered.yaml"
+    reordered_path.write_text(yaml.safe_dump(reordered), encoding="utf-8")
+    assert loaded.stable_hash() == load_config(reordered_path).stable_hash()
+
+    api_key_changed = dict(payload)
+    api_key_changed["model"] = {"endpoint": "http://localhost:8000/v1", "api_key": "other"}
+    api_key_path = tmp_path / "api-key.yaml"
+    api_key_path.write_text(yaml.safe_dump(api_key_changed), encoding="utf-8")
+    assert loaded.stable_hash() == load_config(api_key_path).stable_hash()
+
+    material_change = dict(payload)
+    material_change["high_level_instruction"] = "different instruction"
+    material_path = tmp_path / "material.yaml"
+    material_path.write_text(yaml.safe_dump(material_change), encoding="utf-8")
+    assert loaded.stable_hash() != load_config(material_path).stable_hash()
+
 
 def test_annotation_config_rejects_unknown_keys() -> None:
     with pytest.raises(ValidationError):
@@ -44,3 +68,15 @@ def test_annotation_config_rejects_unknown_keys() -> None:
             }
         )
 
+
+@pytest.mark.parametrize(
+    ("model_type", "payload"),
+    [
+        (Subtask, {"skill": "pick", "text": "Pick", "unexpected": True}),
+        (ModelConfig, {"unexpected": True}),
+        (SamplingConfig, {"unexpected": True}),
+    ],
+)
+def test_nested_models_reject_unknown_keys(model_type: type[object], payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        model_type.model_validate(payload)  # type: ignore[attr-defined]

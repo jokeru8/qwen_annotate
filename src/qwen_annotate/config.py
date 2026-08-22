@@ -57,4 +57,3 @@ def load_config(path: Path) -> AnnotationConfig:
     """Load and validate a YAML annotation configuration."""
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     return AnnotationConfig.model_validate(raw)
-
