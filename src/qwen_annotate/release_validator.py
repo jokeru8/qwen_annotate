@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .config import Subtask
 from .constraints import validate_annotation
-from .lerobot import VideoProbe, probe_video
+from .lerobot import VideoProbe, probe_video, video_fps_matches
 from .models import FinalAnnotation
 from .video import extract_frames
 
@@ -162,7 +162,7 @@ def validate_release(
             expected_payload.add(video_rel.as_posix())
             video_paths[(expected, camera)] = video
             measured = svc.probe_video(video)
-            if measured.frames != length or measured.fps != fps or measured.width <= 0 or measured.height <= 0:
+            if measured.frames != length or not video_fps_matches(measured.fps, fps) or measured.width <= 0 or measured.height <= 0:
                 raise ValueError(f"video metadata mismatch for episode {expected}, camera {camera}")
         global_offset += length
     if sum(lengths) != total_frames:
@@ -176,8 +176,8 @@ def validate_release(
     _validate_optional_metadata(root, total_episodes)
 
     annotations = _read_object(root / "meta/lerobot_annotations.json")
-    top_fields = ["source_root", "work_dir", "subtask_template", "episodes", "primary_camera", "updated_at"]
-    if list(annotations) != top_fields:
+    top_fields = {"source_root", "work_dir", "subtask_template", "episodes", "primary_camera", "updated_at"}
+    if set(annotations) != top_fields:
         raise ValueError("annotation top-level schema mismatch")
     _aware_utc(annotations["updated_at"], "updated_at")
     for field in ("source_root", "work_dir"):

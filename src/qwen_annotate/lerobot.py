@@ -13,6 +13,24 @@ from pydantic import BaseModel, Field, field_validator
 from qwen_annotate.config import AnnotationConfig
 
 
+VIDEO_FPS_TOLERANCE = 0.01
+
+
+def video_fps_matches(measured: float, expected: float) -> bool:
+    """Use one import/release tolerance for finite positive video frame rates."""
+    return (
+        isinstance(measured, (int, float))
+        and not isinstance(measured, bool)
+        and isinstance(expected, (int, float))
+        and not isinstance(expected, bool)
+        and math.isfinite(measured)
+        and math.isfinite(expected)
+        and measured > 0
+        and expected > 0
+        and abs(float(measured) - float(expected)) <= VIDEO_FPS_TOLERANCE
+    )
+
+
 class VideoProbe(BaseModel):
     frames: int = Field(ge=0)
     fps: float = Field(gt=0)
@@ -174,7 +192,7 @@ def inspect_dataset(
                     f"Video frame count for episode {episode_index}, camera {video_key!r} "
                     f"is {video_probe.frames}, expected {length}"
                 )
-            if abs(video_probe.fps - fps) > 0.01:
+            if not video_fps_matches(video_probe.fps, fps):
                 raise ValueError(
                     f"Video fps for episode {episode_index}, camera {video_key!r} "
                     f"is {video_probe.fps}, expected {fps}"

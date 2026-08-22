@@ -156,3 +156,47 @@ def test_expected_output_root_is_checked_during_staging_validation(tmp_path: Pat
             services=services,
             _expected_output_root=tmp_path / "other-release",
         )
+
+
+def test_annotation_top_level_key_order_is_not_semantic(tmp_path: Path) -> None:
+    _, work, services = _fixture(tmp_path)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    path = output / "meta/lerobot_annotations.json"
+    value = json.loads(path.read_text())
+    path.write_text(json.dumps(dict(reversed(list(value.items())))))
+    assert validate_release(output, services=services).valid
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_annotation_top_level_requires_exact_key_set(tmp_path: Path, mutation: str) -> None:
+    _, work, services = _fixture(tmp_path)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    path = output / "meta/lerobot_annotations.json"
+    value = json.loads(path.read_text())
+    if mutation == "missing":
+        value.pop("updated_at")
+    else:
+        value["invented"] = True
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="top-level schema"):
+        validate_release(output, services=services)
+
+
+@pytest.mark.parametrize(("measured_fps", "valid"), [(9.999, True), (9.98, False)])
+def test_release_video_fps_uses_import_tolerance(
+    tmp_path: Path, measured_fps: float, valid: bool,
+) -> None:
+    _, work, services = _fixture(tmp_path)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    from qwen_annotate.lerobot import VideoProbe
+    adjusted = services | {
+        "probe_video": lambda path: VideoProbe(frames=20, fps=measured_fps, width=6, height=4)
+    }
+    if valid:
+        assert validate_release(output, services=adjusted).valid
+    else:
+        with pytest.raises(ValueError, match="video metadata mismatch"):
+            validate_release(output, services=adjusted)
