@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -136,6 +136,99 @@ def recompute_stats(
             finally:
                 parquet.close()
         return {name: accumulator.finish() for name, accumulator in accumulators.items()}
+
+
+def iter_video_rgb_frames(path: Path) -> Iterator[np.ndarray]:
+    """Decode one video sequentially as RGB uint8 arrays."""
+    try:
+        import av
+    except ImportError as exc:
+        raise RuntimeError("PyAV is required to compute video statistics") from exc
+    try:
+        container = av.open(str(path))
+    except Exception as exc:
+        raise ValueError(f"unable to open video for statistics: {path}") from exc
+    try:
+        stream = next((item for item in container.streams if item.type == "video"), None)
+        if stream is None:
+            raise ValueError(f"video has no video stream: {path}")
+        try:
+            for frame in container.decode(stream):
+                yield frame.to_ndarray(format="rgb24")
+        except Exception as exc:
+            raise ValueError(f"unable to decode video for statistics: {path}") from exc
+    finally:
+        container.close()
+
+
+def recompute_video_stats(
+    video_paths: Sequence[Path],
+    expected_frames: Sequence[int],
+    declared_shape: Sequence[int],
+    *,
+    frame_iterator: Callable[[Path], Iterable[np.ndarray]] = iter_video_rgb_frames,
+) -> dict[str, list]:
+    """Compute exact RGB channel statistics with bounded 256-bin histograms."""
+    if len(video_paths) != len(expected_frames) or not video_paths:
+        raise ValueError("video paths and expected frame counts must be nonempty and aligned")
+    if len(declared_shape) != 3:
+        raise ValueError("video feature shape must be [height, width, channels]")
+    height, width, channels = declared_shape
+    if any(type(value) is not int or value <= 0 for value in (height, width, channels)) or channels != 3:
+        raise ValueError("video feature shape must contain positive RGB dimensions")
+    histogram = np.zeros((3, 256), dtype=np.int64)
+    total_frames = 0
+    for raw_path, expected in zip(video_paths, expected_frames, strict=True):
+        path = Path(raw_path)
+        if type(expected) is not int or expected <= 0:
+            raise ValueError("expected video frame count must be positive")
+        decoded = 0
+        for frame in frame_iterator(path):
+            array = np.asarray(frame)
+            if array.dtype != np.uint8 or array.shape != (height, width, 3):
+                raise ValueError(f"decoded RGB frame shape or dtype differs from metadata: {path}")
+            for channel in range(3):
+                histogram[channel] += np.bincount(array[..., channel].reshape(-1), minlength=256)
+            decoded += 1
+        if decoded != expected:
+            raise ValueError(f"video frame count differs from metadata: {path}")
+        total_frames += decoded
+    count = total_frames * height * width
+    if count <= 0 or np.any(histogram.sum(axis=1) != count):
+        raise ValueError("decoded camera coverage is incomplete")
+
+    bins = np.arange(256, dtype=np.float64) / 255.0
+    mean = (histogram * bins).sum(axis=1) / count
+    variance = (histogram * np.square(bins)).sum(axis=1) / count - np.square(mean)
+    minimum = np.argmax(histogram > 0, axis=1).astype(np.float64) / 255.0
+    maximum = (255 - np.argmax((histogram > 0)[:, ::-1], axis=1)).astype(np.float64) / 255.0
+    metrics: dict[str, np.ndarray] = {
+        "min": minimum,
+        "max": maximum,
+        "mean": mean,
+        "std": np.sqrt(np.maximum(variance, 0.0)),
+    }
+    cumulative = np.cumsum(histogram, axis=1)
+    for name, quantile in _QUANTILES:
+        rank = (count - 1) * quantile
+        lower = int(np.floor(rank))
+        upper = int(np.ceil(rank))
+        fraction = rank - lower
+        lower_values = np.array([
+            np.searchsorted(cumulative[channel], lower, side="right") for channel in range(3)
+        ], dtype=np.float64)
+        upper_values = np.array([
+            np.searchsorted(cumulative[channel], upper, side="right") for channel in range(3)
+        ], dtype=np.float64)
+        metrics[name] = (lower_values + fraction * (upper_values - lower_values)) / 255.0
+    result: dict[str, list] = {
+        name: [[[float(value)]] for value in values]
+        for name, values in metrics.items()
+    }
+    result["count"] = [count]
+    if not all(np.isfinite(value) for name, values in result.items() if name != "count" for channel in values for row in channel for value in row):
+        raise ValueError("video statistics must be finite")
+    return result
 
 
 def _numeric_shape(dtype: pa.DataType) -> tuple[int, bool] | None:

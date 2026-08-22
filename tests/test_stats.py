@@ -5,7 +5,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from qwen_annotate.stats import recompute_stats
+import numpy as np
+
+from qwen_annotate.stats import recompute_stats, recompute_video_stats
 
 
 def test_recompute_stats_preserves_scalar_and_fixed_list_shapes(tmp_path: Path) -> None:
@@ -61,3 +63,46 @@ def test_recompute_stats_rejects_numeric_schema_drift(tmp_path: Path) -> None:
     pq.write_table(pa.table({"other": pa.array([2], type=pa.int64())}), second)
     with pytest.raises(ValueError, match="schema"):
         recompute_stats([first, second])
+
+
+def test_recompute_video_stats_has_reference_shape_and_exact_streaming_quantiles(tmp_path: Path) -> None:
+    """Catches omitted camera stats, channel flattening, or dataset-sized frame retention."""
+    first, second = tmp_path / "first.mp4", tmp_path / "second.mp4"
+    first.touch()
+    second.touch()
+    frames = {
+        first: [
+            np.array([[[0, 10, 20], [30, 40, 50]]], dtype=np.uint8),
+            np.array([[[60, 70, 80], [90, 100, 110]]], dtype=np.uint8),
+        ],
+        second: [np.array([[[120, 130, 140], [150, 160, 170]]], dtype=np.uint8)],
+    }
+
+    stats = recompute_video_stats(
+        [first, second], [2, 1], [1, 2, 3], frame_iterator=lambda path: iter(frames[path]),
+    )
+
+    assert stats["count"] == [6]
+    for metric in ("min", "max", "mean", "std", "q01", "q10", "q50", "q90", "q99"):
+        assert len(stats[metric]) == 3
+        assert all(len(channel) == 1 and len(channel[0]) == 1 for channel in stats[metric])
+    assert [channel[0][0] for channel in stats["min"]] == [0.0, 10 / 255, 20 / 255]
+    assert [channel[0][0] for channel in stats["max"]] == [150 / 255, 160 / 255, 170 / 255]
+    assert [channel[0][0] for channel in stats["mean"]] == pytest.approx([75 / 255, 85 / 255, 95 / 255])
+    assert [channel[0][0] for channel in stats["q50"]] == pytest.approx([75 / 255, 85 / 255, 95 / 255])
+
+
+def test_recompute_video_stats_checks_shape_and_frame_count(tmp_path: Path) -> None:
+    """Catches camera coverage that disagrees with LeRobot metadata."""
+    path = tmp_path / "video.mp4"
+    path.touch()
+    with pytest.raises(ValueError, match="frame count"):
+        recompute_video_stats(
+            [path], [2], [1, 1, 3],
+            frame_iterator=lambda _: iter([np.zeros((1, 1, 3), dtype=np.uint8)]),
+        )
+    with pytest.raises(ValueError, match="shape"):
+        recompute_video_stats(
+            [path], [1], [2, 1, 3],
+            frame_iterator=lambda _: iter([np.zeros((1, 1, 3), dtype=np.uint8)]),
+        )

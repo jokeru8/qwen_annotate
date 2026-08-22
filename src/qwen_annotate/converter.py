@@ -25,7 +25,7 @@ from .config import AnnotationConfig
 from .constraints import validate_annotation
 from .lerobot import DatasetIndex, inspect_dataset
 from .release_validator import ReleaseReport, validate_release
-from .stats import recompute_stats
+from .stats import iter_video_rgb_frames, recompute_stats, recompute_video_stats
 from .workspace import EpisodeRecord, RunManifest, WorkspaceStore, compute_run_fingerprint, compute_source_fingerprint
 
 
@@ -134,7 +134,7 @@ def convert_dataset(
         converted_at = datetime.now(UTC)
         if accepted_only:
             frame_count = _rewrite_accepted_subset(
-                staging, source, out, manifest, dataset, records, converted_at,
+                staging, source, out, manifest, dataset, records, converted_at, services,
             )
         else:
             frame_count = manifest.total_frames
@@ -144,6 +144,7 @@ def convert_dataset(
             source=None if accepted_only else source,
             services=services,
             _expected_output_root=out,
+            _expected_stats_source=source,
         )
         if _tree_digest(source) != source_before:
             raise ValueError("source dataset changed during conversion")
@@ -314,6 +315,7 @@ def _rewrite_accepted_subset(
     dataset: DatasetIndex,
     records: list[EpisodeRecord],
     converted_at: datetime,
+    services: Any,
 ) -> int:
     info_path = staging / "meta/info.json"
     info = _read_source_json(info_path)
@@ -337,6 +339,7 @@ def _rewrite_accepted_subset(
     _clear_payload_directory(staging / "data", staging)
     _clear_payload_directory(staging / "videos", staging)
     rewritten_parquets: list[Path] = []
+    rewritten_videos: dict[str, list[Path]] = {camera: [] for camera in manifest.camera_keys}
     for remap in remaps:
         episode = episode_by_index[remap.source_index]
         values = {
@@ -354,6 +357,7 @@ def _rewrite_accepted_subset(
             destination = staging / video_relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(episode.videos[camera], destination, follow_symlinks=False)
+            rewritten_videos[camera].append(destination)
 
     source_episode_rows = _read_source_jsonl(source / "meta/episodes.jsonl")
     rows_by_index = {row.get("episode_index"): row for row in source_episode_rows}
@@ -366,6 +370,25 @@ def _rewrite_accepted_subset(
     _atomic_jsonl(staging / "meta/episodes.jsonl", output_episode_rows)
 
     aggregate_stats = recompute_stats(rewritten_parquets)
+    features = info.get("features")
+    if not isinstance(features, dict):
+        raise ValueError("source features must be an object")
+    frame_iterator = _service(services, "iter_video_rgb_frames", iter_video_rgb_frames)
+    if not callable(frame_iterator):
+        raise TypeError("iter_video_rgb_frames service must be callable")
+    expected_lengths = [remap.length for remap in remaps]
+    for camera in manifest.camera_keys:
+        feature = features.get(camera)
+        if not isinstance(feature, dict) or feature.get("dtype") != "video" or not isinstance(feature.get("shape"), list):
+            raise ValueError(f"camera feature metadata is invalid: {camera}")
+        aggregate_stats[camera] = recompute_video_stats(
+            rewritten_videos[camera], expected_lengths, feature["shape"], frame_iterator=frame_iterator,
+        )
+    source_stats_path = source / "meta/stats.json"
+    if source_stats_path.exists() or source_stats_path.is_symlink():
+        source_stats = _read_source_json(source_stats_path)
+        if set(source_stats) != set(aggregate_stats):
+            raise ValueError("source stats keys differ from declared selected feature coverage")
     _atomic_json(staging / "meta/stats.json", aggregate_stats, sort_keys=False)
     episode_stats = [
         {"episode_index": remap.output_index, "stats": recompute_stats([parquet])}

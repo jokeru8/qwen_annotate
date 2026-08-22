@@ -26,6 +26,7 @@ from .video import extract_frames
 
 _MAX_JSON = 16 * 1024 * 1024
 _REQUIRED_COLUMNS = {"frame_index", "episode_index", "index", "task_index", "timestamp"}
+_STAT_METRICS = {"min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99"}
 _FORBIDDEN = {
     "confidence", "uncertainties", "attempts", "coarse_attempts", "refine_attempts",
     "visible_cues", "evidence", "prompt", "prompts", "api_key", "endpoint",
@@ -86,10 +87,12 @@ def validate_release(
     *,
     services: Any = None,
     _expected_output_root: Path | None = None,
+    _expected_stats_source: Path | None = None,
 ) -> ReleaseReport:
     """Validate a converted release without consulting an annotation workspace."""
     root = _safe_root(path, "release")
     source_root = _safe_root(source, "source") if source is not None else None
+    stats_source = _safe_root(_expected_stats_source, "stats source") if _expected_stats_source is not None else source_root
     svc = _services(services)
     _walk_regular(root)
 
@@ -173,7 +176,10 @@ def validate_release(
     actual_payload = _payload_files(root)
     if actual_payload != expected_payload:
         raise ValueError("missing or extra episode payload files")
-    _validate_optional_metadata(root, total_episodes)
+    _validate_optional_metadata(
+        root, total_episodes, total_frames, lengths, features, cameras, stats_source,
+        strict_image_counts={"data_files_size_in_mb", "video_files_size_in_mb"} <= set(info),
+    )
 
     annotations = _read_object(root / "meta/lerobot_annotations.json")
     top_fields = {"source_root", "work_dir", "subtask_template", "episodes", "primary_camera", "updated_at"}
@@ -554,19 +560,125 @@ def _payload_files(root: Path) -> set[str]:
     return result
 
 
-def _validate_optional_metadata(root: Path, count: int) -> None:
-    for name in ("episodes_stats.jsonl", "stats.json"):
-        path = root / "meta" / name
-        if path.exists() or path.is_symlink():
-            if name.endswith(".jsonl"):
-                rows = _read_jsonl(path)
-                if len(rows) != count:
-                    raise ValueError("episode stats count mismatch")
-                for index, row in enumerate(rows):
-                    if _integer(row, "episode_index", minimum=0) != index:
-                        raise ValueError("episode stats indices are not contiguous")
-            else:
-                _read_object(path)
+def _validate_optional_metadata(
+    root: Path,
+    episode_count: int,
+    total_frames: int,
+    lengths: list[int],
+    features: dict[str, Any],
+    cameras: list[str],
+    stats_source: Path | None,
+    *,
+    strict_image_counts: bool,
+) -> None:
+    aggregate_path = root / "meta/stats.json"
+    episode_path = root / "meta/episodes_stats.jsonl"
+    source_has_stats = stats_source is not None and (stats_source / "meta/stats.json").exists()
+    present = (aggregate_path.exists() or aggregate_path.is_symlink(), episode_path.exists() or episode_path.is_symlink())
+    if not any(present):
+        if source_has_stats:
+            raise ValueError("release stats metadata is missing")
+        return
+    if not all(present):
+        raise ValueError("aggregate and episode stats must be published together")
+
+    numeric = {
+        name: math.prod(value["shape"])
+        for name, value in features.items()
+        if isinstance(name, str) and isinstance(value, dict)
+        and isinstance(value.get("dtype"), str)
+        and (value["dtype"].startswith("int") or value["dtype"].startswith("float"))
+        and isinstance(value.get("shape"), list)
+        and value["shape"] and all(type(item) is int and item > 0 for item in value["shape"])
+    }
+    expected_aggregate = set(numeric) | set(cameras)
+    aggregate = _read_object(aggregate_path)
+    if set(aggregate) != expected_aggregate:
+        raise ValueError("aggregate stats feature coverage mismatch")
+    if source_has_stats:
+        source_stats = _read_object(stats_source / "meta/stats.json")  # type: ignore[operator]
+        if set(source_stats) != set(aggregate):
+            raise ValueError("release stats keys differ from source stats")
+
+    for feature, width in numeric.items():
+        _validate_feature_stats(aggregate[feature], width, total_frames, image=False, context=f"stats {feature}")
+    for camera in cameras:
+        declared = features[camera]
+        shape = declared.get("shape") if isinstance(declared, dict) else None
+        if not isinstance(shape, list) or len(shape) != 3 or shape[-1] != 3:
+            raise ValueError(f"stats camera shape metadata is invalid: {camera}")
+        expected_pixels = total_frames * shape[0] * shape[1] if strict_image_counts else None
+        _validate_feature_stats(
+            aggregate[camera], 3, expected_pixels, image=True, context=f"stats {camera}",
+        )
+
+    rows = _read_jsonl(episode_path)
+    if len(rows) != episode_count:
+        raise ValueError("episode stats count mismatch")
+    for index, row in enumerate(rows):
+        if set(row) != {"episode_index", "stats"} or _integer(row, "episode_index", minimum=0) != index:
+            raise ValueError("episode stats indices or schema are invalid")
+        stats = row["stats"]
+        if not isinstance(stats, dict) or set(stats) != set(numeric):
+            raise ValueError("episode stats feature coverage mismatch")
+        for feature, width in numeric.items():
+            _validate_feature_stats(
+                stats[feature], width, lengths[index], image=False,
+                context=f"episode stats {index}/{feature}",
+            )
+
+
+def _validate_feature_stats(
+    value: Any,
+    width: int,
+    expected_count: int | None,
+    *,
+    image: bool,
+    context: str,
+) -> int:
+    if not isinstance(value, dict) or set(value) != _STAT_METRICS:
+        raise ValueError(f"{context} metric coverage mismatch")
+    count_value = value["count"]
+    if not isinstance(count_value, list) or len(count_value) != 1 or type(count_value[0]) is not int or count_value[0] <= 0:
+        raise ValueError(f"{context} count must be one positive integer")
+    count = count_value[0]
+    if expected_count is not None and count != expected_count:
+        raise ValueError(f"{context} count differs from frame count")
+
+    vectors: dict[str, list[float]] = {}
+    for metric in _STAT_METRICS - {"count"}:
+        raw = value[metric]
+        if image:
+            if (not isinstance(raw, list) or len(raw) != width or
+                    any(not isinstance(channel, list) or len(channel) != 1 or
+                        not isinstance(channel[0], list) or len(channel[0]) != 1
+                        for channel in raw)):
+                raise ValueError(f"{context} {metric} has wrong image stats shape")
+            flat = [channel[0][0] for channel in raw]
+        else:
+            if not isinstance(raw, list) or len(raw) != width:
+                raise ValueError(f"{context} {metric} has wrong stats shape")
+            flat = raw
+        if any(isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(item) for item in flat):
+            raise ValueError(f"{context} {metric} must contain finite numbers")
+        vectors[metric] = [float(item) for item in flat]
+
+    ordered = ("min", "q01", "q10", "q50", "q90", "q99", "max")
+    for component in range(width):
+        values = [vectors[name][component] for name in ordered]
+        tolerance = 1e-9 * max(1.0, *(abs(item) for item in values))
+        if any(left > right + tolerance for left, right in zip(values, values[1:])):
+            raise ValueError(f"{context} quantile ordering is invalid")
+        if vectors["mean"][component] < values[0] - tolerance or vectors["mean"][component] > values[-1] + tolerance:
+            raise ValueError(f"{context} mean is outside min/max")
+        if vectors["std"][component] < 0:
+            raise ValueError(f"{context} std must be nonnegative")
+        if image and (
+            any(item < -tolerance or item > 1.0 + tolerance for item in [*values, vectors["mean"][component]])
+            or vectors["std"][component] > 0.5 + tolerance
+        ):
+            raise ValueError(f"{context} is outside normalized RGB stats range")
+    return count
 
 
 def _subtasks(value: Any) -> list[Subtask]:

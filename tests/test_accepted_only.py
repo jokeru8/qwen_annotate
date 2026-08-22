@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import numpy as np
 import pytest
 
 from qwen_annotate.config import AnnotationConfig
@@ -75,8 +76,18 @@ def _mixed_workspace(tmp_path: Path) -> tuple[Path, Path, dict]:
         ))
         offset += length
     (meta / "episodes.jsonl").write_text("\n".join(episode_rows) + "\n")
-    # Deliberately stale source stats: accepted-only output must derive data, not trust these.
-    (meta / "stats.json").write_text(json.dumps({"action": {"mean": [999, 999]}}))
+    # Deliberately stale values but complete keys: subset output must derive data, not trust them.
+    metric_names = ("min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99")
+    source_stats = {
+        name: {metric: ([28] if metric == "count" else [999] * math.prod(feature["shape"])) for metric in metric_names}
+        for name, feature in info["features"].items() if feature["dtype"] != "video"
+    }
+    for camera in cameras:
+        source_stats[camera] = {
+            metric: ([28 * 4 * 6] if metric == "count" else [[[999]], [[999]], [[999]]])
+            for metric in metric_names
+        }
+    (meta / "stats.json").write_text(json.dumps(source_stats))
     (meta / "episodes_stats.jsonl").write_text("\n".join(
         json.dumps({"episode_index": i, "stats": {"action": {"mean": [999, 999]}}}) for i in range(3)
     ) + "\n")
@@ -114,8 +125,16 @@ def _mixed_workspace(tmp_path: Path) -> tuple[Path, Path, dict]:
         index = int(path.stem.split("_")[-1])
         length = lengths[index] if source in path.parents else selected_lengths[index]
         return VideoProbe(frames=length, fps=10, width=6, height=4)
+    def frames(path: Path):
+        source_index = int(path.read_bytes().decode().rsplit("-", 1)[-1])
+        index = int(path.stem.split("_")[-1])
+        length = lengths[index] if source in path.parents else selected_lengths[index]
+        pixel = np.array([source_index * 100, source_index * 100 + 1, source_index * 100 + 2], dtype=np.uint8)
+        for _ in range(length):
+            yield np.broadcast_to(pixel, (4, 6, 3))
     services = {
         "probe_video": probe,
+        "iter_video_rgb_frames": frames,
         "extract_frames": lambda path, camera, indices, fps: [
             type("S", (), {"frame_index": n, "camera_key": camera})() for n in indices
         ],
@@ -163,7 +182,21 @@ def test_accepted_only_reindexes_every_reference_and_validates(tmp_path: Path) -
     assert aggregate["episode_index"]["max"] == [1]
     assert aggregate["index"]["max"] == [20]
     assert aggregate["action"]["mean"] == pytest.approx([18 / 21, 102 / 21])
-    assert all(math.isfinite(value) for feature in aggregate.values() for values in feature.values() for value in values)
+    assert set(aggregate) == set(info["features"])
+    assert aggregate["cam.eye"]["count"] == [21 * 4 * 6]
+    assert aggregate["cam.eye"]["mean"] == [
+        [[pytest.approx((9 * 200) / (21 * 255))]],
+        [[pytest.approx((12 + 9 * 201) / (21 * 255))]],
+        [[pytest.approx((24 + 9 * 202) / (21 * 255))]],
+    ]
+    assert aggregate["cam.wrist"] == aggregate["cam.eye"]
+    def numbers(value):
+        if isinstance(value, list):
+            for item in value:
+                yield from numbers(item)
+        else:
+            yield value
+    assert all(math.isfinite(value) for feature in aggregate.values() for values in feature.values() for value in numbers(values))
     assert report.accepted_only and report.episode_count == 2 and report.frame_count == 21
     assert validate_release(output, services=services).valid
     assert {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()} == source_before
@@ -181,3 +214,48 @@ def test_accepted_only_requires_at_least_one_approved_episode(tmp_path: Path) ->
     with pytest.raises(ValueError, match="accepted"):
         convert_dataset(work, output, accepted_only=True, services=services)
     assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_camera", "camera_shape", "camera_range", "nonfinite", "camera_count",
+        "numeric_count", "quantile_order", "episode_missing", "episode_shape", "episode_count",
+    ],
+)
+def test_release_validator_rejects_stats_corruption(tmp_path: Path, mutation: str) -> None:
+    """Catches treating stats.json and episodes_stats.jsonl as unchecked decoration."""
+    _, work, services = _mixed_workspace(tmp_path)
+    output = tmp_path / "accepted"
+    convert_dataset(work, output, accepted_only=True, services=services)
+    stats_path = output / "meta/stats.json"
+    episode_path = output / "meta/episodes_stats.jsonl"
+    if mutation.startswith("episode_"):
+        rows = [json.loads(line) for line in episode_path.read_text().splitlines()]
+        if mutation == "episode_missing":
+            rows[0]["stats"].pop("action")
+        elif mutation == "episode_shape":
+            rows[0]["stats"]["action"]["mean"] = [0.0]
+        else:
+            rows[0]["stats"]["action"]["count"] = [999]
+        episode_path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    else:
+        stats = json.loads(stats_path.read_text())
+        if mutation == "missing_camera":
+            stats.pop("cam.eye")
+        elif mutation == "camera_shape":
+            stats["cam.eye"]["mean"] = [0.5, 0.5, 0.5]
+        elif mutation == "camera_range":
+            stats["cam.eye"]["min"] = [[[-1.0]], [[-1.0]], [[-1.0]]]
+        elif mutation == "nonfinite":
+            stats["cam.eye"]["mean"][0][0][0] = 1e999
+        elif mutation == "camera_count":
+            stats["cam.eye"]["count"] = [999]
+            stats["cam.wrist"]["count"] = [999]
+        elif mutation == "numeric_count":
+            stats["action"]["count"] = [999]
+        else:
+            stats["action"]["q50"][0] = stats["action"]["max"][0] + 1
+        stats_path.write_text(json.dumps(stats))
+    with pytest.raises(ValueError, match="stat"):
+        validate_release(output, services=services)
