@@ -1,0 +1,19 @@
+source: /mnt/data/user/zhoukr/datasets/jokeru/arrange_orange_juice_and_green_tea_patch
+work_dir: /mnt/data/user/zhoukr/annotations/arrange_orange_juice_and_green_tea_patch
+mode: dagger_patch
+high_level_instruction: arrange the orange juice and green tea neatly
+primary_camera: observation.images.right_eye
+refine_cameras:
+  - observation.images.right_eye
+  - observation.images.left_wrist
+  - observation.images.right_wrist
+subtasks:
+  - skill: pick
+    text: Pick up green tea using right hand
+  - skill: pick
+    text: Take the green tea from your right hand with your left hand.
+  - skill: place
+    text: Pick up orange juice using right hand and put it in the correct place
+  - skill: place
+    text: Take the green tea with right hand and put it in the correct place
+
