@@ -157,6 +157,7 @@ async def test_dagger_legal_suffix_and_singletons_succeed(
         ("complete", [0, 1]),
         ("dagger_patch", [0, 2]),
         ("dagger_patch", [1, 2]),
+        ("dagger_patch", [3, 4]),
     ],
 )
 async def test_illegal_mode_sequence_requires_review(tmp_path: Path, mode: str, observed: list[int]) -> None:
@@ -325,6 +326,9 @@ async def test_client_exception_propagates_after_first_pass(tmp_path: Path) -> N
 def test_coarse_decision_is_strict_immutable_and_enforces_status_invariants() -> None:
     attempts = (result([0], []), result([0], []))
     decision = CoarseDecision(
+        mode="complete",
+        subtask_count=1,
+        frame_count=1,
         status="coarse_done",
         attempts=attempts,
         reasons=(),
@@ -337,6 +341,9 @@ def test_coarse_decision_is_strict_immutable_and_enforces_status_invariants() ->
         decision.status = "needs_review"
     with pytest.raises(ValidationError):
         CoarseDecision(
+            mode="complete",
+            subtask_count=1,
+            frame_count=1,
             status="needs_review",
             attempts=attempts,
             reasons=(),
@@ -347,6 +354,9 @@ def test_coarse_decision_is_strict_immutable_and_enforces_status_invariants() ->
         )
     with pytest.raises(ValidationError):
         CoarseDecision(
+            mode="complete",
+            subtask_count=1,
+            frame_count=1,
             status="coarse_done",
             attempts=attempts,
             reasons=(),
@@ -355,6 +365,179 @@ def test_coarse_decision_is_strict_immutable_and_enforces_status_invariants() ->
             boundary_centers=(),
             sampled_frame_indices=((0,), (0,)),
         )
+
+
+def decision_fields(
+    *,
+    attempts=None,
+    mode="complete",
+    subtask_count=3,
+    frame_count=101,
+    status="coarse_done",
+    reasons=(),
+    start=0,
+    observed=(0, 1, 2),
+    centers=(21, 61),
+    grids=((0, 20, 40, 60, 80, 100), (0, 21, 40, 60, 80, 100)),
+):
+    return {
+        "mode": mode,
+        "subtask_count": subtask_count,
+        "frame_count": frame_count,
+        "status": status,
+        "attempts": attempts or (result([0, 1, 2], [20, 60]), result([0, 1, 2], [21, 61])),
+        "reasons": reasons,
+        "start_subtask_index": start,
+        "observed_subtask_indices": observed,
+        "boundary_centers": centers,
+        "sampled_frame_indices": grids,
+    }
+
+
+@pytest.mark.parametrize(
+    "grids",
+    [
+        ((-1, 50, 100), (0, 50, 100)),
+        ((0, 50, 50, 100), (0, 50, 100)),
+        ((0, 80, 20, 100), (0, 50, 100)),
+        ((1, 50, 100), (0, 50, 100)),
+        ((0, 50, 99), (0, 50, 100)),
+        ((0, 50, 101), (0, 50, 100)),
+        ((0, True, 100), (0, 50, 100)),
+    ],
+)
+def test_decision_rejects_malformed_sample_provenance(grids) -> None:
+    with pytest.raises(ValidationError, match="sampled"):
+        CoarseDecision(**decision_fields(grids=grids))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"start": 1},
+        {"observed": (0, 2)},
+        {"centers": (21,)},
+        {"centers": (22, 61)},
+        {"centers": (-1, 61)},
+        {"centers": (61, 21)},
+        {"centers": (21, 101)},
+    ],
+)
+def test_success_fields_must_be_exactly_derived_from_attempts(overrides) -> None:
+    with pytest.raises(ValidationError):
+        CoarseDecision(**decision_fields(**overrides))
+
+
+def test_success_rejects_illegal_or_uncertain_audit_attempts() -> None:
+    illegal = bypass_result(observed=[0, 2], boundaries=[
+        CoarseBoundary.model_construct(
+            from_subtask_index=0,
+            to_subtask_index=2,
+            estimated_frame=20,
+            evidence="x",
+        )
+    ])
+    with pytest.raises(ValidationError):
+        CoarseDecision(**decision_fields(attempts=(illegal, illegal)))
+    uncertain = result([0, 1, 2], [20, 60], uncertainties=["occluded"])
+    with pytest.raises(ValidationError):
+        CoarseDecision(**decision_fields(attempts=(uncertain, uncertain), centers=(20, 60)))
+
+
+def test_needs_review_reasons_must_exactly_match_recomputed_audit_truth() -> None:
+    illegal = bypass_result(start=1)
+    base = decision_fields(
+        attempts=(illegal, result([0, 1, 2], [20, 60])),
+        status="needs_review",
+        reasons=("illegal_coarse_sequence",),
+        start=None,
+        observed=(),
+        centers=(),
+    )
+    with pytest.raises(ValidationError, match="recomputed"):
+        CoarseDecision(**base)
+    actual = (
+        "coarse_sequence_disagreement",
+        "illegal_coarse_sequence",
+    )
+    accepted = CoarseDecision(**(base | {"reasons": actual}))
+    assert accepted.reasons == actual
+    with pytest.raises(ValidationError):
+        CoarseDecision(**(base | {"reasons": tuple(reversed(actual))}))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("mode", "other"),
+        ("subtask_count", True),
+        ("subtask_count", "3"),
+        ("subtask_count", 0),
+        ("frame_count", True),
+        ("frame_count", "101"),
+        ("frame_count", 0),
+    ],
+)
+def test_decision_audit_context_is_strict_and_positive(field, value) -> None:
+    data = decision_fields()
+    data[field] = value
+    with pytest.raises(ValidationError):
+        CoarseDecision(**data)
+
+
+def test_valid_complete_dagger_and_singleton_decisions_roundtrip_json() -> None:
+    complete = CoarseDecision(**decision_fields())
+    dagger_attempts = (result([1, 2], [40]), result([1, 2], [41]))
+    dagger = CoarseDecision(
+        **decision_fields(
+            attempts=dagger_attempts,
+            mode="dagger_patch",
+            subtask_count=3,
+            start=1,
+            observed=(1, 2),
+            centers=(41,),
+        )
+    )
+    singleton_attempts = (result([1], []), result([1], []))
+    singleton = CoarseDecision(
+        **decision_fields(
+            attempts=singleton_attempts,
+            mode="dagger_patch",
+            subtask_count=3,
+            start=1,
+            observed=(1,),
+            centers=(),
+        )
+    )
+    for original in (complete, dagger, singleton):
+        restored = CoarseDecision.model_validate_json(original.model_dump_json())
+        assert restored == original
+
+
+def test_needs_review_with_bypassed_semantic_attempt_roundtrips_for_audit() -> None:
+    illegal = bypass_result(start=1)
+    decision = CoarseDecision(
+        **decision_fields(
+            attempts=(illegal, result([0, 1, 2], [20, 60])),
+            status="needs_review",
+            reasons=("coarse_sequence_disagreement", "illegal_coarse_sequence"),
+            start=None,
+            observed=(),
+            centers=(),
+        )
+    )
+
+    restored = CoarseDecision.model_validate_json(decision.model_dump_json())
+
+    assert restored == decision
+    assert restored.attempts[0].start_subtask_index == 1
+
+
+def test_model_validate_json_rejects_tampered_sample_grid() -> None:
+    payload = CoarseDecision(**decision_fields()).model_dump(mode="json")
+    payload["sampled_frame_indices"][0] = [0, 50, 50, 100]
+    with pytest.raises(ValidationError, match="sampled"):
+        CoarseDecision.model_validate_json(json.dumps(payload))
 
 
 @pytest.mark.asyncio

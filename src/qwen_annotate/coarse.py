@@ -8,12 +8,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validator, model_validator
 
 from .config import AnnotationConfig
 from .constraints import coarse_sequence_is_legal
 from .lerobot import EpisodeInfo
-from .models import CoarseResult
+from .models import CoarseBoundary, CoarseResult
 from .prompts import build_coarse_prompt
 from .qwen_client import QwenClient
 from .video import FrameSample, extract_frames, uniform_indices
@@ -53,32 +53,79 @@ class CoarseDecision(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
+    mode: Literal["complete", "dagger_patch"]
+    subtask_count: int = Field(ge=1, strict=True)
+    frame_count: int = Field(ge=1, strict=True)
     status: Literal["coarse_done", "needs_review"]
-    attempts: tuple[CoarseResult, CoarseResult]
+    attempts: tuple[SkipValidation[CoarseResult], SkipValidation[CoarseResult]]
     reasons: tuple[ReviewReason, ...]
     start_subtask_index: int | None = Field(default=None, ge=0)
     observed_subtask_indices: tuple[int, ...] = ()
     boundary_centers: tuple[int, ...] = ()
     sampled_frame_indices: tuple[tuple[int, ...], tuple[int, ...]]
 
+    @field_validator("attempts", mode="before")
+    @classmethod
+    def preserve_typed_bypassed_attempts(cls, value: object) -> object:
+        if not isinstance(value, (tuple, list)) or len(value) != 2:
+            return value
+        parsed: list[CoarseResult] = []
+        for attempt in value:
+            if isinstance(attempt, CoarseResult):
+                parsed.append(attempt)
+            elif isinstance(attempt, dict):
+                parsed.append(_attempt_from_mapping(attempt))
+            else:
+                raise ValueError("attempts must contain exactly two CoarseResult values")
+        return tuple(parsed)
+
     @model_validator(mode="after")
     def status_fields_are_consistent(self) -> "CoarseDecision":
-        if self.reasons != tuple(reason for reason in _REASON_ORDER if reason in self.reasons):
-            raise ValueError("reasons must be unique and in stable reason-code order")
-        if any(not grid for grid in self.sampled_frame_indices):
-            raise ValueError("each coarse pass must preserve at least one sampled frame")
+        for attempt in self.attempts:
+            _validate_attempt_shape(attempt)
+        for grid in self.sampled_frame_indices:
+            _validate_sampled_grid(grid, self.frame_count)
+
+        recomputed_set = _decision_reasons(
+            self.attempts[0],
+            self.attempts[1],
+            self.mode,
+            self.subtask_count,
+            self.frame_count,
+        )
+        recomputed = tuple(reason for reason in _REASON_ORDER if reason in recomputed_set)
         if self.status == "coarse_done":
-            if self.reasons:
-                raise ValueError("coarse_done cannot contain review reasons")
+            if recomputed or self.reasons:
+                raise ValueError("coarse_done requires two legal, certain, sequence-agreeing attempts")
             if self.start_subtask_index is None or not self.observed_subtask_indices:
                 raise ValueError("coarse_done requires an agreed start and observed sequence")
-            if self.start_subtask_index != self.observed_subtask_indices[0]:
-                raise ValueError("agreed start must equal the first observed subtask")
-            if len(self.boundary_centers) != len(self.observed_subtask_indices) - 1:
-                raise ValueError("boundary centers must match the agreed sequence")
+            first, second = self.attempts
+            agreed_sequence = tuple(first.observed_subtask_indices)
+            if (
+                self.start_subtask_index != first.start_subtask_index
+                or self.start_subtask_index != second.start_subtask_index
+                or self.observed_subtask_indices != agreed_sequence
+                or self.observed_subtask_indices != tuple(second.observed_subtask_indices)
+                or not coarse_sequence_is_legal(list(agreed_sequence), self.mode, self.subtask_count)
+            ):
+                raise ValueError("exposed coarse success sequence must exactly match both attempts")
+            expected_centers = tuple(
+                _positive_half_up(left.estimated_frame, right.estimated_frame)
+                for left, right in zip(first.coarse_boundaries, second.coarse_boundaries)
+            )
+            if self.boundary_centers != expected_centers:
+                raise ValueError("boundary centers must be exact pairwise half-up averages")
+            if any(
+                type(center) is not int or not (1 <= center < self.frame_count)
+                for center in self.boundary_centers
+            ) or any(
+                left >= right
+                for left, right in zip(self.boundary_centers, self.boundary_centers[1:])
+            ):
+                raise ValueError("boundary centers must be ordered valid transition frames")
         else:
-            if not self.reasons:
-                raise ValueError("needs_review requires at least one stable reason")
+            if not recomputed or self.reasons != recomputed:
+                raise ValueError("needs_review reasons must exactly equal recomputed audit reasons")
             if (
                 self.start_subtask_index is not None
                 or self.observed_subtask_indices
@@ -162,12 +209,15 @@ async def run_coarse(
     found = _decision_reasons(first, second, config.mode, len(config.subtasks), episode.length)
     reasons = tuple(reason for reason in _REASON_ORDER if reason in found)
     common = {
+        "mode": config.mode,
+        "subtask_count": len(config.subtasks),
+        "frame_count": episode.length,
         "attempts": (first, second),
         "reasons": reasons,
         "sampled_frame_indices": (sampled_grids[0], sampled_grids[1]),
     }
     if reasons:
-        return _make_decision_preserving_attempts(
+        return CoarseDecision(
             status="needs_review",
             start_subtask_index=None,
             observed_subtask_indices=(),
@@ -179,27 +229,13 @@ async def run_coarse(
         _positive_half_up(left.estimated_frame, right.estimated_frame)
         for left, right in zip(first.coarse_boundaries, second.coarse_boundaries)
     )
-    return _make_decision_preserving_attempts(
+    return CoarseDecision(
         status="coarse_done",
         start_subtask_index=first.start_subtask_index,
         observed_subtask_indices=tuple(first.observed_subtask_indices),
         boundary_centers=centers,
         **common,
     )
-
-
-def _make_decision_preserving_attempts(**fields: object) -> CoarseDecision:
-    """Build without revalidating deliberately bypassed model responses.
-
-    A caller can receive a ``CoarseResult.model_construct`` instance from an
-    injected or future client. Re-running its Pydantic validators here would
-    discard the audit result instead of quarantining it. All decision fields
-    are produced locally, and the decision's own cross-field invariants are
-    still executed explicitly.
-    """
-    decision = CoarseDecision.model_construct(**fields)
-    decision.status_fields_are_consistent()
-    return decision
 
 
 def _validate_inputs(config: AnnotationConfig, episode: EpisodeInfo) -> None:
@@ -255,6 +291,85 @@ def _validate_samples(samples: object, requested: list[int], camera: str) -> Non
         actual.append(sample.frame_index)
     if actual != requested:
         raise ValueError("sampler evidence indices must match requested order without duplicates")
+
+
+def _validate_sampled_grid(grid: tuple[int, ...], frame_count: int) -> None:
+    if not grid:
+        raise ValueError("each sampled frame grid must be nonempty")
+    if any(type(frame) is not int for frame in grid):
+        raise ValueError("sampled frame indices must be strict integers")
+    if grid[0] != 0 or grid[-1] != frame_count - 1:
+        raise ValueError("sampled frame grids must preserve both episode endpoints")
+    if any(frame < 0 or frame >= frame_count for frame in grid):
+        raise ValueError("sampled frame indices must be within the episode")
+    if any(left >= right for left, right in zip(grid, grid[1:])):
+        raise ValueError("sampled frame indices must be sorted and unique")
+
+
+def _attempt_from_mapping(value: dict[object, object]) -> CoarseResult:
+    expected = {
+        "start_subtask_index",
+        "observed_subtask_indices",
+        "coarse_boundaries",
+        "confidence",
+        "uncertainties",
+    }
+    if set(value) != expected:
+        raise ValueError("serialized coarse attempt has missing or extra fields")
+    raw_boundaries = value["coarse_boundaries"]
+    if not isinstance(raw_boundaries, list):
+        raise ValueError("serialized coarse boundaries must be a list")
+    boundaries: list[CoarseBoundary] = []
+    boundary_fields = {
+        "from_subtask_index",
+        "to_subtask_index",
+        "estimated_frame",
+        "evidence",
+    }
+    for raw in raw_boundaries:
+        if not isinstance(raw, dict) or set(raw) != boundary_fields:
+            raise ValueError("serialized coarse boundary has missing or extra fields")
+        boundaries.append(CoarseBoundary.model_construct(**raw))
+    return CoarseResult.model_construct(
+        start_subtask_index=value["start_subtask_index"],
+        observed_subtask_indices=value["observed_subtask_indices"],
+        coarse_boundaries=boundaries,
+        confidence=value["confidence"],
+        uncertainties=value["uncertainties"],
+    )
+
+
+def _validate_attempt_shape(attempt: object) -> None:
+    """Reject malformed audit containers while leaving semantic issues reviewable."""
+    if not isinstance(attempt, CoarseResult):
+        raise ValueError("attempts must contain CoarseResult values")
+    if type(getattr(attempt, "start_subtask_index", None)) is not int:
+        raise ValueError("attempt start_subtask_index must be a strict integer")
+    observed = getattr(attempt, "observed_subtask_indices", None)
+    if not isinstance(observed, list) or any(type(index) is not int for index in observed):
+        raise ValueError("attempt observed_subtask_indices must be a list of strict integers")
+    boundaries = getattr(attempt, "coarse_boundaries", None)
+    if not isinstance(boundaries, list):
+        raise ValueError("attempt coarse_boundaries must be a list")
+    for boundary in boundaries:
+        if not isinstance(boundary, CoarseBoundary):
+            raise ValueError("attempt boundaries must be CoarseBoundary values")
+        if any(
+            type(getattr(boundary, field, None)) is not int
+            for field in ("from_subtask_index", "to_subtask_index", "estimated_frame")
+        ):
+            raise ValueError("attempt boundary indices and frame must be strict integers")
+        evidence = getattr(boundary, "evidence", None)
+        if not isinstance(evidence, str) or not evidence:
+            raise ValueError("attempt boundary evidence must be a nonempty string")
+    confidence = getattr(attempt, "confidence", None)
+    if type(confidence) is not float or not math.isfinite(confidence) or not (0 <= confidence <= 1):
+        raise ValueError("attempt confidence must be a finite float in [0, 1]")
+    uncertainties = getattr(attempt, "uncertainties", None)
+    if not isinstance(uncertainties, list) or any(
+        not isinstance(item, str) or not item for item in uncertainties
+    ):
+        raise ValueError("attempt uncertainties must be a list of nonempty strings")
 
 
 def _decision_reasons(
