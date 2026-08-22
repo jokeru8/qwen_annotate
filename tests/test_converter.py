@@ -144,7 +144,7 @@ def test_conversion_refuses_every_nonaccepted_status_without_output(tmp_path: Pa
     assert not output.exists()
 
 
-def test_conversion_refuses_existing_nested_and_accepted_only(tmp_path: Path) -> None:
+def test_conversion_refuses_existing_and_nested_outputs(tmp_path: Path) -> None:
     source, work, services = _fixture(tmp_path)
     existing = tmp_path / "existing"
     existing.mkdir()
@@ -152,8 +152,8 @@ def test_conversion_refuses_existing_nested_and_accepted_only(tmp_path: Path) ->
         convert_dataset(work, existing, services=services)
     with pytest.raises(ValueError):
         convert_dataset(work, source / "nested", services=services)
-    with pytest.raises(NotImplementedError):
-        convert_dataset(work, tmp_path / "partial", accepted_only=True, services=services)
+    partial = convert_dataset(work, tmp_path / "partial", accepted_only=True, services=services)
+    assert partial.accepted_only and partial.episode_count == 2
 
 
 def test_source_change_and_copy_validation_failure_leave_no_final_output(tmp_path: Path) -> None:

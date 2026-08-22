@@ -12,17 +12,51 @@ import secrets
 import shutil
 import stat
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .config import AnnotationConfig
 from .constraints import validate_annotation
-from .lerobot import inspect_dataset
+from .lerobot import DatasetIndex, inspect_dataset
 from .release_validator import ReleaseReport, validate_release
-from .workspace import RunManifest, WorkspaceStore, compute_run_fingerprint, compute_source_fingerprint
+from .stats import recompute_stats
+from .workspace import EpisodeRecord, RunManifest, WorkspaceStore, compute_run_fingerprint, compute_source_fingerprint
+
+
+@dataclass(frozen=True)
+class EpisodeRemap:
+    source_index: int
+    output_index: int
+    length: int
+    global_offset: int
+
+
+def rewrite_episode_parquet(source: Path, destination: Path, remap: EpisodeRemap) -> None:
+    """Rewrite only LeRobot index columns while preserving schema metadata and payload values."""
+    if not isinstance(source, Path) or not isinstance(destination, Path) or not isinstance(remap, EpisodeRemap):
+        raise TypeError("source, destination, and remap must use their declared types")
+    table = pq.read_table(source)
+    if table.num_rows != remap.length:
+        raise ValueError("parquet row count differs from episode remap")
+    replacements = {
+        "episode_index": [remap.output_index] * remap.length,
+        "frame_index": list(range(remap.length)),
+        "index": list(range(remap.global_offset, remap.global_offset + remap.length)),
+    }
+    for name, values in replacements.items():
+        if name not in table.schema.names:
+            raise ValueError(f"parquet misses required column {name}")
+        position = table.schema.get_field_index(name)
+        field = table.schema.field(position)
+        table = table.set_column(position, field, pa.array(values, type=field.type))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, destination)
 
 
 class ConversionReport(BaseModel):
@@ -67,8 +101,6 @@ def convert_dataset(
     """Copy an accepted source tree, add public annotations, validate, and publish."""
     if type(accepted_only) is not bool:
         raise TypeError("accepted_only must be a bool")
-    if accepted_only:
-        raise NotImplementedError("accepted-only conversion is implemented in Task 14")
     if not isinstance(work_dir, Path) or not isinstance(output, Path):
         raise TypeError("work_dir and output must be Path objects")
     if work_dir.is_symlink():
@@ -94,16 +126,22 @@ def convert_dataset(
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         _reject_existing(out)
-        manifest, dataset, records = _guard_workspace(store, manifest, services)
+        manifest, dataset, records = _guard_workspace(store, manifest, services, accepted_only)
         source_before = _tree_digest(source)
         staging = out.parent / f"{out.name}.staging-{secrets.token_hex(16)}"
         os.mkdir(staging, 0o700)
         _copy_tree(source, staging)
         converted_at = datetime.now(UTC)
-        _write_public_metadata(staging, out, manifest, records, converted_at)
+        if accepted_only:
+            frame_count = _rewrite_accepted_subset(
+                staging, source, out, manifest, dataset, records, converted_at,
+            )
+        else:
+            frame_count = manifest.total_frames
+            _write_public_metadata(staging, out, manifest, records, converted_at)
         validation = validate_release(
             staging,
-            source=source,
+            source=None if accepted_only else source,
             services=services,
             _expected_output_root=out,
         )
@@ -118,8 +156,8 @@ def convert_dataset(
             os.close(parent_fd)
         published_validation = validation.model_copy(update={"path": out.resolve()})
         return ConversionReport(
-            output=out.resolve(), accepted_only=False, episode_count=manifest.total_episodes,
-            frame_count=manifest.total_frames, payload_files=validation.payload_files,
+            output=out.resolve(), accepted_only=accepted_only, episode_count=len(records),
+            frame_count=frame_count, payload_files=validation.payload_files,
             annotation_path="meta/lerobot_annotations.json", annotation_schema_version="reference-v2.1",
             converted_at=converted_at, source_tree_digest=source_before,
             validation=published_validation,
@@ -140,9 +178,13 @@ def convert_dataset(
             raise primary
 
 
-def _guard_workspace(store: WorkspaceStore, manifest: RunManifest, services: Any):
+def _guard_workspace(
+    store: WorkspaceStore, manifest: RunManifest, services: Any, accepted_only: bool,
+):
     summary = store.summary()
-    if summary["total"] != manifest.total_episodes or summary["counts"]["accepted"] != manifest.total_episodes:
+    if summary["total"] != manifest.total_episodes:
+        raise ValueError("workspace episode count differs from manifest")
+    if not accepted_only and summary["counts"]["accepted"] != manifest.total_episodes:
         raise ValueError("full conversion requires every episode to be accepted")
     effective = manifest.effective_config
     primary = effective.get("primary_camera")
@@ -174,34 +216,54 @@ def _guard_workspace(store: WorkspaceStore, manifest: RunManifest, services: Any
     records = []
     for episode in dataset.episodes:
         record = store.load_episode(episode.episode_index)
-        if record.status != "accepted" or record.final_annotation is None or record.decision_source not in ("human", "model"):
-            raise ValueError(f"episode {episode.episode_index} is not accepted")
         if record.run_fingerprint != manifest.run_fingerprint:
             raise ValueError("episode run provenance differs from manifest")
         if record.source_fingerprint != compute_source_fingerprint(dataset.root, episode):
             raise ValueError("episode source fingerprint is stale")
+        if record.status != "accepted":
+            if accepted_only:
+                continue
+            raise ValueError(f"episode {episode.episode_index} is not accepted")
+        if record.final_annotation is None or record.decision_source not in ("human", "model"):
+            raise ValueError(f"episode {episode.episode_index} is not accepted")
         issues = validate_annotation(record.final_annotation, manifest.mode, len(manifest.subtasks), episode.length, manifest.min_segment_frames)
         if issues:
             raise ValueError(f"episode {episode.episode_index} has invalid final annotation")
         if record.decision_source == "model" and (record.prompt_version != manifest.prompt_version or record.model_revision != manifest.model_revision):
             raise ValueError("model decision provenance differs from manifest")
         records.append(record)
+    if not records:
+        raise ValueError("accepted-only conversion requires at least one accepted episode")
     return manifest, dataset, records
 
 
 def _write_public_metadata(staging: Path, output: Path, manifest: RunManifest, records: list, converted_at: datetime) -> None:
+    selected = [
+        (record, record.episode_index, manifest.episode_lengths[record.episode_index])
+        for record in records
+    ]
+    _write_selection_metadata(staging, output, manifest, selected, converted_at)
+
+
+def _write_selection_metadata(
+    staging: Path,
+    output: Path,
+    manifest: RunManifest,
+    selected: list[tuple[EpisodeRecord, int, int]],
+    converted_at: datetime,
+) -> None:
     info_path = staging / "meta/info.json"
     info = _read_source_json(info_path)
     template = [item.model_dump(mode="json") for item in manifest.subtasks]
-    instruction_map = {str(index): manifest.high_level_instruction for index in range(manifest.total_episodes)}
+    instruction_map = {str(index): manifest.high_level_instruction for index in range(len(selected))}
     info["subtask_template"] = template
     info["high_level_instruction"] = instruction_map
     _atomic_json(info_path, info)
     episodes = {}
     task_info = []
-    for record in records:
+    for record, output_index, length in selected:
         annotation = record.final_annotation
-        entry = {"episode_index": record.episode_index}
+        entry = {"episode_index": output_index}
         if manifest.mode == "dagger_patch":
             entry["start_subtask_index"] = annotation.start_subtask_index
         entry.update({
@@ -209,10 +271,10 @@ def _write_public_metadata(staging: Path, output: Path, manifest: RunManifest, r
             "high_level_instruction": manifest.high_level_instruction,
             "saved_at": record.updated_at.astimezone(UTC).isoformat(),
         })
-        episodes[str(record.episode_index)] = entry
+        episodes[str(output_index)] = entry
         starts = [0, *annotation.boundaries]
-        ends = [*annotation.boundaries, manifest.episode_lengths[record.episode_index]]
-        selected = manifest.subtasks[
+        ends = [*annotation.boundaries, length]
+        selected_subtasks = manifest.subtasks[
             annotation.start_subtask_index:annotation.start_subtask_index + len(starts)
         ]
         actions = [
@@ -222,10 +284,10 @@ def _write_public_metadata(staging: Path, output: Path, manifest: RunManifest, r
                 "action_text": subtask.text,
                 "skill": subtask.skill,
             }
-            for start, end, subtask in zip(starts, ends, selected, strict=True)
+            for start, end, subtask in zip(starts, ends, selected_subtasks, strict=True)
         ]
         task_info.append({
-            "episode_id": record.episode_index,
+            "episode_id": output_index,
             "task_id": 0,
             "task_name": manifest.high_level_instruction,
             "label_info": {"action_config": actions},
@@ -242,6 +304,92 @@ def _write_public_metadata(staging: Path, output: Path, manifest: RunManifest, r
     task_dir = staging / "meta/task_info"
     task_dir.mkdir(exist_ok=True)
     _atomic_json(task_dir / "task_0.json", task_info, sort_keys=False)
+
+
+def _rewrite_accepted_subset(
+    staging: Path,
+    source: Path,
+    output: Path,
+    manifest: RunManifest,
+    dataset: DatasetIndex,
+    records: list[EpisodeRecord],
+    converted_at: datetime,
+) -> int:
+    info_path = staging / "meta/info.json"
+    info = _read_source_json(info_path)
+    chunks_size = info.get("chunks_size")
+    if type(chunks_size) is not int or chunks_size < 1:
+        raise ValueError("source chunks_size must be a positive integer")
+    data_template = info.get("data_path")
+    video_template = info.get("video_path")
+    if not isinstance(data_template, str) or not isinstance(video_template, str):
+        raise ValueError("source payload templates must be strings")
+
+    episode_by_index = {episode.episode_index: episode for episode in dataset.episodes}
+    selected_records = sorted(records, key=lambda record: record.episode_index)
+    remaps: list[EpisodeRemap] = []
+    offset = 0
+    for output_index, record in enumerate(selected_records):
+        episode = episode_by_index[record.episode_index]
+        remaps.append(EpisodeRemap(record.episode_index, output_index, episode.length, offset))
+        offset += episode.length
+
+    _clear_payload_directory(staging / "data", staging)
+    _clear_payload_directory(staging / "videos", staging)
+    rewritten_parquets: list[Path] = []
+    for remap in remaps:
+        episode = episode_by_index[remap.source_index]
+        values = {
+            "episode_chunk": remap.output_index // chunks_size,
+            "episode_index": remap.output_index,
+        }
+        parquet_relative = _render_payload_path(data_template, values, "data_path", "data")
+        parquet_destination = staging / parquet_relative
+        rewrite_episode_parquet(episode.parquet, parquet_destination, remap)
+        rewritten_parquets.append(parquet_destination)
+        for camera in manifest.camera_keys:
+            video_relative = _render_payload_path(
+                video_template, values | {"video_key": camera}, "video_path", "videos",
+            )
+            destination = staging / video_relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(episode.videos[camera], destination, follow_symlinks=False)
+
+    source_episode_rows = _read_source_jsonl(source / "meta/episodes.jsonl")
+    rows_by_index = {row.get("episode_index"): row for row in source_episode_rows}
+    output_episode_rows = []
+    for remap in remaps:
+        row = rows_by_index.get(remap.source_index)
+        if not isinstance(row, dict):
+            raise ValueError("source episodes metadata misses selected episode")
+        output_episode_rows.append(row | {"episode_index": remap.output_index, "length": remap.length})
+    _atomic_jsonl(staging / "meta/episodes.jsonl", output_episode_rows)
+
+    aggregate_stats = recompute_stats(rewritten_parquets)
+    _atomic_json(staging / "meta/stats.json", aggregate_stats, sort_keys=False)
+    episode_stats = [
+        {"episode_index": remap.output_index, "stats": recompute_stats([parquet])}
+        for remap, parquet in zip(remaps, rewritten_parquets, strict=True)
+    ]
+    _atomic_jsonl(staging / "meta/episodes_stats.jsonl", episode_stats)
+
+    count = len(remaps)
+    info.update({
+        "total_episodes": count,
+        "total_frames": offset,
+        "total_videos": count * len(manifest.camera_keys),
+        "total_chunks": (count + chunks_size - 1) // chunks_size,
+        "splits": {"train": f"0:{count}"},
+        "data_files_size_in_mb": _payload_size_mb(staging / "data", ".parquet"),
+        "video_files_size_in_mb": _payload_size_mb(staging / "videos", ".mp4"),
+    })
+    _atomic_json(info_path, info)
+    selected = [
+        (record, remap.output_index, remap.length)
+        for record, remap in zip(selected_records, remaps, strict=True)
+    ]
+    _write_selection_metadata(staging, output, manifest, selected, converted_at)
+    return offset
 
 
 def _copy_tree(source: Path, staging: Path) -> None:
@@ -275,6 +423,36 @@ def _copy_tree(source: Path, staging: Path) -> None:
         raise ValueError("source root changed while copying")
 
 
+def _clear_payload_directory(path: Path, staging: Path) -> None:
+    if path.parent != staging or path.name not in {"data", "videos"} or path.is_symlink() or not path.is_dir():
+        raise ValueError("copied payload directory is unsafe")
+    shutil.rmtree(path)
+    path.mkdir()
+
+
+def _render_payload_path(
+    template: str,
+    values: dict[str, Any],
+    label: str,
+    required_root: str,
+) -> Path:
+    try:
+        relative = Path(template.format(**values))
+    except Exception as exc:
+        raise ValueError(f"invalid {label} template") from exc
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts or relative.parts[0] != required_root:
+        raise ValueError(f"{label} path escapes its payload directory")
+    return relative
+
+
+def _payload_size_mb(directory: Path, suffix: str) -> float:
+    return sum(
+        path.stat(follow_symlinks=False).st_size
+        for path in directory.rglob(f"*{suffix}")
+        if path.is_file() and not path.is_symlink()
+    ) / (2**20)
+
+
 def _read_source_json(path: Path) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
         raise ValueError("unsafe info.json")
@@ -293,6 +471,36 @@ def _read_source_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("info.json must be an object")
     return value
+
+
+def _read_source_jsonl(path: Path) -> list[dict[str, Any]]:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+        raise ValueError(f"unsafe {path.name}")
+    rows = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            raise ValueError(f"blank {path.name} row {number}")
+        try:
+            value = json.loads(
+                line,
+                object_pairs_hook=lambda pairs: _unique_pairs(pairs, path.name),
+                parse_constant=lambda constant: (_ for _ in ()).throw(ValueError(constant)),
+            )
+        except Exception as exc:
+            raise ValueError(f"invalid {path.name} row {number}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"{path.name} rows must be objects")
+        rows.append(value)
+    return rows
+
+
+def _unique_pairs(pairs: list[tuple[str, Any]], context: str) -> dict[str, Any]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key} in {context}")
+        result[key] = value
+    return result
 
 
 def _atomic_json(path: Path, value: Any, *, sort_keys: bool = True) -> None:
@@ -316,6 +524,35 @@ def _atomic_json(path: Path, value: Any, *, sort_keys: bool = True) -> None:
         if name:
             try: os.unlink(name, dir_fd=directory_fd)
             except FileNotFoundError: pass
+        os.close(directory_fd)
+
+
+def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    encoded = b"".join(
+        (json.dumps(row, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode()
+        for row in rows
+    )
+    directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    name = f".{path.name}.{secrets.token_hex(12)}.tmp"
+    fd = None
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=directory_fd)
+        with os.fdopen(fd, "wb") as handle:
+            fd = None
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        name = ""
+        os.fsync(directory_fd)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if name:
+            try:
+                os.unlink(name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
         os.close(directory_fd)
 
 
