@@ -65,10 +65,16 @@ def test_coarse_prompt_reserves_exact_frame_uncertainty_for_refine():
         100,
         0,
     )
-    assert "Only report uncertainties when you cannot determine" in prompt
-    assert "subtask order, the starting subtask, or an approximate transition neighborhood" in prompt
-    assert "Normal uncertainty about the exact transition frame is handled by refine" in prompt
-    assert "uncertainties=[]" in prompt
+    policy = (
+        "Uncertainty policy: If any of the subtask order, starting subtask, or approximate "
+        "transition neighborhood cannot be determined from sparse evidence, you MUST add a "
+        "concise item to uncertainties and MUST NOT guess that semantic fact.\n"
+        "If all three are clear and only the exact transition frame is uncertain, set "
+        "uncertainties=[] and return the best approximate estimated_frame; refine will "
+        "determine the exact frame."
+    )
+    assert policy in prompt
+    assert "If evidence is insufficient, report uncertainties" not in prompt
 
 
 def test_coarse_prompt_handles_one_frame_transition_range():
