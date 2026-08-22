@@ -1,6 +1,9 @@
 import json
 import asyncio
+import hashlib
 import math
+import os
+import stat
 import time
 from pathlib import Path
 
@@ -667,10 +670,45 @@ def test_attempt_audit_lists_block_every_mutation_api(field, mutate) -> None:
     )
     before = decision.model_dump(mode="json")
 
-    with pytest.raises(TypeError, match="immutable"):
+    with pytest.raises((AttributeError, TypeError)):
         mutate(getattr(decision.attempts[0], field))
 
     assert decision.model_dump(mode="json") == before
+
+
+@pytest.mark.parametrize(
+    ("operation", "field"),
+    [
+        (lambda value: list.append(value, 9), "observed_subtask_indices"),
+        (lambda value: list.extend(value, [9]), "observed_subtask_indices"),
+        (lambda value: list.insert(value, 0, 9), "coarse_boundaries"),
+        (lambda value: list.pop(value), "coarse_boundaries"),
+        (lambda value: list.clear(value), "uncertainties"),
+        (lambda value: list.__setitem__(value, 0, 9), "observed_subtask_indices"),
+        (lambda value: list.__delitem__(value, 0), "coarse_boundaries"),
+    ],
+)
+def test_unbound_list_mutators_cannot_bypass_attempt_immutability(operation, field) -> None:
+    first = result([0, 1, 2], [20, 60], uncertainties=["review note"])
+    second = result([0, 1, 2], [21, 61], uncertainties=["review note"])
+    decision = CoarseDecision(
+        **decision_fields(
+            attempts=(first, second),
+            status="needs_review",
+            reasons=("coarse_uncertain",),
+            start=None,
+            observed=(),
+            centers=(),
+        )
+    )
+    snapshot = decision.model_dump(mode="json")
+    audit_field = getattr(decision.attempts[0], field)
+
+    assert isinstance(decision.attempts[0], CoarseResult)
+    assert isinstance(audit_field, tuple)
+    with pytest.raises(TypeError):
+        operation(audit_field)
+    assert decision.model_dump(mode="json") == snapshot
 
 
 def test_decision_deep_copies_caller_owned_attempt_lists() -> None:
@@ -684,9 +722,29 @@ def test_decision_deep_copies_caller_owned_attempt_lists() -> None:
     first.uncertainties.append("changed later")
 
     assert decision.status == "coarse_done"
-    assert decision.attempts[0].observed_subtask_indices == [0, 1, 2]
+    assert decision.attempts[0].observed_subtask_indices == (0, 1, 2)
     assert len(decision.attempts[0].coarse_boundaries) == 2
-    assert decision.attempts[0].uncertainties == []
+    assert decision.attempts[0].uncertainties == ()
+
+
+def test_mutating_dumped_payload_cannot_change_decision_audit_truth() -> None:
+    decision = CoarseDecision(**decision_fields())
+    python_payload = decision.model_dump()
+    assert isinstance(python_payload["attempts"][0]["observed_subtask_indices"], tuple)
+    assert isinstance(python_payload["attempts"][0]["coarse_boundaries"], tuple)
+    assert isinstance(python_payload["attempts"][0]["uncertainties"], tuple)
+    python_payload["attempts"][0]["coarse_boundaries"][0]["evidence"] = "tampered"
+    payload = decision.model_dump(mode="json")
+    assert isinstance(payload["attempts"][0]["observed_subtask_indices"], list)
+    payload["attempts"][0]["observed_subtask_indices"].append(99)
+    payload["attempts"][0]["coarse_boundaries"].clear()
+    payload["attempts"][0]["uncertainties"].append("tampered")
+
+    assert decision.status == "coarse_done"
+    assert decision.attempts[0].observed_subtask_indices == (0, 1, 2)
+    assert len(decision.attempts[0].coarse_boundaries) == 2
+    assert decision.attempts[0].coarse_boundaries[0].evidence == "visible transition"
+    assert decision.attempts[0].uncertainties == ()
 
 
 def test_malformed_model_construct_attempt_is_rejected_as_validation_error() -> None:
@@ -830,10 +888,7 @@ async def test_source_files_are_not_modified(tmp_path: Path) -> None:
     config = make_config(tmp_path)
     video = make_episode(tmp_path).videos["cam.eye"]
     video.write_bytes(b"source video")
-    before = {
-        path: (path.read_bytes(), path.stat().st_mtime_ns)
-        for path in (config.source / "meta" / "info.json", video)
-    }
+    before = recursive_source_snapshot(config.source)
 
     await run_coarse(
         config,
@@ -842,7 +897,27 @@ async def test_source_files_are_not_modified(tmp_path: Path) -> None:
         RecordingClient([result([0, 1, 2], [20, 60]), result([0, 1, 2], [21, 61])]),
     )
 
-    assert {
-        path: (path.read_bytes(), path.stat().st_mtime_ns)
-        for path in before
-    } == before
+    assert recursive_source_snapshot(config.source) == before
+
+
+def recursive_source_snapshot(root: Path):
+    snapshot = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        file_stat = path.lstat()
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        common = (
+            file_stat.st_dev,
+            file_stat.st_ino,
+            stat.S_IFMT(file_stat.st_mode),
+            stat.S_IMODE(file_stat.st_mode),
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+        )
+        if stat.S_ISREG(file_stat.st_mode):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        elif stat.S_ISLNK(file_stat.st_mode):
+            digest = os.readlink(path)
+        else:
+            digest = None
+        snapshot[relative] = (common, digest)
+    return snapshot

@@ -53,27 +53,6 @@ class _Completer(Protocol):
 Sampler = Callable[[Path, str, list[int], float], list[FrameSample]]
 
 
-class _FrozenList(list):
-    """A list-compatible immutable snapshot for public Pydantic result fields."""
-
-    @staticmethod
-    def _immutable(*args: object, **kwargs: object) -> None:
-        raise TypeError("coarse audit lists are immutable")
-
-    __setitem__ = _immutable
-    __delitem__ = _immutable
-    __iadd__ = _immutable
-    __imul__ = _immutable
-    append = _immutable
-    clear = _immutable
-    extend = _immutable
-    insert = _immutable
-    pop = _immutable
-    remove = _immutable
-    reverse = _immutable
-    sort = _immutable
-
-
 @dataclass(frozen=True)
 class _SourceState:
     root: Path
@@ -86,6 +65,14 @@ class _SourceState:
     info_sha256: str
 
 
+class _ImmutableCoarseResult(CoarseResult):
+    """A CoarseResult-compatible audit snapshot with tuple-backed sequences."""
+
+    observed_subtask_indices: tuple[int, ...]
+    coarse_boundaries: tuple[CoarseBoundary, ...]
+    uncertainties: tuple[str, ...] = ()
+
+
 class CoarseDecision(BaseModel):
     """Auditable outcome of two independent whole-episode model passes."""
 
@@ -95,7 +82,10 @@ class CoarseDecision(BaseModel):
     subtask_count: int = Field(ge=1, strict=True)
     frame_count: int = Field(ge=1, strict=True)
     status: Literal["coarse_done", "needs_review"]
-    attempts: tuple[SkipValidation[CoarseResult], SkipValidation[CoarseResult]]
+    attempts: tuple[
+        SkipValidation[_ImmutableCoarseResult],
+        SkipValidation[_ImmutableCoarseResult],
+    ]
     reasons: tuple[ReviewReason, ...]
     start_subtask_index: int | None = Field(default=None, ge=0)
     observed_subtask_indices: tuple[int, ...] = ()
@@ -107,7 +97,7 @@ class CoarseDecision(BaseModel):
     def preserve_typed_bypassed_attempts(cls, value: object) -> object:
         if not isinstance(value, (tuple, list)) or len(value) != 2:
             return value
-        parsed: list[CoarseResult] = []
+        parsed: list[_ImmutableCoarseResult] = []
         for attempt in value:
             if isinstance(attempt, CoarseResult):
                 _validate_attempt_shape(attempt)
@@ -579,8 +569,8 @@ def _validate_grid_independence(
         )
 
 
-def _freeze_attempt(attempt: CoarseResult) -> CoarseResult:
-    boundaries = _FrozenList(
+def _freeze_attempt(attempt: CoarseResult) -> _ImmutableCoarseResult:
+    boundaries = tuple(
         CoarseBoundary.model_construct(
             from_subtask_index=getattr(boundary, "from_subtask_index", None),
             to_subtask_index=getattr(boundary, "to_subtask_index", None),
@@ -591,14 +581,12 @@ def _freeze_attempt(attempt: CoarseResult) -> CoarseResult:
         else boundary
         for boundary in getattr(attempt, "coarse_boundaries", [])
     )
-    return CoarseResult.model_construct(
+    return _ImmutableCoarseResult.model_construct(
         start_subtask_index=getattr(attempt, "start_subtask_index", None),
-        observed_subtask_indices=_FrozenList(
-            list(getattr(attempt, "observed_subtask_indices", []))
-        ),
+        observed_subtask_indices=tuple(getattr(attempt, "observed_subtask_indices", [])),
         coarse_boundaries=boundaries,
         confidence=getattr(attempt, "confidence", None),
-        uncertainties=_FrozenList(list(getattr(attempt, "uncertainties", []))),
+        uncertainties=tuple(getattr(attempt, "uncertainties", [])),
     )
 
 
@@ -642,11 +630,11 @@ def _validate_attempt_shape(attempt: object) -> None:
     if type(getattr(attempt, "start_subtask_index", None)) is not int:
         raise ValueError("attempt start_subtask_index must be a strict integer")
     observed = getattr(attempt, "observed_subtask_indices", None)
-    if not isinstance(observed, list) or any(type(index) is not int for index in observed):
-        raise ValueError("attempt observed_subtask_indices must be a list of strict integers")
+    if not isinstance(observed, (list, tuple)) or any(type(index) is not int for index in observed):
+        raise ValueError("attempt observed_subtask_indices must be a sequence of strict integers")
     boundaries = getattr(attempt, "coarse_boundaries", None)
-    if not isinstance(boundaries, list):
-        raise ValueError("attempt coarse_boundaries must be a list")
+    if not isinstance(boundaries, (list, tuple)):
+        raise ValueError("attempt coarse_boundaries must be a sequence")
     for boundary in boundaries:
         if not isinstance(boundary, CoarseBoundary):
             raise ValueError("attempt boundaries must be CoarseBoundary values")
@@ -662,10 +650,10 @@ def _validate_attempt_shape(attempt: object) -> None:
     if type(confidence) is not float or not math.isfinite(confidence) or not (0 <= confidence <= 1):
         raise ValueError("attempt confidence must be a finite float in [0, 1]")
     uncertainties = getattr(attempt, "uncertainties", None)
-    if not isinstance(uncertainties, list) or any(
+    if not isinstance(uncertainties, (list, tuple)) or any(
         not isinstance(item, str) or not item for item in uncertainties
     ):
-        raise ValueError("attempt uncertainties must be a list of nonempty strings")
+        raise ValueError("attempt uncertainties must be a sequence of nonempty strings")
 
 
 def _decision_reasons(
@@ -694,7 +682,7 @@ def _decision_reasons(
             reasons.add("illegal_coarse_sequence")
         _validate_attempt_boundaries(attempt, sequence, episode_length, reasons)
         uncertainties = getattr(attempt, "uncertainties", None)
-        if not isinstance(uncertainties, list) or bool(uncertainties):
+        if not isinstance(uncertainties, (list, tuple)) or bool(uncertainties):
             reasons.add("coarse_uncertain")
     return reasons
 
@@ -707,9 +695,9 @@ def _validate_attempt_boundaries(
 ) -> None:
     boundaries = getattr(attempt, "coarse_boundaries", None)
     expected_count = len(sequence) - 1 if sequence else 0
-    if not isinstance(boundaries, list) or len(boundaries) != expected_count:
+    if not isinstance(boundaries, (list, tuple)) or len(boundaries) != expected_count:
         reasons.add("coarse_boundary_count")
-    if not isinstance(boundaries, list):
+    if not isinstance(boundaries, (list, tuple)):
         return
     previous_frame = 0
     for index, item in enumerate(boundaries):
@@ -733,9 +721,9 @@ def _validate_attempt_boundaries(
 
 
 def _strict_int_list(value: object) -> list[int] | None:
-    if not isinstance(value, list) or any(type(item) is not int for item in value):
+    if not isinstance(value, (list, tuple)) or any(type(item) is not int for item in value):
         return None
-    return value
+    return list(value)
 
 
 def _positive_half_up(left: int, right: int) -> int:
