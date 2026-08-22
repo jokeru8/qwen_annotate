@@ -41,6 +41,10 @@ _THREAD_LOCKS_GUARD = threading.Lock()
 _THREAD_LOCKS: dict[str, threading.RLock] = {}
 
 
+class LegacyWorkspaceError(ValueError):
+    """A pre-layered workspace is intentionally read-only under the current schema."""
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -739,7 +743,20 @@ class WorkspaceStore:
         if not path.is_file():
             raise FileNotFoundError(f"Missing episode record: {path}")
         try:
-            record = EpisodeRecord.model_validate_json(_canonical_json(_read_json_object(path)))
+            payload = _read_json_object(path)
+            attempts = payload.get("coarse_attempts")
+            if (
+                payload.get("prompt_version") == "coarse-v4/refine-v1"
+                and isinstance(attempts, list)
+                and any(isinstance(attempt, dict) and "uncertainties" in attempt for attempt in attempts)
+            ):
+                raise LegacyWorkspaceError(
+                    "legacy coarse-v4 record uses removed uncertainties; preserve the original "
+                    "JSON for manual audit and create a new workspace"
+                )
+            record = EpisodeRecord.model_validate_json(_canonical_json(payload))
+        except LegacyWorkspaceError:
+            raise
         except (ValidationError, ValueError) as exc:
             raise ValueError(f"Invalid episode record {path.name}: {exc}") from exc
         if record.episode_index != index:

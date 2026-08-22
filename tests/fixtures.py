@@ -1,12 +1,54 @@
 """Builders for small, structurally valid LeRobot v2.1 datasets."""
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from qwen_annotate.config import AnnotationConfig
+
+
+def make_legacy_v4_workspace(tmp_path: Path) -> Path:
+    """Write one realistic coarse-v4 episode record with the removed field."""
+    work = tmp_path / "legacy-v4-work"
+    episodes = work / "episodes"
+    episodes.mkdir(parents=True)
+    for relative in ("previews", "previews/needs_review", "logs"):
+        (work / relative).mkdir(parents=True, exist_ok=True)
+    now = datetime(2026, 8, 22, tzinfo=UTC).isoformat()
+    payload = {
+        "episode_index": 0,
+        "status": "coarse_done",
+        "coarse_attempts": [{
+            "start_subtask_index": 0,
+            "observed_subtask_indices": [0, 1],
+            "coarse_boundaries": [{
+                "from_subtask_index": 0,
+                "to_subtask_index": 1,
+                "estimated_frame": 20,
+                "evidence": "visible transition",
+            }],
+            "confidence": 0.9,
+            "uncertainties": [],
+        }],
+        "refine_attempts": [],
+        "final_annotation": None,
+        "validation_issues": [],
+        "review_reasons": [],
+        "failure_category": None,
+        "decision_source": None,
+        "created_at": now,
+        "updated_at": now,
+        "source_fingerprint": "a" * 64,
+        "run_fingerprint": "b" * 64,
+        "prompt_version": "coarse-v4/refine-v1",
+        "model_revision": "c" * 40,
+        "sampling_details": {"coarse_decision": {"legacy": True}},
+    }
+    (episodes / "episode_000000.json").write_text(json.dumps(payload), encoding="utf-8")
+    return work
 
 
 def make_lerobot_fixture(

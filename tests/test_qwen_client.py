@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
-from qwen_annotate.models import FinalAnnotation
+from qwen_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation
 from qwen_annotate.qwen_client import (
     InvalidModelResponse,
     ModelCallError,
@@ -410,6 +410,35 @@ async def test_normal_and_format_repair_requests_are_explicitly_greedy() -> None
     )
     assert result.boundaries == [44]
     assert [request["temperature"] for request in calls] == [0, 0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["semantic_uncertainty_codes", "boundary_precision_notes"])
+async def test_coarse_response_missing_layered_field_cannot_silently_default(missing: str) -> None:
+    payload = CoarseResult(
+        start_subtask_index=0,
+        observed_subtask_indices=[0, 1],
+        coarse_boundaries=[CoarseBoundary(
+            from_subtask_index=0, to_subtask_index=1,
+            estimated_frame=20, evidence="visible transition",
+        )],
+        confidence=0.9,
+        semantic_uncertainty_codes=[],
+        boundary_precision_notes=[],
+    ).model_dump(mode="json")
+    payload.pop(missing)
+    calls = 0
+
+    async def send(**kwargs):
+        nonlocal calls
+        calls += 1
+        return json.dumps(payload)
+
+    with pytest.raises(InvalidModelResponse):
+        await QwenClient(send=send, max_attempts=2).complete(
+            "prompt", [], CoarseResult
+        )
+    assert calls == 2
 
 
 @pytest.mark.asyncio

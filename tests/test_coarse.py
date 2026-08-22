@@ -330,6 +330,7 @@ def test_layered_uncertainty_schema_rejects_unknown_codes_and_legacy_field() -> 
     assert "semantic_uncertainty_codes" in schema["properties"]
     assert "boundary_precision_notes" in schema["properties"]
     assert "uncertainties" not in schema["properties"]
+    assert {"semantic_uncertainty_codes", "boundary_precision_notes"} <= set(schema["required"])
     payload = {
         "start_subtask_index": 0,
         "observed_subtask_indices": [0],

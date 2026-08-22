@@ -143,6 +143,8 @@ class _DeterministicModel:
                     evidence="The first action ends before the second begins.",
                 )],
                 confidence=0.99,
+                semantic_uncertainty_codes=[],
+                boundary_precision_notes=[],
             )
         assert response_type is RefineResult
         self.refine_calls += 1

@@ -15,7 +15,7 @@ from .model_manager import download_model
 from .pipeline import WorkspaceSummary, annotate_dataset
 from .review import apply_human_decision, load_human_decision, render_review_site
 from .release_validator import validate_release
-from .workspace import WorkspaceStore
+from .workspace import LegacyWorkspaceError, WorkspaceStore
 
 
 app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
@@ -87,6 +87,13 @@ def status_command(work_dir: Path, as_json: bool = typer.Option(False, "--json")
     try:
         raw = WorkspaceStore(work_dir).summary()
         summary = WorkspaceSummary.from_store_summary(raw)
+    except LegacyWorkspaceError:
+        typer.echo(
+            "Legacy coarse-v4 workspace is read-only: preserve its JSON for manual audit "
+            "and create a new workspace.",
+            err=True,
+        )
+        raise typer.Exit(1)
     except Exception:
         typer.echo("Workspace status could not be read.", err=True)
         raise typer.Exit(1)

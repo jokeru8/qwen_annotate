@@ -28,7 +28,7 @@ def config(mode: str = "complete", subtasks=None) -> AnnotationConfig:
 
 def test_coarse_prompt_contains_ordered_template_and_required_rules():
     prompt = build_coarse_prompt(config("dagger_patch", [{"skill": "pick", "text": "pick"}, {"skill": "place", "text": "place"}]), 2, 20, 3)
-    assert PROMPT_VERSION == "coarse-v5/refine-v1"
+    assert PROMPT_VERSION == "coarse-v6/refine-v1"
     context = json.loads(prompt.split("BEGIN_UNTRUSTED_CONTEXT_JSON\n", 1)[1].split("\nEND_UNTRUSTED_CONTEXT_JSON", 1)[0])
     assert context["subtasks"] == [{"index": 0, "skill": "pick", "text": "pick"}, {"index": 1, "skill": "place", "text": "place"}]
     assert "Do not invent or rewrite labels" in prompt
@@ -67,11 +67,13 @@ def test_coarse_prompt_reserves_exact_frame_uncertainty_for_refine():
     )
     expected_policy = (
         "Semantic uncertainty policy: Use semantic_uncertainty_codes only for semantic facts "
-        "that block coarse acceptance. If sparse evidence cannot determine subtask order, add "
+        "that block coarse acceptance. You MUST always return the best-supported provisional "
+        "start, sequence, and approximate boundaries required by the schema. If sparse evidence "
+        "cannot determine subtask order, add "
         "subtask_order_unclear; if it cannot determine the starting subtask, add "
         "start_subtask_unclear; if it cannot determine an approximate transition neighborhood, "
-        "add transition_neighborhood_unclear. Add every applicable code and MUST NOT guess any "
-        "unclear semantic fact.\n"
+        "add transition_neighborhood_unclear. Add every applicable code; codes are the authoritative "
+        "blockers, so do not present the corresponding provisional candidate as a certain fact.\n"
         "If all three semantic facts are clear, set semantic_uncertainty_codes=[] and return "
         "the best approximate estimated_frame values; refine will determine exact frames. Put "
         "optional exact-frame imprecision comments in boundary_precision_notes; these notes are "

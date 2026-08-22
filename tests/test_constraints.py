@@ -64,6 +64,8 @@ def test_models_are_frozen_and_forbid_extra_fields() -> None:
         observed_subtask_indices=[0],
         coarse_boundaries=[],
         confidence=0.5,
+        semantic_uncertainty_codes=[],
+        boundary_precision_notes=[],
     )
     with pytest.raises(ValidationError):
         CoarseBoundary(from_subtask_index=0, to_subtask_index=1, estimated_frame=2, evidence="x", extra=1)
@@ -145,15 +147,17 @@ def test_models_reject_coercion_empty_evidence_and_cues() -> None:
 def test_coarse_result_rejects_cross_field_inconsistency() -> None:
     boundary = CoarseBoundary(from_subtask_index=0, to_subtask_index=1, estimated_frame=2, evidence="x")
     with pytest.raises(ValidationError):
-        CoarseResult(start_subtask_index=1, observed_subtask_indices=[0, 1], coarse_boundaries=[boundary], confidence=0.5)
+        CoarseResult(start_subtask_index=1, observed_subtask_indices=[0, 1], coarse_boundaries=[boundary], confidence=0.5, semantic_uncertainty_codes=[], boundary_precision_notes=[])
     with pytest.raises(ValidationError):
-        CoarseResult(start_subtask_index=0, observed_subtask_indices=[0, 1, 2], coarse_boundaries=[boundary], confidence=0.5)
+        CoarseResult(start_subtask_index=0, observed_subtask_indices=[0, 1, 2], coarse_boundaries=[boundary], confidence=0.5, semantic_uncertainty_codes=[], boundary_precision_notes=[])
     with pytest.raises(ValidationError):
         CoarseResult(
             start_subtask_index=0,
             observed_subtask_indices=[0, 1, 2],
             coarse_boundaries=[boundary, CoarseBoundary(from_subtask_index=1, to_subtask_index=2, estimated_frame=2, evidence="x")],
             confidence=0.5,
+            semantic_uncertainty_codes=[],
+            boundary_precision_notes=[],
         )
 
 

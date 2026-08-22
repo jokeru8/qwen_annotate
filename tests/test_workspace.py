@@ -20,7 +20,7 @@ from qwen_annotate.workspace import (
     compute_run_fingerprint,
     compute_source_fingerprint,
 )
-from tests.fixtures import make_config
+from tests.fixtures import make_config, make_legacy_v4_workspace
 
 
 SHA = "a" * 40
@@ -58,6 +58,8 @@ def coarse_result() -> CoarseResult:
         observed_subtask_indices=[0, 1],
         coarse_boundaries=[CoarseBoundary(from_subtask_index=0, to_subtask_index=1, estimated_frame=5, evidence="placed")],
         confidence=0.8,
+        semantic_uncertainty_codes=[],
+        boundary_precision_notes=[],
     )
 
 
@@ -88,6 +90,15 @@ def test_workspace_roundtrips_complete_layered_coarse_audit(tmp_path: Path) -> N
     ]
 
 
+def test_legacy_v4_episode_record_fails_closed_with_manual_audit_guidance(tmp_path: Path) -> None:
+    work = make_legacy_v4_workspace(tmp_path)
+    with pytest.raises(
+        ValueError,
+        match=r"legacy coarse-v4.*uncertainties.*manual audit.*new workspace",
+    ):
+        WorkspaceStore(work).load_episode(0)
+
+
 def refine_result() -> RefineResult:
     return RefineResult(
         from_subtask_index=0,
@@ -106,6 +117,8 @@ def zero_transition_review_audit() -> tuple[CoarseDecision, RefineDecision]:
         observed_subtask_indices=[0],
         coarse_boundaries=[],
         confidence=0.9,
+        semantic_uncertainty_codes=[],
+        boundary_precision_notes=[],
     )
     coarse = CoarseDecision(
         mode="complete",
@@ -282,6 +295,8 @@ def test_zero_transition_episode_flows_through_refine_done_to_accepted(
         observed_subtask_indices=[0],
         coarse_boundaries=[],
         confidence=0.8,
+        semantic_uncertainty_codes=[],
+        boundary_precision_notes=[],
     )
     coarse = transition(base, "coarse_done", coarse_attempts=[one_subtask_coarse])
     store.save_episode(coarse)
@@ -734,6 +749,8 @@ def test_initialized_store_requires_model_revision_to_match_manifest(tmp_path: P
             observed_subtask_indices=[0],
             coarse_boundaries=[],
             confidence=0.8,
+            semantic_uncertainty_codes=[],
+            boundary_precision_notes=[],
         )],
     )
     store.save_episode(coarse)
@@ -769,6 +786,8 @@ def test_initialized_store_requires_model_prompt_to_match_manifest(tmp_path: Pat
             observed_subtask_indices=[0],
             coarse_boundaries=[],
             confidence=0.8,
+            semantic_uncertainty_codes=[],
+            boundary_precision_notes=[],
         )],
     )
     store.save_episode(coarse)

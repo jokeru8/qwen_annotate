@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from qwen_annotate.workspace import EpisodeRecord, WorkspaceStore
 from qwen_annotate.pipeline import WorkspaceSummary
 from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo
+from tests.fixtures import make_legacy_v4_workspace
 
 
 runner = CliRunner()
@@ -137,6 +138,15 @@ def test_malformed_workspace_is_operational_exit_one(tmp_path: Path) -> None:
     result = runner.invoke(app, ["status", str(work), "--json"])
     assert result.exit_code == 1
     assert "Traceback" not in result.output
+
+
+def test_status_rejects_legacy_v4_workspace_with_actionable_safe_message(tmp_path: Path) -> None:
+    work = make_legacy_v4_workspace(tmp_path)
+    result = runner.invoke(app, ["status", str(work), "--json"])
+    assert result.exit_code == 1
+    assert "legacy coarse-v4" in result.output.lower()
+    assert "manual audit" in result.output.lower() and "new workspace" in result.output.lower()
+    assert "Traceback" not in result.output and "visible transition" not in result.output
 
 
 def test_review_render_delegates_and_prints_page(monkeypatch, tmp_path: Path) -> None:

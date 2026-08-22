@@ -55,7 +55,10 @@ def _config(tmp_path: Path, dataset: DatasetIndex) -> AnnotationConfig:
 
 
 def _coarse() -> CoarseDecision:
-    attempt = CoarseResult(start_subtask_index=0, observed_subtask_indices=[0], coarse_boundaries=[], confidence=0.9)
+    attempt = CoarseResult(
+        start_subtask_index=0, observed_subtask_indices=[0], coarse_boundaries=[],
+        confidence=0.9, semantic_uncertainty_codes=[], boundary_precision_notes=[],
+    )
     return CoarseDecision(
         mode="complete", subtask_count=1, frame_count=10, status="coarse_done",
         attempts=(attempt, attempt.model_copy(deep=True)), reasons=(), start_subtask_index=0,
@@ -106,6 +109,8 @@ def _coarse_two() -> CoarseDecision:
         start_subtask_index=0, observed_subtask_indices=[0, 1],
         coarse_boundaries=[CoarseBoundary(from_subtask_index=0, to_subtask_index=1, estimated_frame=5, evidence="transition")],
         confidence=0.9,
+        semantic_uncertainty_codes=[],
+        boundary_precision_notes=[],
     )
     return CoarseDecision(
         mode="complete", subtask_count=2, frame_count=10, status="coarse_done",

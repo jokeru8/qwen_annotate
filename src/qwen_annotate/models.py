@@ -34,8 +34,8 @@ class CoarseResult(FrozenModel):
     observed_subtask_indices: list[int] = Field(min_length=1)
     coarse_boundaries: list[CoarseBoundary]
     confidence: float = Field(ge=0, le=1)
-    semantic_uncertainty_codes: list[SemanticUncertaintyCode] = Field(default_factory=list)
-    boundary_precision_notes: list[Annotated[str, Field(min_length=1)]] = Field(default_factory=list)
+    semantic_uncertainty_codes: list[SemanticUncertaintyCode]
+    boundary_precision_notes: list[Annotated[str, Field(min_length=1)]]
 
     @model_validator(mode="after")
     def consistent_sequence(self) -> "CoarseResult":
