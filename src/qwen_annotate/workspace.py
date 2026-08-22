@@ -483,6 +483,64 @@ class WorkspaceStore:
             _atomic_json_write(path, record.model_dump(mode="json"))
             self._write_summary_unlocked()
 
+    def save_episode_transactional(self, record: EpisodeRecord) -> None:
+        """Save a transition and roll its authoritative file back if summary refresh fails.
+
+        Human decisions use this stronger all-or-error contract because an operator must
+        be able to safely correct the underlying failure and reapply the same decision.
+        """
+        record = EpisodeRecord.model_validate(record.model_dump())
+        self.create_layout()
+        with self._locked():
+            self._assert_safe_layout()
+            self._validate_manifest_index(record.episode_index)
+            path = self._episode_path(record.episode_index)
+            if not _safe_entry_exists(path):
+                raise ValueError("transactional save requires an existing episode record")
+            prior = self._load_episode_unlocked(record.episode_index)
+            self._validate_transition(prior, record)
+            self._validate_final_annotation(record)
+            if prior == record:
+                self._write_summary_unlocked()
+                return
+
+            directory_fd = os.open(
+                path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                rollback_fd = os.open(
+                    self.root / "logs",
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                )
+            except BaseException:
+                os.close(directory_fd)
+                raise
+            backup = f".{path.name}.{secrets.token_hex(12)}.rollback"
+            try:
+                os.link(path.name, backup, src_dir_fd=directory_fd, dst_dir_fd=rollback_fd,
+                        follow_symlinks=False)
+                try:
+                    _atomic_json_write(path, record.model_dump(mode="json"))
+                    self._write_summary_unlocked()
+                except BaseException:
+                    os.replace(backup, path.name, src_dir_fd=rollback_fd, dst_dir_fd=directory_fd)
+                    backup = ""
+                    os.fsync(directory_fd)
+                    try:
+                        self._write_summary_unlocked()
+                    except BaseException:
+                        pass
+                    raise
+            finally:
+                if backup:
+                    try:
+                        os.unlink(backup, dir_fd=rollback_fd)
+                    except FileNotFoundError:
+                        pass
+                os.close(rollback_fd)
+                os.close(directory_fd)
+
     def invalidate_episode(
         self,
         index: int,

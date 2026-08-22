@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Qwen annotation review</title></head>
+<body>
+  <h1>Qwen annotation review</h1>
+  <p>Task: {{ high_level_instruction }}</p>
+  <ol>{% for subtask in subtasks %}<li>{{ subtask.skill }} — {{ subtask.text }}</li>{% endfor %}</ol>
+  {% if not episodes %}<p>No episodes need review.</p>{% endif %}
+  {% for episode in episodes %}
+  <article data-episode="{{ episode.episode_index }}" data-fingerprint="{{ episode.source_fingerprint }}">
+    <h2>{{ episode.episode }}</h2>
+    <p>Source fingerprint: <code>{{ episode.source_fingerprint }}</code></p>
+    <ul>{% for reason in episode.review_reasons %}<li>{{ reason }}</li>{% endfor %}
+        {% for issue in episode.validation_issues %}<li>{{ issue.code }}: {{ issue.message }}</li>{% endfor %}</ul>
+    <p>Candidate frames: {{ episode.candidates|join(', ') }}</p>
+    {% if episode.candidate_annotation %}<p>Candidate start: {{ episode.candidate_annotation.start_subtask_index }}; boundaries: {{ episode.candidate_annotation.boundaries|join(', ') }}</p>{% endif %}
+    <h3>Coarse attempts</h3>
+    {% for attempt in episode.coarse_attempts %}
+      <section><p>Confidence: {{ attempt.confidence }}</p>
+      {% for boundary in attempt.coarse_boundaries %}<p>{{ boundary.from_subtask_index }} → {{ boundary.to_subtask_index }}, frame {{ boundary.estimated_frame }}: {{ boundary.evidence }}</p>{% endfor %}
+      {% for uncertainty in attempt.uncertainties %}<p>Uncertainty: {{ uncertainty }}</p>{% endfor %}</section>
+    {% endfor %}
+    <h3>Refine attempts</h3>
+    {% for attempt in episode.refine_attempts %}
+      <section><p>Confidence: {{ attempt.confidence }}, boundary {{ attempt.boundary_frame }}</p>
+      {% for cue in attempt.visible_cues %}<p>{{ cue }}</p>{% endfor %}</section>
+    {% endfor %}
+    {% for stage, summary in episode.decision_summaries.items() %}
+      <section><h3>{{ stage }}</h3>
+      {% if summary.status is defined %}<p>Status: {{ summary.status }}</p>{% endif %}
+      {% if summary.reasons is defined %}<p>Reasons: {{ summary.reasons|join(', ') }}</p>{% endif %}</section>
+    {% endfor %}
+    {% if episode.omitted_candidates %}<p>Omitted candidates (cap {{ episode.candidate_cap }}): {{ episode.omitted_candidates|join(', ') }}</p>{% endif %}
+    <p><a href="{{ episode.episode }}.json">Structured evidence JSON</a></p>
+    {% for image in episode.images %}<img src="{{ image.path }}" alt="{{ image.camera }} frame {{ image.frame_index }} ({{ image.purpose }})">{% endfor %}
+    {% for candidate in episode.candidates %}
+      <img src="{{ episode.episode }}/boundary-{{ candidate }}-before.jpg" alt="frame before boundary {{ candidate }}">
+      <img src="{{ episode.episode }}/boundary-{{ candidate }}-after.jpg" alt="frame after boundary {{ candidate }}">
+    {% endfor %}
+    <form class="decision-form">
+      <label>Start <input name="start_subtask_index" inputmode="numeric" required value="{% if episode.candidate_annotation %}{{ episode.candidate_annotation.start_subtask_index }}{% endif %}"></label>
+      <label>Boundaries <input name="boundaries" inputmode="numeric" value="{% if episode.candidate_annotation %}{{ episode.candidate_annotation.boundaries|join(',') }}{% endif %}"></label>
+      <button type="submit">Export decision JSON</button>
+    </form>
+  </article>
+  {% endfor %}
+  <script src="review.js"></script>
+</body>
+</html>

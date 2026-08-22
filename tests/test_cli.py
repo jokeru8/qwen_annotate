@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -103,3 +104,52 @@ def test_malformed_workspace_is_operational_exit_one(tmp_path: Path) -> None:
     result = runner.invoke(app, ["status", str(work), "--json"])
     assert result.exit_code == 1
     assert "Traceback" not in result.output
+
+
+def test_review_render_delegates_and_prints_page(monkeypatch, tmp_path: Path) -> None:
+    page = tmp_path / "work/previews/needs_review/index.html"
+    monkeypatch.setattr("qwen_annotate.cli.render_review_site", lambda work: page)
+    result = runner.invoke(app, ["review", str(tmp_path / "work")])
+    assert result.exit_code == 0
+    assert str(page) in result.stdout
+
+
+def test_review_apply_strictly_loads_and_delegates(monkeypatch, tmp_path: Path) -> None:
+    fingerprint = "a" * 64
+    decision_path = tmp_path / "decision.json"
+    decision_path.write_text(json.dumps({"episode_index": 3, "source_fingerprint": fingerprint,
+                                         "start_subtask_index": 1, "boundaries": [50]}))
+    calls = []
+
+    def apply(work, episode, decision):
+        calls.append((work, episode, decision))
+        return type("Accepted", (), {"episode_index": 3})()
+
+    monkeypatch.setattr("qwen_annotate.cli.apply_human_decision", apply)
+    result = runner.invoke(app, ["review", str(tmp_path / "work"), "--apply", str(decision_path)])
+    assert result.exit_code == 0
+    assert calls[0][0] == tmp_path / "work" and calls[0][1] == 3
+    assert calls[0][2].source_fingerprint == fingerprint
+    assert "accepted episode 3" in result.stdout
+
+
+@pytest.mark.parametrize("payload", [
+    '{"episode_index":0,"episode_index":1,"source_fingerprint":"' + "a" * 64 + '","start_subtask_index":0,"boundaries":[]}',
+    '{"episode_index":0,"source_fingerprint":"' + "a" * 64 + '","start_subtask_index":0,"boundaries":[NaN]}',
+    '{"episode_index":"0","source_fingerprint":"' + "a" * 64 + '","start_subtask_index":0,"boundaries":[]}',
+])
+def test_review_apply_invalid_decision_is_usage_exit_two(tmp_path: Path, payload: str) -> None:
+    decision = tmp_path / "decision.json"
+    decision.write_text(payload)
+    result = runner.invoke(app, ["review", str(tmp_path / "work"), "--apply", str(decision)])
+    assert result.exit_code == 2 and "Traceback" not in result.output
+
+
+def test_review_apply_operational_rejection_is_exit_one(monkeypatch, tmp_path: Path) -> None:
+    decision = tmp_path / "decision.json"
+    decision.write_text(json.dumps({"episode_index": 0, "source_fingerprint": "a" * 64,
+                                    "start_subtask_index": 0, "boundaries": []}))
+    monkeypatch.setattr("qwen_annotate.cli.apply_human_decision",
+                        lambda *args: (_ for _ in ()).throw(ValueError("stale fingerprint")))
+    result = runner.invoke(app, ["review", str(tmp_path / "work"), "--apply", str(decision)])
+    assert result.exit_code == 1 and "Traceback" not in result.output

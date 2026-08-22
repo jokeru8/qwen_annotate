@@ -11,6 +11,7 @@ from .config import load_config
 from .lerobot import inspect_dataset
 from .model_manager import download_model
 from .pipeline import WorkspaceSummary, annotate_dataset
+from .review import apply_human_decision, load_human_decision, render_review_site
 from .workspace import WorkspaceStore
 
 
@@ -90,6 +91,32 @@ def status_command(work_dir: Path, as_json: bool = typer.Option(False, "--json")
         typer.echo(json.dumps(raw, sort_keys=True, separators=(",", ":")))
     else:
         typer.echo(_summary_text(summary))
+
+
+@app.command("review")
+def review_command(
+    work_dir: Path,
+    decision_path: Path | None = typer.Option(None, "--apply"),
+) -> None:
+    if decision_path is None:
+        try:
+            page = render_review_site(work_dir)
+        except Exception:
+            typer.echo("Review site generation failed.", err=True)
+            raise typer.Exit(1)
+        typer.echo(str(page))
+        return
+    try:
+        decision = load_human_decision(decision_path)
+    except Exception:
+        typer.echo("Invalid human decision file.", err=True)
+        raise typer.Exit(2)
+    try:
+        accepted = apply_human_decision(work_dir, decision.episode_index, decision)
+    except Exception:
+        typer.echo("Human decision was rejected.", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"accepted episode {accepted.episode_index}")
 
 
 @model_app.command("download")
