@@ -82,7 +82,8 @@ def coarse_result(observed, centers):
             for left, right, center in zip(observed, observed[1:], centers)
         ],
         confidence=0.9,
-        uncertainties=[],
+        semantic_uncertainty_codes=[],
+        boundary_precision_notes=[],
     )
 
 

@@ -28,7 +28,7 @@ def config(mode: str = "complete", subtasks=None) -> AnnotationConfig:
 
 def test_coarse_prompt_contains_ordered_template_and_required_rules():
     prompt = build_coarse_prompt(config("dagger_patch", [{"skill": "pick", "text": "pick"}, {"skill": "place", "text": "place"}]), 2, 20, 3)
-    assert PROMPT_VERSION == "coarse-v4/refine-v1"
+    assert PROMPT_VERSION == "coarse-v5/refine-v1"
     context = json.loads(prompt.split("BEGIN_UNTRUSTED_CONTEXT_JSON\n", 1)[1].split("\nEND_UNTRUSTED_CONTEXT_JSON", 1)[0])
     assert context["subtasks"] == [{"index": 0, "skill": "pick", "text": "pick"}, {"index": 1, "skill": "place", "text": "place"}]
     assert "Do not invent or rewrite labels" in prompt
@@ -66,12 +66,16 @@ def test_coarse_prompt_reserves_exact_frame_uncertainty_for_refine():
         0,
     )
     expected_policy = (
-        "Uncertainty policy: If any of the subtask order, starting subtask, or approximate "
-        "transition neighborhood cannot be determined from sparse evidence, you MUST add a "
-        "concise item to uncertainties and MUST NOT guess that semantic fact.\n"
-        "If all three are clear and only the exact transition frame is uncertain, set "
-        "uncertainties=[] and return the best approximate estimated_frame; refine will "
-        "determine the exact frame."
+        "Semantic uncertainty policy: Use semantic_uncertainty_codes only for semantic facts "
+        "that block coarse acceptance. If sparse evidence cannot determine subtask order, add "
+        "subtask_order_unclear; if it cannot determine the starting subtask, add "
+        "start_subtask_unclear; if it cannot determine an approximate transition neighborhood, "
+        "add transition_neighborhood_unclear. Add every applicable code and MUST NOT guess any "
+        "unclear semantic fact.\n"
+        "If all three semantic facts are clear, set semantic_uncertainty_codes=[] and return "
+        "the best approximate estimated_frame values; refine will determine exact frames. Put "
+        "optional exact-frame imprecision comments in boundary_precision_notes; these notes are "
+        "audit-only and do not represent semantic uncertainty or block refine."
     )
     begin = "BEGIN_COARSE_UNCERTAINTY_POLICY\n"
     end = "\nEND_COARSE_UNCERTAINTY_POLICY"

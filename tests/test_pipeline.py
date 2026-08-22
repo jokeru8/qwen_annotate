@@ -78,7 +78,9 @@ def _refine() -> RefineDecision:
 def _coarse_review() -> CoarseDecision:
     attempt = CoarseResult(
         start_subtask_index=0, observed_subtask_indices=[0], coarse_boundaries=[],
-        confidence=0.2, uncertainties=["visual evidence unclear"],
+        confidence=0.2,
+        semantic_uncertainty_codes=["transition_neighborhood_unclear"],
+        boundary_precision_notes=[],
     )
     return CoarseDecision(
         mode="complete", subtask_count=1, frame_count=10, status="needs_review",

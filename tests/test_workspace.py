@@ -61,6 +61,33 @@ def coarse_result() -> CoarseResult:
     )
 
 
+def test_workspace_roundtrips_complete_layered_coarse_audit(tmp_path: Path) -> None:
+    """Catches either layered uncertainty channel being dropped during persistence."""
+    store = WorkspaceStore(tmp_path / "work")
+    base = pending()
+    store.save_episode(base)
+    attempt = CoarseResult(
+        start_subtask_index=0,
+        observed_subtask_indices=[0, 1],
+        coarse_boundaries=[CoarseBoundary(
+            from_subtask_index=0, to_subtask_index=1,
+            estimated_frame=5, evidence="placed",
+        )],
+        confidence=0.8,
+        semantic_uncertainty_codes=[],
+        boundary_precision_notes=["Exact frame is deferred to refine."],
+    )
+    updated = transition(base, "coarse_done", coarse_attempts=[attempt])
+
+    store.save_episode(updated)
+    restored = store.load_episode(0)
+
+    assert restored.coarse_attempts[0].model_dump() == attempt.model_dump()
+    assert restored.coarse_attempts[0].boundary_precision_notes == [
+        "Exact frame is deferred to refine."
+    ]
+
+
 def refine_result() -> RefineResult:
     return RefineResult(
         from_subtask_index=0,

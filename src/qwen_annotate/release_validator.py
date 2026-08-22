@@ -29,7 +29,8 @@ _MAX_JSON = 16 * 1024 * 1024
 _REQUIRED_COLUMNS = {"frame_index", "episode_index", "index", "task_index", "timestamp"}
 _STAT_METRICS = {"min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99"}
 _FORBIDDEN = {
-    "confidence", "uncertainties", "attempts", "coarse_attempts", "refine_attempts",
+    "confidence", "uncertainties", "semantic_uncertainty_codes", "boundary_precision_notes",
+    "attempts", "coarse_attempts", "refine_attempts",
     "visible_cues", "evidence", "prompt", "prompts", "api_key", "endpoint",
     "sampling", "sampling_details", "outbox", "_pipeline_transition_events", "model_response",
 }

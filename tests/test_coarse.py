@@ -72,14 +72,16 @@ def result(
     frames: list[int],
     *,
     start: int | None = None,
-    uncertainties: list[str] | None = None,
+    semantic_codes: list[str] | None = None,
+    precision_notes: list[str] | None = None,
 ) -> CoarseResult:
     return CoarseResult(
         start_subtask_index=observed[0] if start is None else start,
         observed_subtask_indices=observed,
         coarse_boundaries=[boundary(left, frame) for left, frame in zip(observed, frames)],
         confidence=0.9,
-        uncertainties=[] if uncertainties is None else uncertainties,
+        semantic_uncertainty_codes=[] if semantic_codes is None else semantic_codes,
+        boundary_precision_notes=[] if precision_notes is None else precision_notes,
     )
 
 
@@ -214,13 +216,14 @@ async def test_sequence_or_start_disagreement_has_stable_reason(tmp_path: Path) 
     assert decision.reasons == ("coarse_sequence_disagreement",)
 
 
-def bypass_result(*, start=0, observed=None, boundaries=None, uncertainties=None):
+def bypass_result(*, start=0, observed=None, boundaries=None, semantic_codes=None, precision_notes=None):
     return CoarseResult.model_construct(
         start_subtask_index=start,
         observed_subtask_indices=[0, 1, 2] if observed is None else observed,
         coarse_boundaries=[boundary(0, 20), boundary(1, 60)] if boundaries is None else boundaries,
         confidence=0.9,
-        uncertainties=[] if uncertainties is None else uncertainties,
+        semantic_uncertainty_codes=[] if semantic_codes is None else semantic_codes,
+        boundary_precision_notes=[] if precision_notes is None else precision_notes,
     )
 
 
@@ -257,12 +260,90 @@ async def test_bypassed_model_validation_cannot_evade_deterministic_checks(
 
 @pytest.mark.asyncio
 async def test_uncertainty_in_either_attempt_requires_review_without_confidence_threshold(tmp_path: Path) -> None:
-    uncertain = result([0, 1, 2], [20, 60], uncertainties=["handoff is occluded"])
+    uncertain = result([0, 1, 2], [20, 60], semantic_codes=["transition_neighborhood_unclear"])
     confident = result([0, 1, 2], [21, 61])
 
     decision = await run_coarse(make_config(tmp_path), make_episode(tmp_path), RecordingSampler(), RecordingClient([uncertain, confident]))
 
     assert decision.reasons == ("coarse_uncertain",)
+
+
+@pytest.mark.asyncio
+async def test_precision_notes_are_audited_without_blocking_coarse(tmp_path: Path) -> None:
+    """Catches precision-only notes being confused with semantic uncertainty."""
+    first = CoarseResult(
+        start_subtask_index=0,
+        observed_subtask_indices=[0, 1, 2],
+        coarse_boundaries=[boundary(0, 20), boundary(1, 60)],
+        confidence=0.9,
+        semantic_uncertainty_codes=[],
+        boundary_precision_notes=["Exact first boundary may be a few frames later."],
+    )
+    second = first.model_copy(update={
+        "coarse_boundaries": [boundary(0, 21), boundary(1, 61)],
+        "boundary_precision_notes": ["Sparse evidence only localizes approximate centers."],
+    })
+
+    decision = await run_coarse(
+        make_config(tmp_path), make_episode(tmp_path), RecordingSampler(),
+        RecordingClient([first, second]),
+    )
+
+    assert decision.status == "coarse_done" and decision.reasons == ()
+    assert decision.attempts[0].semantic_uncertainty_codes == ()
+    assert decision.attempts[0].boundary_precision_notes == (
+        "Exact first boundary may be a few frames later.",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [
+    "subtask_order_unclear",
+    "start_subtask_unclear",
+    "transition_neighborhood_unclear",
+])
+async def test_each_semantic_uncertainty_code_blocks_coarse(tmp_path: Path, code: str) -> None:
+    uncertain = CoarseResult(
+        start_subtask_index=0,
+        observed_subtask_indices=[0, 1, 2],
+        coarse_boundaries=[boundary(0, 20), boundary(1, 60)],
+        confidence=0.9,
+        semantic_uncertainty_codes=[code],
+        boundary_precision_notes=[],
+    )
+    clear = uncertain.model_copy(update={
+        "semantic_uncertainty_codes": [],
+        "coarse_boundaries": [boundary(0, 21), boundary(1, 61)],
+    })
+
+    decision = await run_coarse(
+        make_config(tmp_path), make_episode(tmp_path), RecordingSampler(),
+        RecordingClient([uncertain, clear]),
+    )
+
+    assert decision.status == "needs_review"
+    assert decision.reasons == ("coarse_uncertain",)
+
+
+def test_layered_uncertainty_schema_rejects_unknown_codes_and_legacy_field() -> None:
+    schema = CoarseResult.model_json_schema()
+    assert "semantic_uncertainty_codes" in schema["properties"]
+    assert "boundary_precision_notes" in schema["properties"]
+    assert "uncertainties" not in schema["properties"]
+    payload = {
+        "start_subtask_index": 0,
+        "observed_subtask_indices": [0],
+        "coarse_boundaries": [],
+        "confidence": 0.9,
+        "semantic_uncertainty_codes": ["invented_code"],
+        "boundary_precision_notes": [],
+    }
+    with pytest.raises(ValidationError):
+        CoarseResult.model_validate(payload)
+    payload["semantic_uncertainty_codes"] = []
+    payload["uncertainties"] = ["legacy ambiguity"]
+    with pytest.raises(ValidationError):
+        CoarseResult.model_validate(payload)
 
 
 def test_two_sampling_grids_preserve_endpoints_cap_and_differ_when_possible() -> None:
@@ -527,7 +608,7 @@ def test_success_rejects_illegal_or_uncertain_audit_attempts() -> None:
     ])
     with pytest.raises(ValidationError):
         CoarseDecision(**decision_fields(attempts=(illegal, illegal)))
-    uncertain = result([0, 1, 2], [20, 60], uncertainties=["occluded"])
+    uncertain = result([0, 1, 2], [20, 60], semantic_codes=["transition_neighborhood_unclear"])
     with pytest.raises(ValidationError):
         CoarseDecision(**decision_fields(attempts=(uncertain, uncertain), centers=(20, 60)))
 
@@ -654,10 +735,19 @@ def test_decision_rejects_two_insufficiently_independent_sparse_grids() -> None:
         lambda value: value.__imul__(2),
     ],
 )
-@pytest.mark.parametrize("field", ["observed_subtask_indices", "coarse_boundaries", "uncertainties"])
+@pytest.mark.parametrize("field", [
+    "observed_subtask_indices", "coarse_boundaries",
+    "semantic_uncertainty_codes", "boundary_precision_notes",
+])
 def test_attempt_audit_lists_block_every_mutation_api(field, mutate) -> None:
-    first = result([0, 1, 2], [20, 60], uncertainties=["review note"])
-    second = result([0, 1, 2], [21, 61], uncertainties=["review note"])
+    first = result(
+        [0, 1, 2], [20, 60],
+        semantic_codes=["transition_neighborhood_unclear"], precision_notes=["review note"],
+    )
+    second = result(
+        [0, 1, 2], [21, 61],
+        semantic_codes=["transition_neighborhood_unclear"], precision_notes=["review note"],
+    )
     decision = CoarseDecision(
         **decision_fields(
             attempts=(first, second),
@@ -683,14 +773,21 @@ def test_attempt_audit_lists_block_every_mutation_api(field, mutate) -> None:
         (lambda value: list.extend(value, [9]), "observed_subtask_indices"),
         (lambda value: list.insert(value, 0, 9), "coarse_boundaries"),
         (lambda value: list.pop(value), "coarse_boundaries"),
-        (lambda value: list.clear(value), "uncertainties"),
+        (lambda value: list.clear(value), "semantic_uncertainty_codes"),
+        (lambda value: list.clear(value), "boundary_precision_notes"),
         (lambda value: list.__setitem__(value, 0, 9), "observed_subtask_indices"),
         (lambda value: list.__delitem__(value, 0), "coarse_boundaries"),
     ],
 )
 def test_unbound_list_mutators_cannot_bypass_attempt_immutability(operation, field) -> None:
-    first = result([0, 1, 2], [20, 60], uncertainties=["review note"])
-    second = result([0, 1, 2], [21, 61], uncertainties=["review note"])
+    first = result(
+        [0, 1, 2], [20, 60],
+        semantic_codes=["transition_neighborhood_unclear"], precision_notes=["review note"],
+    )
+    second = result(
+        [0, 1, 2], [21, 61],
+        semantic_codes=["transition_neighborhood_unclear"], precision_notes=["review note"],
+    )
     decision = CoarseDecision(
         **decision_fields(
             attempts=(first, second),
@@ -719,12 +816,14 @@ def test_decision_deep_copies_caller_owned_attempt_lists() -> None:
 
     first.observed_subtask_indices.append(99)
     first.coarse_boundaries.clear()
-    first.uncertainties.append("changed later")
+    first.semantic_uncertainty_codes.append("transition_neighborhood_unclear")
+    first.boundary_precision_notes.append("changed later")
 
     assert decision.status == "coarse_done"
     assert decision.attempts[0].observed_subtask_indices == (0, 1, 2)
     assert len(decision.attempts[0].coarse_boundaries) == 2
-    assert decision.attempts[0].uncertainties == ()
+    assert decision.attempts[0].semantic_uncertainty_codes == ()
+    assert decision.attempts[0].boundary_precision_notes == ()
 
 
 def test_mutating_dumped_payload_cannot_change_decision_audit_truth() -> None:
@@ -732,19 +831,22 @@ def test_mutating_dumped_payload_cannot_change_decision_audit_truth() -> None:
     python_payload = decision.model_dump()
     assert isinstance(python_payload["attempts"][0]["observed_subtask_indices"], tuple)
     assert isinstance(python_payload["attempts"][0]["coarse_boundaries"], tuple)
-    assert isinstance(python_payload["attempts"][0]["uncertainties"], tuple)
+    assert isinstance(python_payload["attempts"][0]["semantic_uncertainty_codes"], tuple)
+    assert isinstance(python_payload["attempts"][0]["boundary_precision_notes"], tuple)
     python_payload["attempts"][0]["coarse_boundaries"][0]["evidence"] = "tampered"
     payload = decision.model_dump(mode="json")
     assert isinstance(payload["attempts"][0]["observed_subtask_indices"], list)
     payload["attempts"][0]["observed_subtask_indices"].append(99)
     payload["attempts"][0]["coarse_boundaries"].clear()
-    payload["attempts"][0]["uncertainties"].append("tampered")
+    payload["attempts"][0]["semantic_uncertainty_codes"].append("subtask_order_unclear")
+    payload["attempts"][0]["boundary_precision_notes"].append("tampered")
 
     assert decision.status == "coarse_done"
     assert decision.attempts[0].observed_subtask_indices == (0, 1, 2)
     assert len(decision.attempts[0].coarse_boundaries) == 2
     assert decision.attempts[0].coarse_boundaries[0].evidence == "visible transition"
-    assert decision.attempts[0].uncertainties == ()
+    assert decision.attempts[0].semantic_uncertainty_codes == ()
+    assert decision.attempts[0].boundary_precision_notes == ()
 
 
 def test_malformed_model_construct_attempt_is_rejected_as_validation_error() -> None:
@@ -753,7 +855,8 @@ def test_malformed_model_construct_attempt_is_rejected_as_validation_error() -> 
         observed_subtask_indices=None,
         coarse_boundaries=None,
         confidence=0.9,
-        uncertainties=None,
+        semantic_uncertainty_codes=None,
+        boundary_precision_notes=None,
     )
     with pytest.raises(ValidationError, match="attempt"):
         CoarseDecision(

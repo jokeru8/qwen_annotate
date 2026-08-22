@@ -11,14 +11,14 @@ import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validator, model_validator
 
 from .config import AnnotationConfig
 from .constraints import coarse_sequence_is_legal
 from .lerobot import EpisodeInfo
-from .models import CoarseBoundary, CoarseResult
+from .models import CoarseBoundary, CoarseResult, SemanticUncertaintyCode
 from .prompts import build_coarse_prompt
 from .qwen_client import QwenClient
 from .video import FrameSample, extract_frames, uniform_indices
@@ -39,6 +39,7 @@ _REASON_ORDER: tuple[ReviewReason, ...] = (
     "coarse_boundary_order",
     "coarse_uncertain",
 )
+_SEMANTIC_UNCERTAINTY_CODES = frozenset(get_args(SemanticUncertaintyCode))
 
 
 class _Completer(Protocol):
@@ -70,7 +71,8 @@ class _ImmutableCoarseResult(CoarseResult):
 
     observed_subtask_indices: tuple[int, ...]
     coarse_boundaries: tuple[CoarseBoundary, ...]
-    uncertainties: tuple[str, ...] = ()
+    semantic_uncertainty_codes: tuple[SemanticUncertaintyCode, ...] = ()
+    boundary_precision_notes: tuple[str, ...] = ()
 
 
 class CoarseDecision(BaseModel):
@@ -586,7 +588,12 @@ def _freeze_attempt(attempt: CoarseResult) -> _ImmutableCoarseResult:
         observed_subtask_indices=tuple(getattr(attempt, "observed_subtask_indices", [])),
         coarse_boundaries=boundaries,
         confidence=getattr(attempt, "confidence", None),
-        uncertainties=tuple(getattr(attempt, "uncertainties", [])),
+        semantic_uncertainty_codes=tuple(
+            getattr(attempt, "semantic_uncertainty_codes", [])
+        ),
+        boundary_precision_notes=tuple(
+            getattr(attempt, "boundary_precision_notes", [])
+        ),
     )
 
 
@@ -596,7 +603,8 @@ def _attempt_from_mapping(value: dict[object, object]) -> CoarseResult:
         "observed_subtask_indices",
         "coarse_boundaries",
         "confidence",
-        "uncertainties",
+        "semantic_uncertainty_codes",
+        "boundary_precision_notes",
     }
     if set(value) != expected:
         raise ValueError("serialized coarse attempt has missing or extra fields")
@@ -619,7 +627,8 @@ def _attempt_from_mapping(value: dict[object, object]) -> CoarseResult:
         observed_subtask_indices=value["observed_subtask_indices"],
         coarse_boundaries=boundaries,
         confidence=value["confidence"],
-        uncertainties=value["uncertainties"],
+        semantic_uncertainty_codes=value["semantic_uncertainty_codes"],
+        boundary_precision_notes=value["boundary_precision_notes"],
     )
 
 
@@ -649,11 +658,17 @@ def _validate_attempt_shape(attempt: object) -> None:
     confidence = getattr(attempt, "confidence", None)
     if type(confidence) is not float or not math.isfinite(confidence) or not (0 <= confidence <= 1):
         raise ValueError("attempt confidence must be a finite float in [0, 1]")
-    uncertainties = getattr(attempt, "uncertainties", None)
-    if not isinstance(uncertainties, (list, tuple)) or any(
-        not isinstance(item, str) or not item for item in uncertainties
+    semantic_codes = getattr(attempt, "semantic_uncertainty_codes", None)
+    if not isinstance(semantic_codes, (list, tuple)) or any(
+        not isinstance(item, str) or item not in _SEMANTIC_UNCERTAINTY_CODES
+        for item in semantic_codes
     ):
-        raise ValueError("attempt uncertainties must be a sequence of nonempty strings")
+        raise ValueError("attempt semantic uncertainty codes are invalid")
+    precision_notes = getattr(attempt, "boundary_precision_notes", None)
+    if not isinstance(precision_notes, (list, tuple)) or any(
+        not isinstance(item, str) or not item for item in precision_notes
+    ):
+        raise ValueError("attempt boundary precision notes must be nonempty strings")
 
 
 def _decision_reasons(
@@ -681,8 +696,8 @@ def _decision_reasons(
         ):
             reasons.add("illegal_coarse_sequence")
         _validate_attempt_boundaries(attempt, sequence, episode_length, reasons)
-        uncertainties = getattr(attempt, "uncertainties", None)
-        if not isinstance(uncertainties, (list, tuple)) or bool(uncertainties):
+        semantic_codes = getattr(attempt, "semantic_uncertainty_codes", None)
+        if not isinstance(semantic_codes, (list, tuple)) or bool(semantic_codes):
             reasons.add("coarse_uncertain")
     return reasons
 

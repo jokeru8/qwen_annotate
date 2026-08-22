@@ -62,7 +62,8 @@ def _workspace(tmp_path: Path, *, mode: str = "dagger_patch", reasons=None, issu
         start_subtask_index=1, observed_subtask_indices=[1, 2], confidence=.4,
         coarse_boundaries=[CoarseBoundary(from_subtask_index=1, to_subtask_index=2,
                                           estimated_frame=184, evidence="cue <b>unsafe</b>")],
-        uncertainties=["occluded"],
+        semantic_uncertainty_codes=["transition_neighborhood_unclear"],
+        boundary_precision_notes=["Exact handoff frame is approximate."],
     )
     refine = RefineResult(from_subtask_index=1, to_subtask_index=2, last_frame_before=182,
                           first_frame_after=183, boundary_frame=183, confidence=.5,
@@ -109,6 +110,8 @@ def test_review_renders_safe_evidence_json_and_exact_aliases(tmp_path: Path) -> 
     html = page.read_text(encoding="utf-8")
     assert "episode_000000" in html and "coarse_sequence_disagreement" in html
     assert "cue &lt;b&gt;unsafe&lt;/b&gt;" in html and "hand releases object" in html
+    assert "Semantic uncertainty: transition_neighborhood_unclear" in html
+    assert "Boundary precision: Exact handoff frame is approximate." in html
     assert "0.4" in html and "0.5" in html
     assert "boundary-184-before.jpg" in html and "boundary-184-after.jpg" in html
     assert "<script>alert(1)</script>" not in html and "&lt;script&gt;" in html
@@ -125,6 +128,12 @@ def test_review_renders_safe_evidence_json_and_exact_aliases(tmp_path: Path) -> 
     assert "run_fingerprint" in javascript and "mode:" in javascript
     assert "fetch(" not in javascript and "eval(" not in javascript and "innerHTML" not in javascript
     assert len(payload["coarse_attempts"]) == 2 and len(payload["refine_attempts"]) == 1
+    assert payload["coarse_attempts"][0]["semantic_uncertainty_codes"] == [
+        "transition_neighborhood_unclear"
+    ]
+    assert payload["coarse_attempts"][0]["boundary_precision_notes"] == [
+        "Exact handoff frame is approximate."
+    ]
     assert payload["candidates"] == [183, 184]
     assert (page.parent / "episode_000000" / "boundary-184-before.jpg").read_bytes() == b"jpeg:cam.eye:183"
     assert (page.parent / "episode_000000" / "boundary-184-after.jpg").read_bytes() == b"jpeg:cam.eye:184"

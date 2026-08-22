@@ -18,7 +18,8 @@
     {% for attempt in episode.coarse_attempts %}
       <section><p>Confidence: {{ attempt.confidence }}</p>
       {% for boundary in attempt.coarse_boundaries %}<p>{{ boundary.from_subtask_index }} → {{ boundary.to_subtask_index }}, frame {{ boundary.estimated_frame }}: {{ boundary.evidence }}</p>{% endfor %}
-      {% for uncertainty in attempt.uncertainties %}<p>Uncertainty: {{ uncertainty }}</p>{% endfor %}</section>
+      {% for code in attempt.semantic_uncertainty_codes %}<p>Semantic uncertainty: {{ code }}</p>{% endfor %}
+      {% for note in attempt.boundary_precision_notes %}<p>Boundary precision: {{ note }}</p>{% endfor %}</section>
     {% endfor %}
     <h3>Refine attempts</h3>
     {% for attempt in episode.refine_attempts %}

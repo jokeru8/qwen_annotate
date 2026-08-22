@@ -22,12 +22,20 @@ class CoarseBoundary(FrozenModel):
         return self
 
 
+SemanticUncertaintyCode = Literal[
+    "subtask_order_unclear",
+    "start_subtask_unclear",
+    "transition_neighborhood_unclear",
+]
+
+
 class CoarseResult(FrozenModel):
     start_subtask_index: int = Field(ge=0)
     observed_subtask_indices: list[int] = Field(min_length=1)
     coarse_boundaries: list[CoarseBoundary]
     confidence: float = Field(ge=0, le=1)
-    uncertainties: list[str] = Field(default_factory=list)
+    semantic_uncertainty_codes: list[SemanticUncertaintyCode] = Field(default_factory=list)
+    boundary_precision_notes: list[Annotated[str, Field(min_length=1)]] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def consistent_sequence(self) -> "CoarseResult":

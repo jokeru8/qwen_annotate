@@ -7,15 +7,19 @@ from .config import AnnotationConfig
 from .models import CoarseResult, RefineResult
 
 
-PROMPT_VERSION = "coarse-v4/refine-v1"
+PROMPT_VERSION = "coarse-v5/refine-v1"
 
 _COARSE_UNCERTAINTY_POLICY = (
-    "Uncertainty policy: If any of the subtask order, starting subtask, or approximate "
-    "transition neighborhood cannot be determined from sparse evidence, you MUST add a "
-    "concise item to uncertainties and MUST NOT guess that semantic fact.\n"
-    "If all three are clear and only the exact transition frame is uncertain, set "
-    "uncertainties=[] and return the best approximate estimated_frame; refine will "
-    "determine the exact frame."
+    "Semantic uncertainty policy: Use semantic_uncertainty_codes only for semantic facts "
+    "that block coarse acceptance. If sparse evidence cannot determine subtask order, add "
+    "subtask_order_unclear; if it cannot determine the starting subtask, add "
+    "start_subtask_unclear; if it cannot determine an approximate transition neighborhood, "
+    "add transition_neighborhood_unclear. Add every applicable code and MUST NOT guess any "
+    "unclear semantic fact.\n"
+    "If all three semantic facts are clear, set semantic_uncertainty_codes=[] and return "
+    "the best approximate estimated_frame values; refine will determine exact frames. Put "
+    "optional exact-frame imprecision comments in boundary_precision_notes; these notes are "
+    "audit-only and do not represent semantic uncertainty or block refine."
 )
 
 

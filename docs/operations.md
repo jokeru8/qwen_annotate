@@ -141,7 +141,7 @@ uv run qwen-annotate status WORK_DIR --json
 
 每个 episode 的阶段是 `pending → coarse_done → refine_done → accepted`。coarse 使用主相机、覆盖完整时间范围的两套独立稀疏采样，必须在合法模板序列上达成一致。refine 对每个 transition 先用配置相机做 broad window，再在候选点附近做 dense 连续帧判断；最终边界是“下一 subtask 的第一帧”。模型只能引用 prompt 中带整数 index 的模板，不能发明标签。
 
-当前 prompt 版本是 `coarse-v4/refine-v1`。若稀疏证据不足以判断 subtask 顺序、起始 subtask 或大致过渡邻域中的任一项，coarse 必须填写 `uncertainties` 且不得猜测；若三者都明确，只是无法从稀疏帧确定精确 transition frame，则必须返回最合理的粗略中心并保持 `uncertainties=[]`，由 refine 阶段完成精确定位。所有正常请求、瞬态重试和格式修复请求都显式设置 greedy `temperature=0`，不继承 vLLM 模型目录中可能为随机采样的 `generation_config`。v4 会使已有 v3 及更早 workspace 的 run fingerprint 不匹配并 fail closed；旧结果必须在新的空 workspace 中重新标注，不能复用。
+当前 prompt 版本是 `coarse-v5/refine-v1`。coarse 使用两个分层字段：`semantic_uncertainty_codes` 是唯一阻断通道，只允许 `subtask_order_unclear`、`start_subtask_unclear`、`transition_neighborhood_unclear`；任一非空就进入 `coarse_uncertain`，且模型不得猜测。若顺序、起始项和大致过渡邻域都明确，模型必须返回最合理的粗略中心并保持该 codes 列表为空，由 refine 完成精确定位。`boundary_precision_notes` 只记录稀疏采样下的精确帧误差，不阻断 coarse/refine。旧的泛化 `uncertainties` 字段不再属于 schema。所有正常请求、瞬态重试和格式修复请求都显式设置 greedy `temperature=0`，不继承 vLLM 模型目录中可能为随机采样的 `generation_config`。v5 会使已有 v4 及更早 workspace 的 run fingerprint 不匹配并 fail closed；旧结果必须在新的空 workspace 中重新标注，不能复用。
 
 重复执行同一命令会跳过 `accepted`、`needs_review` 和 `failed`，并从持久的 `coarse_done`/`refine_done` 继续。每个 episode 保存 source SHA-256 指纹；run fingerprint 绑定完整有效配置（API key 除外）、`PROMPT_VERSION`、model repo 和固定 revision。源 payload、prompt、模型或行为配置发生变化时，旧 workspace 会 fail closed，而不是复用过期结果。当前 CLI 没有“强制清缓存”选项；需要重跑时使用新的空 `work_dir`，保留旧目录用于审计。
 
