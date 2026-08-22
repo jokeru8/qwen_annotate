@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, Generic, TypeVar
@@ -350,11 +351,22 @@ def _recover_semantic_baseline(content: str) -> Any:
 
 
 def _strict_json_loads(content: str) -> Any:
-    return json.loads(content, parse_constant=_reject_json_constant)
+    return json.loads(
+        content,
+        parse_constant=_reject_json_constant,
+        parse_float=_parse_finite_json_float,
+    )
 
 
 def _reject_json_constant(constant: str) -> Any:
     raise _StrictJSONError(f"non-standard JSON numeric constant: {constant}")
+
+
+def _parse_finite_json_float(token: str) -> float:
+    value = float(token)
+    if not math.isfinite(value):
+        raise _StrictJSONError(f"JSON float is outside the finite range: {token}")
+    return value
 
 
 def _json_semantically_equal(left: Any, right: Any) -> bool:

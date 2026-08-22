@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from qwen_annotate.models import FinalAnnotation
 from qwen_annotate.qwen_client import (
     InvalidModelResponse,
@@ -20,6 +20,7 @@ class SemanticPayload(BaseModel):
 
     value: bool | int | float
     label: str = "same"
+    nested: list[bool | int | float] = Field(default_factory=list)
 
 
 def valid_json(boundary: int = 20) -> str:
@@ -431,6 +432,39 @@ async def test_nonstandard_json_numeric_constants_are_rejected(constant: str) ->
             "prompt", [], SemanticPayload
         )
     assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"value":1e999}',
+        '{"value":0,"nested":[-1e999]}',
+    ],
+)
+@pytest.mark.asyncio
+async def test_float_tokens_that_overflow_to_infinity_are_rejected(payload: str) -> None:
+    async def send(**kwargs):
+        return payload
+
+    with pytest.raises(InvalidModelResponse):
+        await QwenClient(send=send, max_attempts=1).complete(
+            "prompt", [], SemanticPayload
+        )
+
+
+@pytest.mark.asyncio
+async def test_finite_floats_and_arbitrary_size_json_integers_are_preserved() -> None:
+    huge_integer = 10**400
+
+    async def send(**kwargs):
+        return json.dumps({"value": 1.25, "nested": [-2.5, huge_integer]})
+
+    result = await QwenClient(send=send, max_attempts=1).complete(
+        "prompt", [], SemanticPayload
+    )
+    assert result.value == 1.25
+    assert result.nested == [-2.5, huge_integer]
+    assert type(result.nested[1]) is int
 
 
 @pytest.mark.asyncio
