@@ -109,7 +109,7 @@ def test_models_are_strict_and_status_fields_are_consistent() -> None:
     "audit",
     [
         {},
-        {"prompt_version": "wrong", "model_revision": SHA, "sampling_details": {"fps": 1}},
+        {"prompt_version": "historical", "sampling_details": {"fps": 1}},
         {"prompt_version": PROMPT_VERSION, "model_revision": SHA, "sampling_details": {}},
     ],
 )
@@ -121,6 +121,31 @@ def test_model_acceptance_requires_exact_reproducibility_provenance(audit: dict)
     } | audit
     with pytest.raises(ValidationError, match="provenance|prompt_version|sampling"):
         EpisodeRecord.model_validate(data)
+
+
+def test_historical_prompt_model_record_can_deserialize_and_be_invalidated(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path / "work")
+    store.create_layout()
+    base = pending()
+    store.save_episode(base)
+    coarse = transition(base, "coarse_done", coarse_attempts=[coarse_result()])
+    store.save_episode(coarse)
+    refined = transition(coarse, "refine_done", refine_attempts=[refine_result()])
+    store.save_episode(refined)
+    historical = transition(
+        refined,
+        "accepted",
+        final_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[5]),
+        decision_source="model",
+        prompt_version="historical-coarse-v0/refine-v0",
+        model_revision=SHA,
+        sampling_details={"frames": [0, 5, 9]},
+    )
+    store.save_episode(historical)
+    assert store.load_episode(0).prompt_version == "historical-coarse-v0/refine-v0"
+    assert store.invalidate_episode(
+        0, source_fingerprint="d" * 64, run_fingerprint="e" * 64
+    ).status == "pending"
 
 
 def test_human_acceptance_does_not_need_model_provenance() -> None:
@@ -610,6 +635,41 @@ def test_initialized_store_requires_model_revision_to_match_manifest(tmp_path: P
         store.save_episode(accepted)
 
 
+def test_initialized_store_requires_model_prompt_to_match_manifest(tmp_path: Path) -> None:
+    index = make_index(tmp_path, [10])
+    config = make_config(index.root, tmp_path / "work")
+    store = WorkspaceStore(config.work_dir, clock=lambda: NOW)
+    store.initialize(config, index, SHA)
+    base = store.load_episode(0)
+    coarse = transition(
+        base,
+        "coarse_done",
+        coarse_attempts=[CoarseResult(
+            start_subtask_index=0,
+            observed_subtask_indices=[0],
+            coarse_boundaries=[],
+            confidence=0.8,
+        )],
+    )
+    store.save_episode(coarse)
+    refined = transition(
+        coarse,
+        "refine_done",
+        final_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[]),
+    )
+    store.save_episode(refined)
+    accepted = transition(
+        refined,
+        "accepted",
+        decision_source="model",
+        prompt_version="historical-coarse-v0/refine-v0",
+        model_revision=SHA,
+        sampling_details={"frames": [0, 9]},
+    )
+    with pytest.raises(ValueError, match="prompt_version"):
+        store.save_episode(accepted)
+
+
 def test_resume_revalidates_semantically_accepted_records(tmp_path: Path) -> None:
     index = make_index(tmp_path, [10])
     config = make_config(index.root, tmp_path / "work")
@@ -715,9 +775,79 @@ def test_episode_commit_survives_summary_failure_and_summary_is_recoverable(tmp_
     monkeypatch.setattr(workspace, "_atomic_json_write", fail_only_summary)
     with pytest.raises(OSError, match="summary disk error"):
         store.save_episode(pending())
-    assert store.load_episode(0).status == "pending"
+    committed = store.load_episode(0)
+    assert committed.status == "pending"
     monkeypatch.setattr(workspace, "_atomic_json_write", original)
-    assert store.write_summary() == store.summary()
+    store.save_episode(committed)
+    assert json.loads((store.root / "summary.json").read_text()) == store.summary()
+
+
+def _fd_count() -> int:
+    fd_root = Path("/proc/self/fd")
+    if not fd_root.is_dir():
+        pytest.skip("fd accounting requires procfs")
+    return len(list(fd_root.iterdir()))
+
+
+def test_lock_fdopen_failure_closes_fd_and_releases_thread_lock(tmp_path: Path, monkeypatch) -> None:
+    import qwen_annotate.workspace as workspace
+
+    store = WorkspaceStore(tmp_path / "work")
+    store.create_layout()
+    before = _fd_count()
+    with monkeypatch.context() as patcher:
+        patcher.setattr(workspace.os, "fdopen", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("fdopen failed")))
+        with pytest.raises(RuntimeError, match="fdopen failed"):
+            store.summary()
+    assert _fd_count() == before
+    assert store.summary()["total"] == 0
+
+
+def test_atomic_fdopen_failure_closes_raw_fd_and_cleans_temp(tmp_path: Path, monkeypatch) -> None:
+    import qwen_annotate.workspace as workspace
+
+    target = tmp_path / "value.json"
+    before = _fd_count()
+    with monkeypatch.context() as patcher:
+        patcher.setattr(workspace.os, "fdopen", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("fdopen failed")))
+        with pytest.raises(RuntimeError, match="fdopen failed"):
+            workspace._atomic_json_write(target, {"value": 1})
+    assert _fd_count() == before
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_json_fstat_failure_closes_raw_fd(tmp_path: Path, monkeypatch) -> None:
+    import qwen_annotate.workspace as workspace
+
+    path = tmp_path / "value.json"
+    path.write_text('{"value":1}')
+    before = _fd_count()
+    with monkeypatch.context() as patcher:
+        patcher.setattr(workspace.os, "fstat", lambda fd: (_ for _ in ()).throw(OSError("fstat failed")))
+        with pytest.raises(ValueError, match="fstat failed"):
+            workspace._read_json_object(path)
+    assert _fd_count() == before
+
+
+def test_unlock_failure_closes_handle_and_releases_thread_lock(tmp_path: Path, monkeypatch) -> None:
+    import qwen_annotate.workspace as workspace
+
+    store = WorkspaceStore(tmp_path / "work")
+    store.create_layout()
+    before = _fd_count()
+    original = workspace.fcntl.flock
+
+    def fail_unlock(fd, operation):
+        if operation == workspace.fcntl.LOCK_UN:
+            raise OSError("unlock failed")
+        return original(fd, operation)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(workspace.fcntl, "flock", fail_unlock)
+        with pytest.raises(OSError, match="unlock failed"):
+            store.summary()
+    assert _fd_count() == before
+    assert store.summary()["total"] == 0
 
 
 def test_summary_has_all_zero_counts_sorted_indices_and_updates_on_save(tmp_path: Path) -> None:

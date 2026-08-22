@@ -141,12 +141,12 @@ class EpisodeRecord(_StrictModel):
             if self.validation_issues or self.review_reasons:
                 raise ValueError("accepted records cannot retain unresolved review issues")
             if self.decision_source == "model" and (
-                self.prompt_version != PROMPT_VERSION
+                self.prompt_version is None
                 or self.model_revision is None
                 or not self.sampling_details
             ):
                 raise ValueError(
-                    "model acceptance requires exact prompt_version, model_revision, and sampling provenance"
+                    "model acceptance requires prompt_version, model_revision, and sampling provenance"
                 )
         elif self.decision_source is not None:
             raise ValueError("decision_source is only valid for accepted records")
@@ -381,6 +381,8 @@ class WorkspaceStore:
                 prior = self._load_episode_unlocked(record.episode_index)
                 self._validate_transition(prior, record)
                 if prior == record:
+                    self._validate_final_annotation(record)
+                    self._write_summary_unlocked()
                     return
             elif record.status != "pending":
                 raise ValueError("a new standalone episode record must start pending")
@@ -558,9 +560,14 @@ class WorkspaceStore:
         if (
             record.status == "accepted"
             and record.decision_source == "model"
-            and record.model_revision != manifest.model_revision
+            and (
+                record.prompt_version != manifest.prompt_version
+                or record.model_revision != manifest.model_revision
+            )
         ):
-            raise ValueError("accepted model_revision must match the workspace manifest")
+            raise ValueError(
+                "accepted prompt_version and model_revision must match the workspace manifest"
+            )
         issues = validate_annotation(
             record.final_annotation,
             manifest.mode,
@@ -640,6 +647,7 @@ class _WorkspaceLock:
 
     def __enter__(self) -> "_WorkspaceLock":
         self._thread_lock.acquire()
+        raw_fd: int | None = None
         try:
             if self._path.parent.is_symlink() or not self._path.parent.is_dir():
                 raise ValueError("workspace lock parent is a symlink or unsafe directory")
@@ -652,28 +660,34 @@ class _WorkspaceLock:
             try:
                 parent_fd = os.open(self._path.parent, parent_flags)
                 try:
-                    fd = os.open(self._path.name, flags, 0o600, dir_fd=parent_fd)
+                    raw_fd = os.open(self._path.name, flags, 0o600, dir_fd=parent_fd)
                 finally:
                     os.close(parent_fd)
             except OSError as exc:
                 raise ValueError("workspace lock must not be a symlink or unsafe file") from exc
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                os.close(fd)
+            if not stat.S_ISREG(os.fstat(raw_fd).st_mode):
                 raise ValueError("workspace lock must be a regular file, not a symlink")
-            self._handle = os.fdopen(fd, "a+b")
+            self._handle = os.fdopen(raw_fd, "a+b")
+            raw_fd = None
             fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
         except BaseException:
-            if self._handle is not None and not self._handle.closed:
-                self._handle.close()
-            self._thread_lock.release()
+            try:
+                if raw_fd is not None:
+                    os.close(raw_fd)
+                if self._handle is not None and not self._handle.closed:
+                    self._handle.close()
+            finally:
+                self._thread_lock.release()
             raise
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         try:
             if self._handle is not None:
-                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
-                self._handle.close()
+                try:
+                    fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    self._handle.close()
         finally:
             self._thread_lock.release()
 
@@ -688,6 +702,7 @@ def _atomic_json_write(path: Path, value: Mapping[str, object] | dict[str, objec
     ) + "\n"
     directory_fd: int | None = None
     temporary_name: str | None = None
+    temporary_fd: int | None = None
     try:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
@@ -702,7 +717,9 @@ def _atomic_json_write(path: Path, value: Mapping[str, object] | dict[str, objec
             0o600,
             dir_fd=directory_fd,
         )
-        with os.fdopen(temporary_fd, "w", encoding="utf-8") as handle:
+        handle = os.fdopen(temporary_fd, "w", encoding="utf-8")
+        temporary_fd = None
+        with handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -716,28 +733,35 @@ def _atomic_json_write(path: Path, value: Mapping[str, object] | dict[str, objec
         temporary_name = None
         os.fsync(directory_fd)
     finally:
-        if temporary_name is not None and directory_fd is not None:
+        try:
+            if temporary_fd is not None:
+                os.close(temporary_fd)
+        finally:
             try:
-                os.unlink(temporary_name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
-        if directory_fd is not None:
-            os.close(directory_fd)
+                if temporary_name is not None and directory_fd is not None:
+                    try:
+                        os.unlink(temporary_name, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                if directory_fd is not None:
+                    os.close(directory_fd)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
+    fd: int | None = None
     try:
         _reject_symlink_path(path)
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         file_stat = os.fstat(fd)
         if not stat.S_ISREG(file_stat.st_mode):
-            os.close(fd)
             raise ValueError("JSON path must be a regular file")
         size = file_stat.st_size
         if size > _MAX_JSON_BYTES:
-            os.close(fd)
             raise ValueError(f"JSON file exceeds {_MAX_JSON_BYTES} bytes")
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        handle = os.fdopen(fd, "r", encoding="utf-8")
+        fd = None
+        with handle:
             text = handle.read(_MAX_JSON_BYTES + 1)
         value = json.loads(
             text,
@@ -746,6 +770,9 @@ def _read_json_object(path: Path) -> dict[str, Any]:
         )
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"Malformed JSON in {path.name}: {exc}") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
     if not isinstance(value, dict):
         raise ValueError(f"Malformed JSON in {path.name}: expected object")
     return value
