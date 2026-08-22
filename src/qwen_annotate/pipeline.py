@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .coarse import CoarseDecision, run_coarse
 from .config import AnnotationConfig
+from .constraints import ANNOTATION_VALIDATION_ISSUE_CODES
 from .lerobot import DatasetIndex, EpisodeInfo, inspect_dataset
 from .model_manager import ModelInstall
 from .models import CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
@@ -31,10 +32,6 @@ from .workspace import EpisodeRecord, Status, WorkspaceStore
 _STATUSES = ("pending", "coarse_done", "refine_done", "accepted", "needs_review", "failed")
 _NONACCEPTED = ("pending", "coarse_done", "refine_done", "needs_review", "failed")
 _SHA40 = frozenset("0123456789abcdef")
-_VALIDATION_ISSUE_CODES = {
-    "start_subtask_range", "complete_start_index", "complete_boundary_count",
-    "dagger_suffix_length", "boundary_order", "boundary_range", "segment_too_short",
-}
 _OUTBOX_KEY = "_pipeline_transition_events"
 _MAX_LOG_BYTES = 64 * 1024 * 1024
 _MAX_LOG_LINE_BYTES = 64 * 1024
@@ -389,7 +386,7 @@ async def _process_episode(config, dataset, episode, store, revision, client, se
             elif refined.status == "needs_review":
                 issues = [
                     ValidationIssue(code=reason, message=f"deterministic review reason: {reason}")
-                    for reason in refined.reasons if reason in _VALIDATION_ISSUE_CODES
+                    for reason in refined.reasons if reason in ANNOTATION_VALIDATION_ISSUE_CODES
                 ]
                 updated = _replace(record, services.clock, status="needs_review", validation_issues=issues,
                     review_reasons=list(refined.reasons), decision_source=None)

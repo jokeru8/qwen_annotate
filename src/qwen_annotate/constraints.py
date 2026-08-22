@@ -1,10 +1,22 @@
 """Pure validation rules for coarse and final annotations."""
 
-from typing import Literal
+from typing import Literal, get_args
 
-from .models import FinalAnnotation, ValidationIssue
+from .models import FinalAnnotation, IssueCode, ValidationIssue
 
 Mode = Literal["complete", "dagger_patch"]
+
+# Canonical classification shared by orchestration and offline evaluation.
+# Keep schema/parse failures here because the pipeline persists them as a
+# deterministic rejection before a FinalAnnotation can exist.
+ANNOTATION_VALIDATION_ISSUE_CODES = frozenset(get_args(IssueCode))
+DETERMINISTIC_REJECTION_REASONS = ANNOTATION_VALIDATION_ISSUE_CODES | frozenset({
+    "invalid_model_response",
+    "illegal_coarse_sequence",
+    "coarse_boundary_count",
+    "coarse_boundary_order",
+    "refine_transition_mismatch",
+})
 
 
 def _valid_positive_int(value: object) -> bool:

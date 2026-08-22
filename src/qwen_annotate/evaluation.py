@@ -12,28 +12,20 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .constraints import validate_annotation
+from .config import AnnotationConfig
+from .constraints import DETERMINISTIC_REJECTION_REASONS, validate_annotation
+from .lerobot import DatasetIndex, inspect_dataset, probe_video
 from .models import FinalAnnotation
-from .workspace import EpisodeRecord, RunManifest
+from .workspace import (
+    EpisodeRecord,
+    RunManifest,
+    WorkspaceStore,
+    compute_run_fingerprint,
+    compute_source_fingerprint,
+)
 
 
 EvaluationStatus = Literal["pending", "coarse_done", "refine_done", "accepted", "needs_review", "failed"]
-
-_DETERMINISTIC_REJECTION_REASONS = frozenset({
-    "invalid_model_response",
-    "illegal_coarse_sequence",
-    "coarse_boundary_count",
-    "coarse_boundary_order",
-    "refine_transition_mismatch",
-    "start_subtask_range",
-    "complete_start_index",
-    "complete_boundary_count",
-    "dagger_suffix_length",
-    "boundary_order",
-    "boundary_range",
-    "segment_too_short",
-})
-
 
 class _FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -303,7 +295,11 @@ def evaluate_complete(
     """Load a workspace and a reference-shaped golden dataset, then evaluate."""
     work = Path(work_dir).resolve()
     golden_root = Path(golden_dataset).resolve()
-    manifest = RunManifest.model_validate_json(json.dumps(_read_object(work / "manifest.json")))
+    store = WorkspaceStore(work)
+    manifest = store._load_manifest()  # secure workspace peer loader
+    summary = store.summary()
+    if summary["total"] != manifest.total_episodes:
+        raise ValueError("workspace episode count does not match manifest")
     if manifest.mode != "complete":
         raise ValueError("evaluate_complete requires a complete workspace manifest")
     annotations = _load_golden(golden_root, manifest)
@@ -316,11 +312,11 @@ def evaluate_complete(
     if set(annotations.boundaries) != expected_indices:
         raise ValueError("golden annotation episode indices do not match the workspace manifest")
     for index in range(manifest.total_episodes):
-        record = EpisodeRecord.model_validate_json(json.dumps(
-            _read_object(work / "episodes" / f"episode_{index:06d}.json")
-        ))
+        record = store.load_episode(index)
         if record.episode_index != index:
             raise ValueError("workspace episode index does not match its filename")
+        if record.run_fingerprint != manifest.run_fingerprint:
+            raise ValueError("episode run fingerprint does not match workspace manifest")
         records[index] = record
         statuses[index] = record.status
         if record.final_annotation is None:
@@ -334,6 +330,7 @@ def evaluate_complete(
         )) or _record_has_deterministic_rejection(record)
     for index in expected_indices - set(violations):
         violations[index] = _record_has_deterministic_rejection(records[index])
+    _validate_source_provenance(work, manifest, records)
     return evaluate_boundaries(
         predicted,
         annotations.boundaries,
@@ -438,9 +435,54 @@ def _dagger_prediction_violates(
 def _record_has_deterministic_rejection(record: EpisodeRecord) -> bool:
     return bool(
         record.validation_issues
-        or _DETERMINISTIC_REJECTION_REASONS.intersection(record.review_reasons)
+        or DETERMINISTIC_REJECTION_REASONS.intersection(record.review_reasons)
         or record.failure_category == "invalid_model_response"
     )
+
+
+def _validate_source_provenance(
+    work: Path,
+    manifest: RunManifest,
+    records: Mapping[int, EpisodeRecord],
+) -> DatasetIndex:
+    """Re-inspect the authoritative source and verify cached episode provenance."""
+    raw = json.loads(json.dumps(manifest.effective_config, allow_nan=False))
+    if not isinstance(raw, dict):
+        raise ValueError("manifest effective_config must be an object")
+    raw["source"] = str(manifest.dataset_root)
+    raw["work_dir"] = str(work)
+    model = raw.get("model")
+    if not isinstance(model, dict):
+        raise ValueError("manifest model provenance is invalid")
+    model["api_key"] = "evaluation-local-redacted"
+    config = AnnotationConfig.model_validate_json(json.dumps(raw), strict=True)
+    if (
+        config.mode != manifest.mode
+        or config.high_level_instruction != manifest.high_level_instruction
+        or config.subtasks != manifest.subtasks
+        or config.sampling.min_segment_frames != manifest.min_segment_frames
+        or config.model.name != manifest.model_repo
+        or compute_run_fingerprint(config, manifest.model_revision) != manifest.run_fingerprint
+    ):
+        raise ValueError("manifest run/model provenance is invalid")
+    dataset = inspect_dataset(config, probe=probe_video)
+    if (
+        dataset.root.resolve() != manifest.dataset_root.resolve()
+        or dataset.version != manifest.dataset_version
+        or not math.isclose(dataset.fps, manifest.fps, rel_tol=0, abs_tol=1e-9)
+        or list(dataset.camera_keys) != list(manifest.camera_keys)
+        or [episode.length for episode in dataset.episodes] != list(manifest.episode_lengths)
+        or len(dataset.episodes) != manifest.total_episodes
+        or sum(episode.length for episode in dataset.episodes) != manifest.total_frames
+    ):
+        raise ValueError("current source dataset does not match workspace manifest")
+    if any(episode.task != manifest.high_level_instruction for episode in dataset.episodes):
+        raise ValueError("current source task instruction does not match workspace manifest")
+    for episode in dataset.episodes:
+        record = records[episode.episode_index]
+        if record.source_fingerprint != compute_source_fingerprint(dataset.root, episode):
+            raise ValueError(f"episode {episode.episode_index} source fingerprint is stale")
+    return dataset
 
 
 def launch_gate_report(metrics: EvaluationMetrics) -> dict[str, Any]:

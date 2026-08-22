@@ -7,6 +7,8 @@ import pytest
 from typer.testing import CliRunner
 
 from qwen_annotate.cli import app
+from qwen_annotate.config import AnnotationConfig
+from qwen_annotate.constraints import DETERMINISTIC_REJECTION_REASONS
 from qwen_annotate.evaluation import (
     DaggerPrediction,
     DaggerView,
@@ -14,6 +16,18 @@ from qwen_annotate.evaluation import (
     evaluate_dagger,
     make_dagger_views,
 )
+from qwen_annotate.lerobot import EpisodeInfo, VideoProbe
+from qwen_annotate.workspace import compute_run_fingerprint, compute_source_fingerprint
+from tests.fixtures import make_lerobot_fixture
+
+
+@pytest.fixture(autouse=True)
+def _probe_fixture_videos(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "qwen_annotate.evaluation.probe_video",
+        lambda _: VideoProbe(frames=300, fps=20, width=16, height=16),
+        raising=False,
+    )
 
 
 def test_boundary_metrics_use_transition_alignment_and_nearest_rank_p90() -> None:
@@ -201,17 +215,44 @@ def test_dagger_evaluation_derives_minimum_segment_violation() -> None:
 def _write_evaluation_fixture(root: Path, *, boundary: int, status: str = "accepted") -> tuple[Path, Path]:
     work = root / "work"
     golden = root / "golden"
+    source = make_lerobot_fixture(
+        root, lengths=[300], fps=20, cameras=["observation.images.cam"]
+    )
+    (source / "meta" / "tasks.jsonl").write_text(
+        json.dumps({"task_index": 0, "task": "task"}) + "\n", encoding="utf-8"
+    )
+    (source / "meta" / "episodes.jsonl").write_text(
+        json.dumps({"episode_index": 0, "tasks": ["task"], "length": 300}) + "\n",
+        encoding="utf-8",
+    )
     (work / "episodes").mkdir(parents=True)
+    (work / "logs").mkdir()
+    (work / "previews" / "needs_review").mkdir(parents=True)
     (golden / "meta").mkdir(parents=True)
-    sha = "a" * 64
+    config = AnnotationConfig.model_validate({
+        "source": source, "work_dir": work, "mode": "complete",
+        "high_level_instruction": "task", "primary_camera": "observation.images.cam",
+        "refine_cameras": ["observation.images.cam"],
+        "subtasks": [{"skill": "a", "text": "A"}, {"skill": "b", "text": "B"}],
+    })
+    revision = "b" * 40
+    run_sha = compute_run_fingerprint(config, revision)
+    episode_info = EpisodeInfo(
+        episode_index=0, length=300, task="task",
+        parquet=source / "data/chunk-000/episode_000000.parquet",
+        videos={"observation.images.cam": source / "videos/chunk-000/observation.images.cam/episode_000000.mp4"},
+    )
+    source_sha = compute_source_fingerprint(source, episode_info)
     manifest = {
-        "dataset_root": str(root / "source"), "dataset_version": "v2.1", "fps": 20.0,
+        "dataset_root": str(source), "dataset_version": "v2.1", "fps": 20.0,
         "camera_keys": ["observation.images.cam"], "total_episodes": 1, "total_frames": 300,
         "episode_lengths": [300], "mode": "complete", "high_level_instruction": "task",
         "subtasks": [{"skill": "a", "text": "A"}, {"skill": "b", "text": "B"}],
-        "code_version": "0.1.0", "prompt_version": "v1", "model_repo": "Qwen/test",
-        "model_revision": "b" * 40, "effective_config": {}, "min_segment_frames": 8,
-        "run_fingerprint": sha, "created_at": "2026-08-22T00:00:00Z",
+        "code_version": "0.1.0", "prompt_version": "v1", "model_repo": config.model.name,
+        "model_revision": revision,
+        "effective_config": config.model_dump(mode="json", exclude={"model": {"api_key"}}),
+        "min_segment_frames": 8, "run_fingerprint": run_sha,
+        "created_at": "2026-08-22T00:00:00Z",
     }
     (work / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     episode = {
@@ -220,7 +261,7 @@ def _write_evaluation_fixture(root: Path, *, boundary: int, status: str = "accep
         "validation_issues": [], "review_reasons": [], "failure_category": None,
         "decision_source": "human" if status == "accepted" else None,
         "created_at": "2026-08-22T00:00:00Z", "updated_at": "2026-08-22T00:00:01Z",
-        "source_fingerprint": sha, "run_fingerprint": sha, "prompt_version": None,
+        "source_fingerprint": source_sha, "run_fingerprint": run_sha, "prompt_version": None,
         "model_revision": None, "sampling_details": {},
     }
     if status == "needs_review":
@@ -281,7 +322,7 @@ def test_cli_rejects_misaligned_golden_episode_metadata(tmp_path: Path) -> None:
     assert not output.exists()
 
 
-@pytest.mark.parametrize("reason", ["invalid_model_response", "boundary_order", "coarse_boundary_count"])
+@pytest.mark.parametrize("reason", sorted(DETERMINISTIC_REJECTION_REASONS))
 def test_complete_evaluation_counts_recorded_pre_final_constraint_failures(
     tmp_path: Path, reason: str,
 ) -> None:
@@ -298,6 +339,44 @@ def test_complete_evaluation_counts_recorded_pre_final_constraint_failures(
     assert metrics.constraint_violation_count == 1
     assert metrics.constraint_violation_blocked_count == 1
     assert metrics.constraint_blocking_rate == 1.0
+
+
+def test_complete_evaluation_rejects_cross_run_episode_and_cli_writes_no_report(tmp_path: Path) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=100)
+    path = work / "episodes" / "episode_000000.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["run_fingerprint"] = "c" * 64
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    from qwen_annotate.evaluation import evaluate_complete
+
+    with pytest.raises(ValueError, match="run fingerprint"):
+        evaluate_complete(work, golden)
+    output = tmp_path / "metrics.json"
+    result = CliRunner().invoke(
+        app, ["evaluate", str(work), "--golden", str(golden), "--output", str(output)],
+    )
+    assert result.exit_code == 1
+    assert not output.exists()
+
+
+def test_complete_evaluation_rejects_stale_source_episode(tmp_path: Path) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=100)
+    source_video = (
+        tmp_path / "source" / "videos/chunk-000/observation.images.cam/episode_000000.mp4"
+    )
+    source_video.write_bytes(b"changed after annotation")
+
+    from qwen_annotate.evaluation import evaluate_complete
+
+    with pytest.raises(ValueError, match="source fingerprint"):
+        evaluate_complete(work, golden)
+    output = tmp_path / "stale-source-metrics.json"
+    result = CliRunner().invoke(
+        app, ["evaluate", str(work), "--golden", str(golden), "--output", str(output)],
+    )
+    assert result.exit_code == 1
+    assert not output.exists()
 
 
 def test_complete_evaluation_rejects_dagger_workspace(tmp_path: Path) -> None:
