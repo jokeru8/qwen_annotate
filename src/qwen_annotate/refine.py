@@ -13,11 +13,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SkipValidation,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from .coarse import CoarseDecision
 from .config import AnnotationConfig
-from .constraints import validate_annotation
+from .constraints import coarse_sequence_is_legal, validate_annotation
 from .lerobot import EpisodeInfo
 from .models import FinalAnnotation, RefineResult
 from .prompts import build_refine_prompt
@@ -75,6 +83,13 @@ class CameraSampling(BaseModel):
     camera_key: str = Field(min_length=1)
     frame_indices: tuple[int, ...] = Field(min_length=1)
 
+    @field_validator("frame_indices", mode="before")
+    @classmethod
+    def restore_json_tuple(cls, value: object, info: ValidationInfo) -> object:
+        if info.mode == "json" and isinstance(value, list):
+            return tuple(value)
+        return value
+
     @field_validator("frame_indices")
     @classmethod
     def valid_grid(cls, value: tuple[int, ...]) -> tuple[int, ...]:
@@ -101,6 +116,13 @@ class SamplingProvenance(BaseModel):
     samples: tuple[CameraSampling, ...] = Field(min_length=1)
     outcome: Literal["completed", "model_oom"]
 
+    @field_validator("cameras", "samples", mode="before")
+    @classmethod
+    def restore_json_tuples(cls, value: object, info: ValidationInfo) -> object:
+        if info.mode == "json" and isinstance(value, list):
+            return tuple(value)
+        return value
+
     @model_validator(mode="after")
     def internally_consistent(self) -> "SamplingProvenance":
         if self.to_subtask_index != self.from_subtask_index + 1:
@@ -121,6 +143,8 @@ class RefineDecision(BaseModel):
     frame_count: int = Field(ge=1)
     min_segment_frames: int = Field(ge=1)
     agreement_tolerance_frames: int = Field(ge=0)
+    start_subtask_index: int = Field(ge=0)
+    observed_subtask_indices: tuple[int, ...] = Field(min_length=1)
     status: Literal["accepted", "needs_review", "failed"]
     attempts: tuple[SkipValidation[_ImmutableRefineResult], ...]
     provenance: tuple[SamplingProvenance, ...]
@@ -129,17 +153,21 @@ class RefineDecision(BaseModel):
     candidate_annotation: SkipValidation[_ImmutableFinalAnnotation] | None = None
     failure_category: Literal["model_oom"] | None = None
 
-    @field_validator("provenance", "reasons", mode="before")
+    @field_validator(
+        "observed_subtask_indices", "provenance", "reasons", mode="before"
+    )
     @classmethod
-    def freeze_plain_sequences(cls, value: object) -> object:
-        if isinstance(value, list):
+    def restore_json_sequences(cls, value: object, info: ValidationInfo) -> object:
+        if info.mode == "json" and isinstance(value, list):
             return tuple(value)
         return value
 
     @field_validator("attempts", mode="before")
     @classmethod
-    def freeze_attempts(cls, value: object) -> object:
-        if not isinstance(value, (list, tuple)):
+    def freeze_attempts(cls, value: object, info: ValidationInfo) -> object:
+        if info.mode == "json" and isinstance(value, list):
+            value = tuple(value)
+        if not isinstance(value, tuple):
             return value
         return tuple(_freeze_result(item) for item in value)
 
@@ -162,6 +190,12 @@ class RefineDecision(BaseModel):
 
     @model_validator(mode="after")
     def status_context_is_consistent(self) -> "RefineDecision":
+        if self.start_subtask_index != self.observed_subtask_indices[0]:
+            raise ValueError("start_subtask_index must match the first observed subtask")
+        if not coarse_sequence_is_legal(
+            list(self.observed_subtask_indices), self.mode, self.subtask_count
+        ):
+            raise ValueError("observed_subtask_indices must be a legal coarse sequence")
         if len(set(self.reasons)) != len(self.reasons):
             raise ValueError("reasons must be unique")
         if self.reasons != tuple(reason for reason in _REASON_ORDER if reason in self.reasons):
@@ -180,6 +214,10 @@ class RefineDecision(BaseModel):
                 self.frame_count, self.min_segment_frames,
             ):
                 raise ValueError("accepted annotation must satisfy mode/range/order constraints")
+            if self.annotation.start_subtask_index != self.start_subtask_index:
+                raise ValueError("accepted annotation start must match the coarse sequence")
+            if len(self.annotation.boundaries) != len(self.observed_subtask_indices) - 1:
+                raise ValueError("accepted annotation must cover every observed transition")
             if tuple(self.annotation.boundaries) != selected:
                 raise ValueError("accepted boundaries must exactly equal audited agreed results")
         elif self.status == "needs_review":
@@ -187,6 +225,10 @@ class RefineDecision(BaseModel):
                 raise ValueError("needs_review requires reasons, no failure, and no accepted annotation")
             validation_codes: set[str] = set()
             if self.candidate_annotation is not None:
+                if self.candidate_annotation.start_subtask_index != self.start_subtask_index:
+                    raise ValueError("review candidate start must match the coarse sequence")
+                if len(self.candidate_annotation.boundaries) != len(self.observed_subtask_indices) - 1:
+                    raise ValueError("review candidate must cover every observed transition")
                 validation_codes = {
                     issue.code for issue in validate_annotation(
                         _mutable_annotation(self.candidate_annotation), self.mode,
@@ -201,6 +243,8 @@ class RefineDecision(BaseModel):
         else:
             if self.reasons != ("model_oom",) or self.failure_category != "model_oom":
                 raise ValueError("failed decisions must identify model_oom")
+            if not self.provenance or self.provenance[-1].outcome != "model_oom":
+                raise ValueError("failed model_oom decisions require terminal OOM provenance")
             if self.annotation is not None or self.candidate_annotation is not None:
                 raise ValueError("failed decisions cannot expose an annotation")
         return self
@@ -265,6 +309,8 @@ async def run_refine(
         "frame_count": episode.length,
         "min_segment_frames": config.sampling.min_segment_frames,
         "agreement_tolerance_frames": config.sampling.agreement_tolerance_frames,
+        "start_subtask_index": coarse.start_subtask_index,
+        "observed_subtask_indices": tuple(coarse.observed_subtask_indices),
     }
     if not coarse.boundary_centers:
         annotation = FinalAnnotation(
@@ -303,7 +349,8 @@ async def run_refine(
     for boundary_index, ((left, right), center) in enumerate(zip(pairs, coarse.boundary_centers)):
         broad_pass = boundary_index * 3
         active_cameras = (config.primary_camera,) if degraded else cameras
-        broad_indices = _evidence_indices(center, broad_radius, base_stride, episode.length)
+        active_stride = base_stride * 2 if degraded else base_stride
+        broad_indices = _evidence_indices(center, broad_radius, active_stride, episode.length)
         broad_samples = await _sample_stage(
             source, active_cameras, broad_indices, sampler, episode,
             expected_source_fingerprint,
@@ -315,13 +362,13 @@ async def run_refine(
             broad = await completer.complete(broad_prompt, broad_samples, RefineResult)
             provenance.append(_provenance(
                 boundary_index, left, right, "broad", broad_pass, center,
-                broad_radius, base_stride, active_cameras, broad_indices, "completed",
+                broad_radius, active_stride, active_cameras, broad_indices, "completed",
             ))
         except ModelOutOfMemory:
             _assert_source_unchanged(source, episode, expected_source_fingerprint)
             provenance.append(_provenance(
                 boundary_index, left, right, "broad", broad_pass, center,
-                broad_radius, base_stride, active_cameras, broad_indices, "model_oom",
+                broad_radius, active_stride, active_cameras, broad_indices, "model_oom",
             ))
             if degraded or len(active_cameras) == 1:
                 return _oom_failure(common, attempts, provenance)
@@ -674,26 +721,43 @@ def _semantic_audit(decision: RefineDecision) -> tuple[set[ReviewReason], tuple[
     unique_indices = sorted(set(boundary_indices))
     if unique_indices and unique_indices != list(range(unique_indices[-1] + 1)):
         raise ValueError("provenance boundary indices must be contiguous from zero")
+    expected_pairs = tuple(
+        zip(decision.observed_subtask_indices, decision.observed_subtask_indices[1:])
+    )
+    if any(index >= len(expected_pairs) for index in unique_indices):
+        raise ValueError("provenance references a transition absent from the coarse sequence")
+    if decision.status == "accepted" and unique_indices != list(range(len(expected_pairs))):
+        raise ValueError("accepted refinement must cover every observed transition")
 
     completed_pairs = iter(decision.attempts)
     grouped: dict[int, list[tuple[SamplingProvenance, RefineResult]]] = {
         index: [] for index in unique_indices
     }
-    stages: dict[int, list[str]] = {index: [] for index in unique_indices}
+    stages: dict[int, list[tuple[str, str]]] = {index: [] for index in unique_indices}
     pairs: dict[int, tuple[int, int]] = {}
     for item in decision.provenance:
         base = item.boundary_index * 3
         expected_pass = {"broad": base, "broad_retry": base + 1, "dense": base + 2}[item.stage]
         if item.pass_id != expected_pass:
             raise ValueError("provenance pass_id does not match boundary/stage")
-        stages[item.boundary_index].append(item.stage)
+        stages[item.boundary_index].append((item.stage, item.outcome))
         pair = (item.from_subtask_index, item.to_subtask_index)
+        if pair != expected_pairs[item.boundary_index]:
+            raise ValueError("provenance transition must match the exact observed pair")
         if item.boundary_index in pairs and pairs[item.boundary_index] != pair:
             raise ValueError("all evidence for a boundary must request the same transition")
         pairs[item.boundary_index] = pair
         if item.outcome == "completed":
             grouped[item.boundary_index].append((item, next(completed_pairs)))
-    allowed_stages = (["broad", "dense"], ["broad", "broad_retry", "dense"], ["broad"], ["broad", "broad_retry"])
+    allowed_stages = (
+        [("broad", "completed"), ("dense", "completed")],
+        [("broad", "completed"), ("dense", "model_oom")],
+        [("broad", "completed")],
+        [("broad", "model_oom"), ("broad_retry", "completed"), ("dense", "completed")],
+        [("broad", "model_oom"), ("broad_retry", "completed"), ("dense", "model_oom")],
+        [("broad", "model_oom"), ("broad_retry", "model_oom")],
+        [("broad", "model_oom")],
+    )
     for values in stages.values():
         if values not in allowed_stages:
             raise ValueError("provenance stages are not a finite broad/retry/dense sequence")
@@ -719,6 +783,8 @@ def _semantic_audit(decision: RefineDecision) -> tuple[set[ReviewReason], tuple[
                 found.add("camera_evidence_conflict")
             continue
         selected.append(agreed)
+    if decision.status == "accepted" and len(selected) != len(expected_pairs):
+        raise ValueError("accepted refinement must agree on every observed transition")
     return found, tuple(selected)
 
 

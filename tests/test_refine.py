@@ -10,7 +10,13 @@ from qwen_annotate.config import AnnotationConfig
 from qwen_annotate.lerobot import EpisodeInfo
 from qwen_annotate.models import CoarseBoundary, CoarseResult, RefineResult
 from qwen_annotate.qwen_client import ModelCallError, ModelOutOfMemory
-from qwen_annotate.refine import RefineDecision, choose_agreed_boundary, run_refine
+from qwen_annotate.refine import (
+    CameraSampling,
+    RefineDecision,
+    SamplingProvenance,
+    choose_agreed_boundary,
+    run_refine,
+)
 from qwen_annotate.video import FrameSample
 from qwen_annotate.workspace import compute_source_fingerprint
 
@@ -190,6 +196,17 @@ async def test_two_stage_sampling_order_prompts_and_multiple_boundary_acceptance
     assert all(call[2] is RefineResult for call in client.calls)
     assert "from_subtask_index=0, to_subtask_index=1" in client.calls[0][0]
     assert "coarse center frame is 11" in client.calls[1][0]
+    restored = RefineDecision.model_validate_json(decision.model_dump_json())
+    assert restored == decision
+    assert isinstance(restored.observed_subtask_indices, tuple)
+    assert isinstance(restored.provenance[0].cameras, tuple)
+    assert isinstance(restored.provenance[0].samples, tuple)
+    assert isinstance(restored.provenance[0].samples[0].frame_indices, tuple)
+    dumped = restored.model_dump()
+    dumped["provenance"][0]["samples"][0]["frame_indices"] += (999,)
+    assert 999 not in restored.provenance[0].samples[0].frame_indices
+    with pytest.raises(ValidationError):
+        restored.provenance[0].samples[0].frame_indices += (999,)
 
 
 @pytest.mark.asyncio
@@ -225,6 +242,7 @@ async def test_disagreement_and_multicamera_conflict_preserve_audit(tmp_path: Pa
     assert decision.reasons == ("refine_boundary_disagreement", "camera_evidence_conflict")
     assert decision.annotation is None and decision.candidate_annotation is None
     assert len(decision.attempts) == 4
+    assert RefineDecision.model_validate_json(decision.model_dump_json()) == decision
 
 
 @pytest.mark.asyncio
@@ -278,6 +296,7 @@ async def test_second_oom_fails_without_partial_annotation(tmp_path: Path) -> No
     assert decision.reasons == ("model_oom",)
     assert decision.annotation is None and decision.candidate_annotation is None
     assert [item.outcome for item in decision.provenance] == ["model_oom", "model_oom"]
+    assert RefineDecision.model_validate_json(decision.model_dump_json()) == decision
 
 
 @pytest.mark.asyncio
@@ -328,7 +347,8 @@ def test_refine_decision_is_deeply_immutable_and_roundtrips(tmp_path: Path) -> N
     payload = {
         "mode": "complete", "subtask_count": 1, "frame_count": 20, "min_segment_frames": 2,
         "agreement_tolerance_frames": 2,
-        "status": "accepted", "attempts": [], "provenance": [], "reasons": [],
+        "start_subtask_index": 0, "observed_subtask_indices": (0,),
+        "status": "accepted", "attempts": (), "provenance": (), "reasons": (),
         "annotation": {"start_subtask_index": 0, "boundaries": []},
         "candidate_annotation": None, "failure_category": None,
     }
@@ -355,9 +375,10 @@ def test_refine_decision_freezes_attempts_and_rejects_inconsistent_audit() -> No
     payload = {
         "mode": "complete", "subtask_count": 2, "frame_count": 20,
         "min_segment_frames": 2, "agreement_tolerance_frames": 2,
-        "status": "needs_review", "attempts": [attempt, refined(15)],
-        "provenance": [provenance, {**provenance, "stage": "dense", "pass_id": 2}],
-        "reasons": ["refine_boundary_disagreement"],
+        "start_subtask_index": 0, "observed_subtask_indices": (0, 1),
+        "status": "needs_review", "attempts": (attempt, refined(15)),
+        "provenance": (provenance, {**provenance, "stage": "dense", "pass_id": 2}),
+        "reasons": ("refine_boundary_disagreement",),
         "annotation": None, "candidate_annotation": None, "failure_category": None,
     }
     decision = RefineDecision.model_validate(payload)
@@ -366,13 +387,103 @@ def test_refine_decision_freezes_attempts_and_rejects_inconsistent_audit() -> No
     dumped["attempts"][0]["visible_cues"] += ("dump mutation",)
     assert decision.attempts[0].visible_cues == ("release complete",)
     with pytest.raises(ValidationError, match="completed evidence"):
-        RefineDecision.model_validate({**payload, "attempts": []})
-    with pytest.raises(ValidationError, match="accepted annotation"):
+        RefineDecision.model_validate({**payload, "attempts": ()})
+    with pytest.raises(ValidationError, match="observed transition"):
         RefineDecision.model_validate({
-            **payload, "status": "accepted", "attempts": [], "provenance": [],
-            "reasons": [], "annotation": {"start_subtask_index": 0, "boundaries": [1]},
+            **payload, "status": "accepted", "attempts": (), "provenance": (),
+            "reasons": (), "annotation": {"start_subtask_index": 0, "boundaries": [1]},
             "candidate_annotation": None, "min_segment_frames": 2,
         })
+
+
+def test_python_lists_are_rejected_for_strict_audit_tuples() -> None:
+    base = {
+        "mode": "complete", "subtask_count": 1, "frame_count": 20,
+        "min_segment_frames": 2, "agreement_tolerance_frames": 2,
+        "start_subtask_index": 0, "observed_subtask_indices": (0,),
+        "status": "accepted", "attempts": (), "provenance": (), "reasons": (),
+        "annotation": {"start_subtask_index": 0, "boundaries": []},
+        "candidate_annotation": None, "failure_category": None,
+    }
+    for field in ("observed_subtask_indices", "attempts", "provenance", "reasons"):
+        with pytest.raises(ValidationError):
+            RefineDecision.model_validate({**base, field: list(base[field])})
+    with pytest.raises(ValidationError):
+        CameraSampling(camera_key="cam.eye", frame_indices=[1, 2])
+    camera = CameraSampling.model_validate_json('{"camera_key":"cam.eye","frame_indices":[1,2]}')
+    assert camera.frame_indices == (1, 2)
+    provenance = {
+        "boundary_index": 0, "from_subtask_index": 0, "to_subtask_index": 1,
+        "stage": "broad", "pass_id": 0, "request_center": 2,
+        "radius_frames": 1, "stride": 1, "cameras": ["cam.eye"],
+        "samples": [{"camera_key": "cam.eye", "frame_indices": [1, 2]}],
+        "outcome": "completed",
+    }
+    with pytest.raises(ValidationError):
+        SamplingProvenance.model_validate(provenance)
+    restored = SamplingProvenance.model_validate_json(json.dumps(provenance))
+    assert restored.cameras == ("cam.eye",) and restored.samples == (camera,)
+
+
+def test_decision_rejects_incomplete_or_masquerading_coarse_mapping() -> None:
+    base = {
+        "mode": "dagger_patch", "subtask_count": 4, "frame_count": 40,
+        "min_segment_frames": 2, "agreement_tolerance_frames": 2,
+        "start_subtask_index": 1, "status": "accepted", "attempts": (),
+        "provenance": (), "reasons": (), "annotation": {"start_subtask_index": 1, "boundaries": []},
+        "candidate_annotation": None, "failure_category": None,
+    }
+    # [1] is a legal explicit singleton, while [1,2,3] requires both refinements.
+    singleton = RefineDecision.model_validate({**base, "observed_subtask_indices": (1,)})
+    assert singleton.annotation.boundaries == ()
+    with pytest.raises(ValidationError, match="every observed transition"):
+        RefineDecision.model_validate({**base, "observed_subtask_indices": (1, 2, 3)})
+    with pytest.raises(ValidationError, match="legal coarse sequence"):
+        RefineDecision.model_validate({**base, "observed_subtask_indices": (1, 2)})
+    with pytest.raises(ValidationError, match="start"):
+        RefineDecision.model_validate({**base, "start_subtask_index": 2, "observed_subtask_indices": (1,)})
+    with pytest.raises(ValidationError, match="OOM provenance"):
+        RefineDecision.model_validate({
+            **base, "observed_subtask_indices": (1,), "status": "failed",
+            "annotation": None, "reasons": ("model_oom",), "failure_category": "model_oom",
+        })
+
+
+@pytest.mark.asyncio
+async def test_dagger_suffix_records_and_replays_full_observed_mapping(tmp_path: Path) -> None:
+    config = make_config(tmp_path, mode="dagger_patch", subtasks=4)
+    coarse = coarse_decision(
+        "dagger_patch", observed=(1, 2, 3), centers=(10, 30), subtask_count=4
+    )
+    decision = await run_refine(
+        config, make_episode(tmp_path), coarse, RecordingSampler(),
+        RecordingClient([refined(10, 1), refined(10, 1), refined(30, 2), refined(30, 2)]),
+    )
+    assert decision.status == "accepted"
+    assert decision.start_subtask_index == 1
+    assert decision.observed_subtask_indices == (1, 2, 3)
+    assert decision.annotation.boundaries == (10, 30)
+    assert RefineDecision.model_validate_json(decision.model_dump_json()) == decision
+
+
+@pytest.mark.asyncio
+async def test_oom_degradation_stride_persists_across_later_boundaries(tmp_path: Path) -> None:
+    sampler = RecordingSampler()
+    client = RecordingClient([oom(), refined(10, 0), refined(10, 0), refined(30, 1), refined(30, 1)])
+    decision = await run_refine(make_config(tmp_path), make_episode(tmp_path), coarse_decision(), sampler, client)
+    assert decision.status == "accepted"
+    # Boundary 1 broad is still primary-only and uses doubled stride (10), not base stride (5).
+    later_broad = [call for call in sampler.calls if call[2] == [20, 30, 40]]
+    assert [(call[1], call[2]) for call in later_broad] == [("cam.eye", [20, 30, 40])]
+
+
+@pytest.mark.asyncio
+async def test_any_oom_after_degradation_fails_without_another_retry(tmp_path: Path) -> None:
+    client = RecordingClient([oom(), refined(10, 0), refined(10, 0), oom()])
+    decision = await run_refine(make_config(tmp_path), make_episode(tmp_path), coarse_decision(), RecordingSampler(), client)
+    assert decision.status == "failed"
+    assert len(client.calls) == 4
+    assert [item.stage for item in decision.provenance] == ["broad", "broad_retry", "dense", "broad"]
 
 
 @pytest.mark.asyncio
