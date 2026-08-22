@@ -7,7 +7,7 @@ from .config import AnnotationConfig
 from .models import CoarseResult, RefineResult
 
 
-PROMPT_VERSION = "coarse-v6/refine-v1"
+PROMPT_VERSION = "coarse-v6/refine-v2"
 
 _COARSE_UNCERTAINTY_POLICY = (
     "Semantic uncertainty policy: Use semantic_uncertainty_codes only for semantic facts "
@@ -22,6 +22,18 @@ _COARSE_UNCERTAINTY_POLICY = (
     "the best approximate estimated_frame values; refine will determine exact frames. Put "
     "optional exact-frame imprecision comments in boundary_precision_notes; these notes are "
     "audit-only and do not represent semantic uncertainty or block refine."
+)
+
+_REFINE_ONSET_POLICY = (
+    "Refine onset policy: boundary_frame is the first original frame where the next "
+    "subtask's goal-directed action becomes visibly underway. Count reaching, "
+    "reorientation, or other purposeful preparatory motion toward the next subtask as "
+    "onset. last_frame_before is the final original frame before any such goal-directed "
+    "motion begins; first_frame_after == boundary_frame.\n"
+    "Do NOT wait for contact, grasp, release, handover, placement, or completion. Do not "
+    "label aimless stillness, camera shake, robot jitter, or non-goal-directed motion as "
+    "onset. Interpret motion using the exact semantics of both from/to subtasks and "
+    "corroborate it with all available camera evidence."
 )
 
 
@@ -132,6 +144,9 @@ def build_refine_prompt(
         f"Refine exactly one consecutive pair: from_subtask_index={from_subtask_index}, to_subtask_index={to_subtask_index}.",
         "The exact skill/text for both entries is in the untrusted context JSON; use those values without rewriting them.",
         f"The coarse center frame is {coarse_frame}; inspect visible cues around it.",
+        "BEGIN_REFINE_ONSET_POLICY",
+        _REFINE_ONSET_POLICY,
+        "END_REFINE_ONSET_POLICY",
         "Return last_frame_before, first_frame_after, and boundary_frame for this transition only.",
         f"Require from_subtask_index == {from_subtask_index} and to_subtask_index == {to_subtask_index}. Frame values must be in range [0, {frame_count - 1}].",
         "Require last_frame_before + 1 == first_frame_after == boundary_frame; these are adjacent original episode frames, not merely sampled evidence frames.",

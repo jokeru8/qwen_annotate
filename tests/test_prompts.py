@@ -28,7 +28,7 @@ def config(mode: str = "complete", subtasks=None) -> AnnotationConfig:
 
 def test_coarse_prompt_contains_ordered_template_and_required_rules():
     prompt = build_coarse_prompt(config("dagger_patch", [{"skill": "pick", "text": "pick"}, {"skill": "place", "text": "place"}]), 2, 20, 3)
-    assert PROMPT_VERSION == "coarse-v6/refine-v1"
+    assert PROMPT_VERSION == "coarse-v6/refine-v2"
     context = json.loads(prompt.split("BEGIN_UNTRUSTED_CONTEXT_JSON\n", 1)[1].split("\nEND_UNTRUSTED_CONTEXT_JSON", 1)[0])
     assert context["subtasks"] == [{"index": 0, "skill": "pick", "text": "pick"}, {"index": 1, "skill": "place", "text": "place"}]
     assert "Do not invent or rewrite labels" in prompt
@@ -146,6 +146,37 @@ def test_refine_prompt_names_exact_pair_and_coarse_center():
     assert "last_frame_before + 1 == first_frame_after == boundary_frame" in prompt
     assert "[0, 29]" in prompt
     assert "no other transition" in prompt
+
+
+def test_refine_prompt_defines_unique_earliest_goal_directed_onset_contract():
+    """Catches refining to contact/completion instead of the next action's onset."""
+    prompt = build_refine_prompt(
+        config(subtasks=[{"skill": "a", "text": "Move item"}, {"skill": "b", "text": "Hand it over"}]),
+        1,
+        100,
+        0,
+        1,
+        50,
+        0,
+    )
+    expected_policy = (
+        "Refine onset policy: boundary_frame is the first original frame where the next "
+        "subtask's goal-directed action becomes visibly underway. Count reaching, "
+        "reorientation, or other purposeful preparatory motion toward the next subtask as "
+        "onset. last_frame_before is the final original frame before any such goal-directed "
+        "motion begins; first_frame_after == boundary_frame.\n"
+        "Do NOT wait for contact, grasp, release, handover, placement, or completion. Do not "
+        "label aimless stillness, camera shake, robot jitter, or non-goal-directed motion as "
+        "onset. Interpret motion using the exact semantics of both from/to subtasks and "
+        "corroborate it with all available camera evidence."
+    )
+    begin = "BEGIN_REFINE_ONSET_POLICY\n"
+    end = "\nEND_REFINE_ONSET_POLICY"
+    assert prompt.count(begin) == prompt.count(end) == 1
+    before, remainder = prompt.split(begin, 1)
+    policy, after = remainder.split(end, 1)
+    assert policy == expected_policy
+    assert "onset" not in (before + after).lower()
 
 
 @pytest.mark.parametrize("args", [(True, 1, 0), (-1, 1, 0), (0, 0, 0), (0, 1, -1)])

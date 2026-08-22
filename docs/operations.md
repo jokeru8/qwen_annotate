@@ -20,9 +20,9 @@ uv run qwen-annotate inspect examples/complete.yaml
 
 - 机器可见 8 张 NVIDIA H20，每张总显存 97,871 MiB；检查时每张约有 97,284 MiB 空闲。
 - `/mnt/data/user/zhoukr/envs/vllm` 中安装的 vLLM package 版本为 `0.27.1`；`vllm --version` 在 10 秒预检超时内未返回，因此启动前仍需现场确认 CLI 可用。
-- 精确目标目录 `/mnt/data/user/zhoukr/models/Qwen3.8-27B` 尚不存在，尚未产生 `model-install.json`。
+- 后续已在精确目标目录 `/mnt/data/user/zhoukr/models/Qwen3.8-27B` 完成校验，`model-install.json` 记录固定 revision `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`。
 - 本机存在 `/mnt/data/user/zhoukr/models/Qwen3.8-27B-FP8`，但它不是本项目要求的精确 repo/path，不能替代经过本 CLI 固定 revision 并验证的安装。
-- 因模型未安装，真实单 episode smoke、47 episode golden benchmark 和并发 1/2/4 吞吐测试均尚未执行；本文不填写虚构的延迟、显存或吞吐数值。
+- 已得到 5 episode 的真实 partial 失败基线（见第 8 节）；47 episode golden benchmark 和并发 1/2/4 吞吐测试仍未执行。本文不填写未实测的延迟、显存或吞吐数值。
 
 ## 2. 配置
 
@@ -114,18 +114,18 @@ uv run qwen-annotate status \
 
 检查 `episodes/episode_000000.json`：应保存两次合法 coarse attempt、每个候选边界的 broad/dense refine attempt、真实 frame index/camera 采样 provenance、`prompt_version` 和固定模型 SHA。客户端对每次结构化 completion 最多发出 4 次请求（包括瞬态重试与最多一次格式修复），默认单请求 timeout 为 120 秒。
 
-真实 smoke 完成后在本节追加实际值，不可估算：
+当前已有 episode 0--4 的真实 partial 评测，但当次没有记录完整 smoke 遥测；缺失值保持明确，不可估算：
 
 ```text
-model_revision: PENDING_MODEL_DOWNLOAD
-vllm_version: 0.27.1 package present; server CLI/runtime confirmation pending
-episode: 0
-coarse_valid_responses: PENDING
-refine_valid_responses: PENDING
-visual_frame_count: PENDING
-request_latency_seconds: PENDING
-peak_gpu_memory_mib: PENDING
-result: BLOCKED_BY_MISSING_TARGET_MODEL
+model_revision: 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+vllm_version: 0.27.1 package; exact serving-process banner not retained here
+episodes: 0,1,2,3,4 partial evaluation
+coarse_valid_responses: NOT_RECORDED_IN_PARTIAL_BASELINE
+refine_valid_responses: NOT_RECORDED_IN_PARTIAL_BASELINE
+visual_frame_count: NOT_RECORDED_IN_PARTIAL_BASELINE
+request_latency_seconds: NOT_RECORDED_IN_PARTIAL_BASELINE
+peak_gpu_memory_mib: NOT_RECORDED_IN_PARTIAL_BASELINE
+result: FAILED_BOUNDARY_ACCURACY_BASELINE; see section 8
 ```
 
 ## 5. 批量运行、两阶段 prompt 与恢复
@@ -141,7 +141,7 @@ uv run qwen-annotate status WORK_DIR --json
 
 每个 episode 的阶段是 `pending → coarse_done → refine_done → accepted`。coarse 使用主相机、覆盖完整时间范围的两套独立稀疏采样，必须在合法模板序列上达成一致。refine 对每个 transition 先用配置相机做 broad window，再在候选点附近做 dense 连续帧判断；最终边界是“下一 subtask 的第一帧”。模型只能引用 prompt 中带整数 index 的模板，不能发明标签。
 
-当前 prompt 版本是 `coarse-v6/refine-v1`。coarse 使用两个必填分层字段：`semantic_uncertainty_codes` 是唯一阻断通道，只允许 `subtask_order_unclear`、`start_subtask_unclear`、`transition_neighborhood_unclear`；任一非空就进入 `coarse_uncertain`。即使存在语义不确定，模型仍须填写 schema 所需的 best-supported provisional 起始项、序列与粗边界，同时用 code 明确它们不是确定事实；code 是权威 blocker。若顺序、起始项和大致过渡邻域都明确，模型返回最合理的粗略中心并保持 codes 为空，由 refine 完成精确定位。`boundary_precision_notes` 只记录稀疏采样下的精确帧误差，不阻断 coarse/refine。旧的泛化 `uncertainties` 字段不再属于 schema。所有正常请求、瞬态重试和格式修复请求都显式设置 greedy `temperature=0`，不继承 vLLM 模型目录中可能为随机采样的 `generation_config`。v6 会使已有 v5 及更早 workspace 的 run fingerprint 不匹配并 fail closed；旧结果必须在新的空 workspace 中重新标注，不能复用。
+当前 prompt 版本是 `coarse-v6/refine-v2`。coarse 使用两个必填分层字段：`semantic_uncertainty_codes` 是唯一阻断通道，只允许 `subtask_order_unclear`、`start_subtask_unclear`、`transition_neighborhood_unclear`；任一非空就进入 `coarse_uncertain`。即使存在语义不确定，模型仍须填写 schema 所需的 best-supported provisional 起始项、序列与粗边界，同时用 code 明确它们不是确定事实；code 是权威 blocker。若顺序、起始项和大致过渡邻域都明确，模型返回最合理的粗略中心并保持 codes 为空，由 refine 完成精确定位。`boundary_precision_notes` 只记录稀疏采样下的精确帧误差，不阻断 coarse/refine。旧的泛化 `uncertainties` 字段不再属于 schema。refine-v2 把边界定义为下一 subtask 的目标导向动作首次可见的原始帧：reach、reorientation 和有目的的准备动作都算开始，不能等到 contact、grasp、release、handover、placement 或动作完成；无目标的静止、相机抖动、机器人抖动或非目标导向运动不算开始，必须结合相邻两个 subtask 的精确语义和全部可用相机证据判断。所有正常请求、瞬态重试和格式修复请求都显式设置 greedy `temperature=0`，不继承 vLLM 模型目录中可能为随机采样的 `generation_config`。refine-v2 会使已有 refine-v1 workspace 的 run fingerprint 不匹配并 fail closed；旧结果必须在新的空 workspace 中重新标注，不能复用。
 
 实际 coarse-v4 episode JSON 含已移除的 `uncertainties`，当前 loader 会明确 fail closed，`status`/`review` 不保证读取此类旧 workspace。保留原始 workspace JSON 只能用于人工审计；不要编辑成新 schema 或继续运行，必须创建新的空 workspace 重新标注。
 
@@ -219,7 +219,19 @@ uv run qwen-annotate evaluate \
   --output /mnt/data/user/zhoukr/annotations/arrange_orange_juice_and_green_tea_2/metrics.json
 ```
 
-全部 launch gates 才返回成功：median boundary error ≤0.5 s、p90 ≤1.0 s、accepted coverage ≥0.85、constraint blocking rate =1.0、false accept count =0。当前因目标模型尚未下载，尚无真实 metrics，不能声称门槛已通过。
+全部 launch gates 才返回成功：median boundary error ≤0.5 s、p90 ≤1.0 s、accepted coverage ≥0.85、constraint blocking rate =1.0、false accept count =0。尚未完成 47 episode 全量评测，不能声称门槛已通过。
+
+refine-v1 的 5 episode（0--4）真实结果仅是 **partial 失败基线**，不是 47 episode 全量 benchmark，也不代表 launch gate 结果。模型预测/人工 golden 的三个边界帧如下：
+
+| episode | refine-v1 predicted | golden |
+| --- | --- | --- |
+| 0 | `[220, 416, 627]` | `[186, 400, 584]` |
+| 1 | `[234, 418, 643]` | `[219, 435, 604]` |
+| 2 | `[232, 455, 720]` | `[216, 458, 691]` |
+| 3 | `[230, 370, 577]` | `[205, 397, 549]` |
+| 4 | `[207, 390, 575]` | `[190, 399, 541]` |
+
+这 15 个边界的绝对帧误差 median 为 25 帧、P90 为 39 帧；transition 0 和 2 几乎都偏晚。`visible_cues` 显示 refine-v1 倾向等到 grasp/handover contact 或 placement，而参考标注采用下一 subtask 最早目标导向动作开始。该证据促成 refine-v2 prompt；必须在新 workspace 重跑同一 episode 集后才能比较，本文不预报改进幅度。
 
 若失败，只调整 prompt 文本、sampling 密度/window 或接受阈值；修改 prompt 时递增 `PROMPT_VERSION`，使用新 workspace 使受影响 cache 失效，然后保存前后 `metrics.json`。不要为通过 benchmark 修改 golden 标注或硬约束。
 
