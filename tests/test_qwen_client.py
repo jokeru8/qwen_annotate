@@ -577,6 +577,75 @@ async def test_invalid_response_exception_graph_never_retains_raw_output(respons
     assert caught.value.__context__ is None
 
 
+@pytest.mark.parametrize(
+    ("failure_factory", "expected_type", "attempts"),
+    [
+        (lambda secret: RuntimeError(secret), ModelCallError, 1),
+        (lambda secret: TimeoutError(secret), ModelCallError, 2),
+        (
+            lambda secret: RuntimeError(secret + " CUDA out of memory"),
+            ModelOutOfMemory,
+            1,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_transport_exception_graph_never_retains_raw_error(
+    failure_factory, expected_type, attempts: int
+) -> None:
+    secret = "UNIQUE_TRANSPORT_SECRET_" + ("t" * 300)
+    calls = 0
+
+    async def send(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise failure_factory(secret)
+
+    with pytest.raises(expected_type) as caught:
+        await QwenClient(send=send, max_attempts=attempts, retry_seconds=0).complete(
+            "prompt", [], FinalAnnotation
+        )
+    assert calls == attempts
+    assert caught.value.attempt_count == attempts
+    assert secret not in exception_text_graph(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_malformed_accessor_exception_graph_never_retains_raw_error() -> None:
+    secret = "UNIQUE_ACCESSOR_SECRET_" + ("a" * 300)
+
+    class MaliciousChoices:
+        @property
+        def choices(self):
+            raise RuntimeError(secret)
+
+    class MaliciousMessage:
+        @property
+        def content(self):
+            raise RuntimeError(secret)
+
+    responses = [
+        SimpleNamespace(secret=secret, choices=[]),
+        MaliciousChoices(),
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=MaliciousMessage())],
+        ),
+    ]
+    for response in responses:
+        async def send(**kwargs):
+            return response
+
+        with pytest.raises(InvalidModelResponse) as caught:
+            await QwenClient(send=send, max_attempts=1).complete(
+                "prompt", [], FinalAnnotation
+            )
+        assert secret not in exception_text_graph(caught.value)
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+
+
 @pytest.mark.asyncio
 async def test_error_excerpt_is_redacted_and_bounded() -> None:
     secret = "super-secret-api-key"

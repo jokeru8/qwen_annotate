@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import json
 import math
-import re
 from collections.abc import Awaitable, Callable, Sequence
 from numbers import Real
 from typing import Any
@@ -49,16 +48,6 @@ class InvalidModelResponse(ModelCallError):
     """The endpoint returned no strictly valid instance of the requested schema."""
 
 
-class _ResponseStatusError(RuntimeError):
-    def __init__(self, status_code: int, body: str) -> None:
-        self.status_code = status_code
-        super().__init__(body)
-
-
-class _MalformedResponse(ValueError):
-    pass
-
-
 class _StrictJSONError(ValueError):
     pass
 
@@ -90,7 +79,6 @@ class QwenClient:
         if endpoint is not None and base_url is not None and str(endpoint) != str(base_url):
             raise ValueError("endpoint and base_url must not disagree")
 
-        self._api_key = api_key
         self._model = model
         self._max_attempts = max_attempts
         self._retry_seconds = delays
@@ -127,33 +115,35 @@ class QwenClient:
 
         while attempt_count < self._max_attempts:
             attempt_count += 1
-            try:
-                raw_response = await self._send(**request)
-                content = self._extract_content(raw_response)
-            except _MalformedResponse as exc:
-                raise InvalidModelResponse(
-                    "model returned a malformed response envelope",
-                    attempt_count=attempt_count,
-                    excerpt=self._safe_excerpt(exc),
-                ) from exc
-            except Exception as exc:
-                full_detail = _exception_detail(exc)
-                if self._is_oom(full_detail):
-                    raise ModelOutOfMemory(
-                        "model worker ran out of memory or exited",
-                        attempt_count=attempt_count,
-                        excerpt=self._safe_excerpt(full_detail),
-                    ) from None
-                excerpt = self._safe_excerpt(full_detail)
-                if self._is_transient(exc) and attempt_count < self._max_attempts:
+            content, failure, excerpt = await self._send_once(request)
+            if failure is not None:
+                if failure == "transient" and attempt_count < self._max_attempts:
                     await self._sleep(self._delay(transient_count))
                     transient_count += 1
                     continue
+                if failure == "oom":
+                    raise ModelOutOfMemory(
+                        "model worker ran out of memory or exited",
+                        attempt_count=attempt_count,
+                        excerpt=excerpt,
+                    )
+                if failure == "malformed":
+                    raise InvalidModelResponse(
+                        "model returned a malformed response envelope",
+                        attempt_count=attempt_count,
+                        excerpt=excerpt,
+                    )
                 raise ModelCallError(
                     "model request failed",
                     attempt_count=attempt_count,
                     excerpt=excerpt,
-                ) from None
+                )
+            if content is None:
+                raise InvalidModelResponse(
+                    "model returned a malformed response envelope",
+                    attempt_count=attempt_count,
+                    excerpt="<missing sanitized response state>",
+                )
 
             result, category = _parse_typed_response(
                 content,
@@ -227,28 +217,78 @@ class QwenClient:
         )
         return self._request(repair_prompt, [], response_type, schema)
 
-    def _extract_content(self, response: Any) -> str:
-        if isinstance(response, str):
-            content = response
-        else:
-            status_code = _status_code(response)
-            if status_code is not None and status_code >= 400:
-                raise _ResponseStatusError(status_code, _response_text(response))
+    async def _send_once(
+        self, request: dict[str, Any]
+    ) -> tuple[str | None, str | None, str]:
+        """Return only content or sanitized primitive failure state."""
+        try:
+            response = await self._send(**request)
+        except Exception as exc:
             try:
-                content = response.choices[0].message.content
-            except (AttributeError, IndexError, KeyError, TypeError) as exc:
-                raise _MalformedResponse("response is missing choices[0].message.content") from exc
-        if not isinstance(content, str) or not content.strip():
-            raise _MalformedResponse("choices[0].message.content must be a nonempty string")
-        return content
+                detail = _exception_detail(exc)
+            except Exception:
+                detail = "unprintable transport exception"
+            try:
+                status_code = _status_code(exc)
+            except Exception:
+                status_code = None
+            if self._is_oom(detail):
+                failure = "oom"
+            elif self._exception_is_transient(exc, status_code):
+                failure = "transient"
+            else:
+                failure = "fatal"
+            return None, failure, _redacted_diagnostic_excerpt(detail, "transport")
+        return self._extract_content_result(response)
 
-    def _is_transient(self, exc: Exception) -> bool:
+    def _extract_content_result(
+        self, response: Any
+    ) -> tuple[str | None, str | None, str]:
+        try:
+            if isinstance(response, str):
+                content = response
+            else:
+                status_code = _status_code(response)
+                if status_code is not None and status_code >= 400:
+                    detail = _response_text(response)
+                    if self._is_oom(detail):
+                        failure = "oom"
+                    elif status_code == 429 or 500 <= status_code <= 599:
+                        failure = "transient"
+                    else:
+                        failure = "fatal"
+                    return (
+                        None,
+                        failure,
+                        _redacted_diagnostic_excerpt(detail, f"HTTP {status_code}"),
+                    )
+                content = response.choices[0].message.content
+        except Exception as exc:
+            try:
+                detail = _exception_detail(exc)
+            except Exception:
+                detail = "unprintable response accessor exception"
+            return None, "malformed", _redacted_diagnostic_excerpt(detail, "envelope")
+        if not isinstance(content, str) or not content.strip():
+            return (
+                None,
+                "malformed",
+                _redacted_diagnostic_excerpt(
+                    "missing or non-string choices[0].message.content", "envelope"
+                ),
+            )
+        return content, None, ""
+
+    def _exception_is_transient(
+        self, exc: Exception, status_code: int | None
+    ) -> bool:
         if isinstance(exc, TimeoutError):
             return True
         if exc.__class__.__name__ in {"APITimeoutError", "APIConnectionError"}:
             return True
-        status = _status_code(exc)
-        return status == 429 or (status is not None and 500 <= status <= 599)
+        return status_code == 429 or (
+            status_code is not None and 500 <= status_code <= 599
+        )
 
     def _is_oom(self, text: str) -> bool:
         lowered = text.lower()
@@ -256,16 +296,6 @@ class QwenClient:
 
     def _delay(self, transient_index: int) -> float:
         return self._retry_seconds[min(transient_index, len(self._retry_seconds) - 1)]
-
-    def _safe_excerpt(self, value: object) -> str:
-        text = str(value).replace(self._api_key, "[REDACTED]") if self._api_key else str(value)
-        text = re.sub(r"(?i)bearer\s+[^\s,;]+", "Bearer [REDACTED]", text)
-        text = re.sub(r"(?i)(api[_-]?key\s*[=:]\s*)[^\s,;]+", r"\1[REDACTED]", text)
-        text = " ".join(text.split())
-        if len(text) > _MAX_ERROR_EXCERPT:
-            return text[: _MAX_ERROR_EXCERPT - 3] + "..."
-        return text
-
 
 _NOT_PARSED = object()
 
@@ -394,6 +424,12 @@ def _parse_typed_response[T: BaseModel](
 def _redacted_response_excerpt(content: str) -> str:
     digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
     return f"<model response redacted; chars={len(content)}; sha256={digest}>"
+
+
+def _redacted_diagnostic_excerpt(detail: str, category: str) -> str:
+    digest = hashlib.sha256(detail.encode("utf-8", errors="replace")).hexdigest()[:16]
+    excerpt = f"<{category} diagnostic redacted; chars={len(detail)}; sha256={digest}>"
+    return excerpt[:_MAX_ERROR_EXCERPT]
 
 
 def _normalize_retry_seconds(value: float | Sequence[float]) -> tuple[float, ...]:
