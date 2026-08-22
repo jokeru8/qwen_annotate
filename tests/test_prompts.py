@@ -28,7 +28,7 @@ def config(mode: str = "complete", subtasks=None) -> AnnotationConfig:
 
 def test_coarse_prompt_contains_ordered_template_and_required_rules():
     prompt = build_coarse_prompt(config("dagger_patch", [{"skill": "pick", "text": "pick"}, {"skill": "place", "text": "place"}]), 2, 20, 3)
-    assert PROMPT_VERSION == "coarse-v3/refine-v1"
+    assert PROMPT_VERSION == "coarse-v4/refine-v1"
     context = json.loads(prompt.split("BEGIN_UNTRUSTED_CONTEXT_JSON\n", 1)[1].split("\nEND_UNTRUSTED_CONTEXT_JSON", 1)[0])
     assert context["subtasks"] == [{"index": 0, "skill": "pick", "text": "pick"}, {"index": 1, "skill": "place", "text": "place"}]
     assert "Do not invent or rewrite labels" in prompt

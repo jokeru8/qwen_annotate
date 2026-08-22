@@ -396,6 +396,23 @@ async def test_one_text_only_format_repair_can_succeed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_normal_and_format_repair_requests_are_explicitly_greedy() -> None:
+    """Catches vLLM generation_config silently making either request stochastic."""
+    calls = []
+    replies = iter(["wrapped: " + valid_json(44), valid_json(44)])
+
+    async def send(**kwargs):
+        calls.append(kwargs)
+        return next(replies)
+
+    result = await QwenClient(send=send, max_attempts=2).complete(
+        "prompt", [], FinalAnnotation
+    )
+    assert result.boundaries == [44]
+    assert [request["temperature"] for request in calls] == [0, 0]
+
+
+@pytest.mark.asyncio
 async def test_totally_unparseable_response_cannot_be_repaired_by_invention() -> None:
     replies = iter(["not json at all", valid_json(44)])
 

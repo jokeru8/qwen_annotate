@@ -194,6 +194,7 @@ class QwenClient:
         )
         request: dict[str, Any] = {
             "model": self._model,
+            "temperature": 0,
             "messages": [{"role": "user", "content": content}],
             "response_format": {
                 "type": "json_schema",

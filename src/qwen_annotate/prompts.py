@@ -7,7 +7,7 @@ from .config import AnnotationConfig
 from .models import CoarseResult, RefineResult
 
 
-PROMPT_VERSION = "coarse-v3/refine-v1"
+PROMPT_VERSION = "coarse-v4/refine-v1"
 
 _COARSE_UNCERTAINTY_POLICY = (
     "Uncertainty policy: If any of the subtask order, starting subtask, or approximate "
