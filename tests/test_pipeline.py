@@ -22,6 +22,20 @@ from tests.fixtures import make_config
 SHA = "a" * 40
 
 
+def _sync_log_in_process(work_dir: str, results) -> None:
+    import asyncio
+    from pathlib import Path
+    from qwen_annotate.pipeline import _RunLog
+    from qwen_annotate.workspace import WorkspaceStore
+
+    try:
+        asyncio.run(_RunLog(Path(work_dir), lambda: datetime.now(UTC)).sync(WorkspaceStore(Path(work_dir))))
+    except BaseException as exc:
+        results.put(type(exc).__name__)
+    else:
+        results.put("ok")
+
+
 def _dataset(tmp_path: Path, count: int = 2) -> DatasetIndex:
     root = tmp_path / "source"
     root.mkdir(parents=True)
@@ -647,6 +661,162 @@ async def test_deleted_log_is_rebuilt_from_outbox_without_duplicates(tmp_path: P
         EpisodeRecord.model_validate(payload)
     await annotate_dataset(config, 1, services=services)
     assert log.read_text() == expected
+
+
+@pytest.mark.asyncio
+async def test_trailing_partial_legacy_log_is_rebuilt_from_authoritative_outbox(tmp_path: Path) -> None:
+    dataset = _dataset(tmp_path, 1)
+    config = _config(tmp_path, dataset)
+    services = FakeRuntime(dataset).services()
+    await annotate_dataset(config, 1, services=services)
+    log = config.work_dir / "logs" / "run.jsonl"
+    expected = log.read_bytes()
+    log.write_bytes(expected + b'{"partial":')
+    await annotate_dataset(config, 1, services=services)
+    assert log.read_bytes() == expected and expected.endswith(b"\n")
+
+
+@pytest.mark.parametrize("failure", [OSError("short write"), KeyboardInterrupt()])
+@pytest.mark.asyncio
+async def test_partial_temp_write_never_corrupts_official_log_and_resume_repairs(
+    monkeypatch, tmp_path: Path, failure: BaseException,
+) -> None:
+    import qwen_annotate.pipeline as pipeline_module
+
+    dataset = _dataset(tmp_path, 1)
+    config = _config(tmp_path, dataset)
+    runtime = FakeRuntime(dataset)
+    base = runtime.services()
+
+    async def interrupt_refine(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    interrupted = PipelineServices(
+        inspect_dataset=base.inspect_dataset, workspace_factory=base.workspace_factory,
+        resolve_model=base.resolve_model, client_factory=base.client_factory,
+        run_coarse=base.run_coarse, run_refine=interrupt_refine,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        await annotate_dataset(config, 1, services=interrupted)
+    log = config.work_dir / "logs" / "run.jsonl"
+    prior = log.read_bytes()
+    original_write = pipeline_module.os.write
+    write_calls = 0
+
+    def partial_then_fail(fd, payload):
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 1:
+            return original_write(fd, bytes(payload[: max(1, len(payload) // 2)]))
+        raise failure
+
+    monkeypatch.setattr(pipeline_module.os, "write", partial_then_fail)
+    expected_error = AuditPersistenceError if isinstance(failure, OSError) else KeyboardInterrupt
+    with pytest.raises(expected_error):
+        await annotate_dataset(config, 1, services=base)
+    assert WorkspaceStore(config.work_dir).load_episode(0).status == "refine_done"
+    assert log.read_bytes() == prior and prior.endswith(b"\n")
+    assert not list((config.work_dir / "logs").glob(".run.jsonl.*.tmp"))
+
+    monkeypatch.setattr(pipeline_module.os, "write", original_write)
+    assert (await annotate_dataset(config, 1, services=base)).accepted == 1
+    lines = log.read_text().splitlines()
+    assert len(lines) == 3 and all(line.endswith("}") for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_atomic_replace_failure_keeps_prior_log_and_cleans_temp(monkeypatch, tmp_path: Path) -> None:
+    import qwen_annotate.pipeline as pipeline_module
+
+    dataset = _dataset(tmp_path, 1)
+    config = _config(tmp_path, dataset)
+    runtime = FakeRuntime(dataset)
+    base = runtime.services()
+
+    async def interrupt_refine(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    services = PipelineServices(
+        inspect_dataset=base.inspect_dataset, workspace_factory=base.workspace_factory,
+        resolve_model=base.resolve_model, client_factory=base.client_factory,
+        run_coarse=base.run_coarse, run_refine=interrupt_refine,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        await annotate_dataset(config, 1, services=services)
+    log = config.work_dir / "logs" / "run.jsonl"
+    prior = log.read_bytes()
+    original_replace = pipeline_module.os.replace
+
+    def fail_log_replace(source, destination, **kwargs):
+        if destination == "run.jsonl":
+            raise OSError("replace failed")
+        return original_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(pipeline_module.os, "replace", fail_log_replace)
+    with pytest.raises(AuditPersistenceError):
+        await annotate_dataset(config, 1, services=base)
+    assert log.read_bytes() == prior
+    assert not list((config.work_dir / "logs").glob(".run.jsonl.*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_cross_process_log_synchronizers_produce_one_canonical_file(tmp_path: Path) -> None:
+    import multiprocessing
+
+    dataset = _dataset(tmp_path, 2)
+    config = _config(tmp_path, dataset)
+    await annotate_dataset(config, 2, services=FakeRuntime(dataset).services())
+    log = config.work_dir / "logs" / "run.jsonl"
+    expected = log.read_bytes()
+    log.write_bytes(b"legacy partial")
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    processes = [context.Process(target=_sync_log_in_process, args=(str(config.work_dir), results)) for _ in range(4)]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(10)
+        assert process.exitcode == 0
+    assert [results.get(timeout=2) for _ in processes] == ["ok"] * 4
+    assert log.read_bytes() == expected
+    assert not list((config.work_dir / "logs").glob(".run.jsonl.*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_temp_fsync_failure_preserves_official_log_and_cleans_temp(monkeypatch, tmp_path: Path) -> None:
+    import qwen_annotate.pipeline as pipeline_module
+
+    dataset = _dataset(tmp_path, 1)
+    config = _config(tmp_path, dataset)
+    runtime = FakeRuntime(dataset)
+    base = runtime.services()
+
+    async def interrupt_refine(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    services = PipelineServices(
+        inspect_dataset=base.inspect_dataset, workspace_factory=base.workspace_factory,
+        resolve_model=base.resolve_model, client_factory=base.client_factory,
+        run_coarse=base.run_coarse, run_refine=interrupt_refine,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        await annotate_dataset(config, 1, services=services)
+    log = config.work_dir / "logs" / "run.jsonl"
+    prior = log.read_bytes()
+    original_fsync = pipeline_module.os.fsync
+
+    def fail_temp_fsync(fd):
+        target = Path(f"/proc/self/fd/{fd}").resolve()
+        if target.name.startswith(".run.jsonl."):
+            raise OSError("temp fsync failed")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(pipeline_module.os, "fsync", fail_temp_fsync)
+    with pytest.raises(AuditPersistenceError):
+        await annotate_dataset(config, 1, services=base)
+    assert WorkspaceStore(config.work_dir).load_episode(0).status == "refine_done"
+    assert log.read_bytes() == prior
+    assert not list((config.work_dir / "logs").glob(".run.jsonl.*.tmp"))
 
 
 @pytest.mark.asyncio

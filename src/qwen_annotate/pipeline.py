@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import secrets
 import stat
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -178,29 +179,17 @@ class _RunLog:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             expected = _workspace_events(store)
-            log_fd = _open_regular(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+            rendered = _render_log(expected)
+            directory_fd = os.open(
+                self.path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
             try:
-                existing = _read_log(log_fd)
-                expected_by_id = {item.event_id: item for item in expected}
-                for event_id, item in existing.items():
-                    if event_id not in expected_by_id or item != expected_by_id[event_id]:
-                        raise ValueError("run log contains an event absent from the durable outbox")
-                missing = [item for item in expected if item.event_id not in existing]
-                encoded_missing = [
-                    json.dumps(
-                        item.model_dump(mode="json"), sort_keys=True, separators=(",", ":"),
-                        ensure_ascii=True, allow_nan=False,
-                    ).encode() + b"\n"
-                    for item in missing
-                ]
-                if os.fstat(log_fd).st_size + sum(map(len, encoded_missing)) > _MAX_LOG_BYTES:
-                    raise ValueError("run log would exceed the bounded size limit")
-                os.lseek(log_fd, 0, os.SEEK_END)
-                for line in encoded_missing:
-                    _write_all(log_fd, line)
-                os.fsync(log_fd)
+                current = _read_official_log(directory_fd, self.path.name)
+                if current != rendered:
+                    _replace_log_atomically(directory_fd, self.path.name, rendered)
             finally:
-                os.close(log_fd)
+                os.close(directory_fd)
         finally:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -606,36 +595,102 @@ def _open_regular(path: Path, flags: int, mode: int) -> int:
         raise
 
 
-def _read_log(descriptor: int) -> dict[str, TransitionEvent]:
-    size = os.fstat(descriptor).st_size
-    if size > _MAX_LOG_BYTES:
-        raise ValueError("run log exceeds the bounded size limit")
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    data = bytearray()
-    while len(data) <= _MAX_LOG_BYTES:
-        chunk = os.read(descriptor, min(1024 * 1024, _MAX_LOG_BYTES + 1 - len(data)))
-        if not chunk:
-            break
-        data.extend(chunk)
-    if len(data) > _MAX_LOG_BYTES:
-        raise ValueError("run log exceeds the bounded size limit")
-    if data and not data.endswith(b"\n"):
-        raise ValueError("run log has a partial trailing line")
-    result: dict[str, TransitionEvent] = {}
-    for raw_line in data.splitlines():
-        if not raw_line or len(raw_line) > _MAX_LOG_LINE_BYTES:
-            raise ValueError("run log line is empty or oversized")
+def _render_log(events: Sequence[TransitionEvent]) -> bytes:
+    lines = []
+    for event in events:
+        line = json.dumps(
+            event.model_dump(mode="json"), sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True, allow_nan=False,
+        ).encode() + b"\n"
+        if len(line) > _MAX_LOG_LINE_BYTES:
+            raise ValueError("rendered run log line exceeds the bounded size limit")
+        lines.append(line)
+    rendered = b"".join(lines)
+    if len(rendered) > _MAX_LOG_BYTES:
+        raise ValueError("rendered run log exceeds the bounded size limit")
+    return rendered
+
+
+def _read_official_log(directory_fd: int, name: str) -> bytes | None:
+    try:
+        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(entry.st_mode):
+        raise ValueError("official run log must be a regular non-symlink file")
+    descriptor = os.open(
+        name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("official run log must be a regular file")
+        if opened.st_size > _MAX_LOG_BYTES:
+            return None
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _replace_log_atomically(directory_fd: int, destination: str, rendered: bytes) -> None:
+    temporary = ""
+    descriptor = -1
+    for _ in range(16):
+        candidate = f".{destination}.{secrets.token_hex(12)}.tmp"
         try:
-            payload = _strict_json_object(raw_line)
-            event = TransitionEvent.model_validate_json(
-                json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_fd,
             )
-        except Exception:
-            raise ValueError("run log contains malformed or unsafe event JSON") from None
-        if event.event_id in result:
-            raise ValueError("run log contains duplicate event ids")
-        result[event.event_id] = event
-    return result
+        except FileExistsError:
+            continue
+        temporary = candidate
+        break
+    if descriptor < 0:
+        raise OSError("could not allocate a unique audit log temporary file")
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("audit log temporary must be a regular file")
+        _write_all(descriptor, rendered)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        _assert_destination_safe(directory_fd, destination)
+        os.replace(
+            temporary, destination,
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+        )
+        temporary = ""
+        os.fsync(directory_fd)
+    finally:
+        try:
+            if descriptor >= 0:
+                os.close(descriptor)
+        finally:
+            if temporary:
+                try:
+                    os.unlink(temporary, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+
+
+def _assert_destination_safe(directory_fd: int, destination: str) -> None:
+    try:
+        entry = os.stat(destination, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(entry.st_mode):
+        raise ValueError("official run log must be a regular non-symlink file")
 
 
 def _strict_json_object(value: bytes | str) -> dict[str, Any]:
