@@ -84,6 +84,7 @@ class QwenClient:
         self._retry_seconds = delays
         self._guided_json = use_vllm_guided_json
         self._sleep = sleep
+        self._owned_client: Any | None = None
         if send is None:
             try:
                 from openai import AsyncOpenAI
@@ -94,9 +95,16 @@ class QwenClient:
                 api_key=api_key,
                 timeout=timeout,
             )
+            self._owned_client = client
             self._send = client.chat.completions.create
         else:
             self._send = send
+
+    async def aclose(self) -> None:
+        """Close the internally-created AsyncOpenAI client exactly once."""
+        client, self._owned_client = self._owned_client, None
+        if client is not None:
+            await client.close()
 
     async def complete[T: BaseModel](
         self,

@@ -143,6 +143,32 @@ async def test_production_adapter_uses_async_openai_and_extracts_content(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_aclose_closes_only_owned_async_openai_client(monkeypatch) -> None:
+    closed = 0
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: None))
+
+        async def close(self):
+            nonlocal closed
+            closed += 1
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(AsyncOpenAI=FakeAsyncOpenAI))
+    owned = QwenClient(max_attempts=1)
+    await owned.aclose()
+    await owned.aclose()
+    assert closed == 1
+
+    async def injected_send(**kwargs):
+        return valid_json()
+
+    injected = QwenClient(send=injected_send, max_attempts=1)
+    await injected.aclose()
+    assert closed == 1
+
+
+@pytest.mark.asyncio
 async def test_client_retries_transient_error_then_parses_and_sleeps() -> None:
     calls = 0
     delays = []

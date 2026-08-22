@@ -12,10 +12,10 @@ from qwen_annotate.config import AnnotationConfig, Subtask
 from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo
 from qwen_annotate.model_manager import ModelInstall
 from qwen_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation
-from qwen_annotate.pipeline import PipelineServices, WorkspaceSummary, annotate_dataset
+from qwen_annotate.pipeline import AuditPersistenceError, PipelineServices, WorkspaceSummary, _installed_model, annotate_dataset
 from qwen_annotate.refine import CameraSampling, RefineDecision, SamplingProvenance
 from qwen_annotate.qwen_client import InvalidModelResponse, ModelCallError, ModelOutOfMemory
-from qwen_annotate.workspace import WorkspaceStore
+from qwen_annotate.workspace import EpisodeRecord, WorkspaceStore
 from tests.fixtures import make_config
 
 
@@ -161,8 +161,12 @@ async def test_pending_episodes_flow_through_durable_stages_and_terminal_resume_
     resumed = await annotate_dataset(config, 1, services=runtime.services())
     assert resumed.accepted == 2
     assert runtime.coarse_calls == [0, 1]
-    lines = (config.work_dir / "logs" / "run.jsonl").read_text().splitlines()
+    lines = [__import__("json").loads(line) for line in (config.work_dir / "logs" / "run.jsonl").read_text().splitlines()]
     assert len(lines) == 6
+    for episode in (0, 1):
+        chain = [(line["from_status"], line["to_status"]) for line in lines if line["episode"] == episode]
+        assert chain == [("pending", "coarse_done"), ("coarse_done", "refine_done"), ("refine_done", "accepted")]
+        assert len({line["event_id"] for line in lines if line["episode"] == episode}) == 3
 
 
 @pytest.mark.asyncio
@@ -279,6 +283,7 @@ async def test_concurrency_is_exactly_bounded_and_shared_client_is_reused(tmp_pa
         (ModelOutOfMemory("oom", attempt_count=1), "failed", "model_oom"),
         (ModelCallError("down", attempt_count=2), "failed", "model_call"),
         (OSError("SECRET source path"), "failed", "source_or_video"),
+        (ValueError("SECRET corrupt video"), "failed", "source_or_video"),
         (RuntimeError("SECRET unexpected"), "failed", "unexpected_error"),
     ],
 )
@@ -328,7 +333,7 @@ async def test_symlink_run_log_is_rejected_before_any_model_call(tmp_path: Path)
     target = tmp_path / "outside.log"
     target.write_text("")
     (config.work_dir / "logs" / "run.jsonl").symlink_to(target)
-    with pytest.raises(ValueError, match="symlink"):
+    with pytest.raises(AuditPersistenceError):
         await annotate_dataset(config, 1, services=runtime.services())
     assert runtime.coarse_calls == [] and target.read_text() == ""
 
@@ -364,6 +369,46 @@ async def test_default_model_resolver_reads_matching_verified_install_metadata(t
     bad_config = config.model_copy(update={"work_dir": tmp_path / "other-work", "model": model.model_copy(update={"revision": "b" * 40})})
     with pytest.raises(ValueError, match="revision"):
         await annotate_dataset(bad_config, 1, services=services)
+
+
+def test_model_install_reader_rejects_symlink_oversize_and_path_swap(monkeypatch, tmp_path: Path) -> None:
+    import json
+    import qwen_annotate.pipeline as pipeline_module
+
+    dataset = _dataset(tmp_path, 1)
+    config = _config(tmp_path, dataset)
+    local = (tmp_path / "model").resolve()
+    local.mkdir()
+    config = config.model_copy(update={"model": config.model.model_copy(update={"local_path": local})})
+    install = ModelInstall(config.model.name, SHA, local, datetime(2026, 8, 22, tzinfo=UTC))
+    metadata = local / "model-install.json"
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps(install.to_dict()))
+    metadata.symlink_to(outside)
+    with pytest.raises(ValueError, match="invalid|required"):
+        _installed_model(config)
+
+    metadata.unlink()
+    metadata.write_bytes(b" " * (70 * 1024))
+    with pytest.raises(ValueError, match="invalid"):
+        _installed_model(config)
+
+    valid = json.dumps(install.to_dict()).encode()
+    metadata.write_bytes(valid)
+    original_read = pipeline_module.os.read
+    swapped = False
+
+    def swapping_read(fd, size):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            metadata.unlink()
+            metadata.write_bytes(valid)
+        return original_read(fd, size)
+
+    monkeypatch.setattr(pipeline_module.os, "read", swapping_read)
+    with pytest.raises(ValueError, match="invalid"):
+        _installed_model(config)
 
 
 @pytest.mark.asyncio
@@ -448,14 +493,19 @@ async def test_outer_cancellation_finishes_current_atomic_transition_only(monkey
     runtime = FakeRuntime(dataset)
     entered_log = asyncio.Event()
     release_log = asyncio.Event()
-    original = pipeline_module._RunLog.transition
+    original = pipeline_module._RunLog.sync
+    sync_calls = 0
 
     async def blocked_log(self, *args, **kwargs):
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 1:
+            return await original(self, *args, **kwargs)
         entered_log.set()
         await release_log.wait()
         await original(self, *args, **kwargs)
 
-    monkeypatch.setattr(pipeline_module._RunLog, "transition", blocked_log)
+    monkeypatch.setattr(pipeline_module._RunLog, "sync", blocked_log)
     task = asyncio.create_task(annotate_dataset(config, 1, services=runtime.services()))
     await entered_log.wait()
     task.cancel()
@@ -571,3 +621,139 @@ async def test_resume_from_durably_saved_refine_done_only_finalizes(tmp_path: Pa
     summary = await annotate_dataset(config, 1, services=base)
     assert summary.accepted == 1
     assert runtime.coarse_calls == [0] and runtime.refine_calls == [0]
+    lines = [__import__("json").loads(line) for line in (config.work_dir / "logs" / "run.jsonl").read_text().splitlines()]
+    assert [(line["from_status"], line["to_status"]) for line in lines] == [
+        ("pending", "coarse_done"), ("coarse_done", "refine_done"), ("refine_done", "accepted")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deleted_log_is_rebuilt_from_outbox_without_duplicates(tmp_path: Path) -> None:
+    dataset = _dataset(tmp_path, 1)
+    config = _config(tmp_path, dataset)
+    runtime = FakeRuntime(dataset)
+    services = runtime.services()
+    await annotate_dataset(config, 1, services=services)
+    log = config.work_dir / "logs" / "run.jsonl"
+    expected = log.read_text()
+    log.unlink()
+    await annotate_dataset(config, 1, services=services)
+    assert log.read_text() == expected
+    record = WorkspaceStore(config.work_dir).load_episode(0)
+    payload = record.model_dump()
+    events = payload["sampling_details"]["_pipeline_transition_events"]
+    events[0]["category"] = "SECRET=api-key"
+    with pytest.raises(ValidationError, match="transition"):
+        EpisodeRecord.model_validate(payload)
+    await annotate_dataset(config, 1, services=services)
+    assert log.read_text() == expected
+
+
+@pytest.mark.asyncio
+async def test_log_failure_after_state_save_aborts_and_resume_repairs(monkeypatch, tmp_path: Path) -> None:
+    import qwen_annotate.pipeline as pipeline_module
+
+    dataset = _dataset(tmp_path, 1)
+    config = _config(tmp_path, dataset)
+    runtime = FakeRuntime(dataset)
+    original = pipeline_module._RunLog.sync
+    calls = 0
+
+    async def fail_once(self, store):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("audit disk unavailable SECRET")
+        return await original(self, store)
+
+    monkeypatch.setattr(pipeline_module._RunLog, "sync", fail_once)
+    with pytest.raises(AuditPersistenceError):
+        await annotate_dataset(config, 1, services=runtime.services())
+    record = WorkspaceStore(config.work_dir).load_episode(0)
+    assert record.status == "coarse_done" and record.failure_category is None
+    monkeypatch.setattr(pipeline_module._RunLog, "sync", original)
+    assert (await annotate_dataset(config, 1, services=runtime.services())).accepted == 1
+    lines = [__import__("json").loads(line) for line in (config.work_dir / "logs" / "run.jsonl").read_text().splitlines()]
+    assert len(lines) == 3 and len({line["event_id"] for line in lines}) == 3
+    assert "SECRET" not in (config.work_dir / "logs" / "run.jsonl").read_text()
+
+
+@pytest.mark.asyncio
+async def test_custom_base_exception_stops_scheduling_and_drains_inflight(tmp_path: Path) -> None:
+    import asyncio
+
+    class StopNow(BaseException):
+        pass
+
+    dataset = _dataset(tmp_path, 3)
+    config = _config(tmp_path, dataset)
+    base = FakeRuntime(dataset).services()
+    second_started = asyncio.Event()
+    second_drained = asyncio.Event()
+    calls = []
+
+    async def coarse(config, episode, **kwargs):
+        calls.append(episode.episode_index)
+        if episode.episode_index == 1:
+            second_started.set()
+            await asyncio.sleep(0.02)
+            second_drained.set()
+            return _coarse()
+        await second_started.wait()
+        raise StopNow()
+
+    services = PipelineServices(
+        inspect_dataset=base.inspect_dataset, workspace_factory=base.workspace_factory,
+        resolve_model=base.resolve_model, client_factory=base.client_factory,
+        run_coarse=coarse, run_refine=base.run_refine,
+    )
+    with pytest.raises(StopNow):
+        await annotate_dataset(config, 2, services=services)
+    assert second_drained.is_set() and calls == [0, 1]
+    assert WorkspaceStore(config.work_dir).load_episode(2).status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_closes_opted_in_shared_client_without_masking_primary_error(tmp_path: Path) -> None:
+    class StopNow(BaseException):
+        pass
+
+    dataset = _dataset(tmp_path, 1)
+    config = _config(tmp_path, dataset)
+    base = FakeRuntime(dataset).services()
+    close_calls = 0
+
+    class Client:
+        async def aclose(self):
+            nonlocal close_calls
+            close_calls += 1
+            raise RuntimeError("close failure")
+
+    async def stop(*args, **kwargs):
+        raise StopNow()
+
+    services = PipelineServices(
+        inspect_dataset=base.inspect_dataset, workspace_factory=base.workspace_factory,
+        resolve_model=base.resolve_model, client_factory=lambda config: Client(),
+        run_coarse=stop, run_refine=base.run_refine, close_client=True,
+    )
+    with pytest.raises(StopNow):
+        await annotate_dataset(config, 1, services=services)
+    assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_internal_clock_value_error_aborts_without_mislabeling_episode(tmp_path: Path) -> None:
+    dataset = _dataset(tmp_path, 1)
+    config = _config(tmp_path, dataset)
+    base = FakeRuntime(dataset).services()
+    services = PipelineServices(
+        inspect_dataset=base.inspect_dataset, workspace_factory=base.workspace_factory,
+        resolve_model=base.resolve_model, client_factory=base.client_factory,
+        run_coarse=base.run_coarse, run_refine=base.run_refine,
+        clock=lambda: datetime(2026, 8, 22),
+    )
+    with pytest.raises(ValueError, match="timezone-aware"):
+        await annotate_dataset(config, 1, services=services)
+    record = WorkspaceStore(config.work_dir).load_episode(0)
+    assert record.status == "pending" and record.failure_category is None

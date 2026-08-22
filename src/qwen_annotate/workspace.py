@@ -157,6 +157,7 @@ class EpisodeRecord(_StrictModel):
             raise ValueError("failed requires failure_category")
         if self.status != "failed" and self.failure_category is not None:
             raise ValueError("failure_category is only valid for failed records")
+        _validate_pipeline_transition_outbox(self)
         return self
 
 
@@ -190,6 +191,65 @@ def _is_audited_zero_transition_review(record: EpisodeRecord) -> bool:
         and refined.coarse_boundary_centers == coarse.boundary_centers == ()
         and persisted_attempts == audited_attempts
     )
+
+
+def _validate_pipeline_transition_outbox(record: EpisodeRecord) -> None:
+    key = "_pipeline_transition_events"
+    if key not in record.sampling_details:
+        return
+    raw = record.sampling_details[key]
+    if not isinstance(raw, list):
+        raise ValueError("pipeline transition outbox must be a list")
+    fields = {"event_id", "timestamp", "episode", "from_status", "to_status", "event", "category", "reasons"}
+    statuses = {"pending", "coarse_done", "refine_done", "accepted", "needs_review", "failed"}
+    event_names = {"coarse_review", "coarse_completed", "refine_completed", "accepted", "refine_review", "error"}
+    categories = {None, "invalid_model_response", "model_oom", "model_call", "source_or_video", "unexpected_error", "workspace_state"}
+    parsed: list[tuple[dict[str, Any], datetime]] = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != fields:
+            raise ValueError("pipeline transition event has invalid fields")
+        if (
+            not isinstance(item["event_id"], str) or not _SHA256.fullmatch(item["event_id"])
+            or type(item["episode"]) is not int or item["episode"] != record.episode_index
+            or not isinstance(item["from_status"], str) or item["from_status"] not in statuses
+            or not isinstance(item["to_status"], str) or item["to_status"] not in statuses
+            or not isinstance(item["event"], str) or item["event"] not in event_names
+            or (item["category"] is not None and not isinstance(item["category"], str))
+            or item["category"] not in categories
+            or not isinstance(item["reasons"], list)
+            or any(not isinstance(reason, str) or not reason for reason in item["reasons"])
+            or len(set(item["reasons"])) != len(item["reasons"])
+            or not isinstance(item["timestamp"], str)
+        ):
+            raise ValueError("pipeline transition event has invalid values")
+        try:
+            timestamp = datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("pipeline transition timestamp is invalid") from None
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError("pipeline transition timestamp must be timezone-aware")
+        timestamp = timestamp.astimezone(UTC)
+        payload = {
+            "run_fingerprint": record.run_fingerprint,
+            "episode": item["episode"],
+            "from_status": item["from_status"],
+            "to_status": item["to_status"],
+            "updated_at": timestamp.isoformat(),
+            "event": item["event"],
+            "category": item["category"],
+            "reasons": item["reasons"],
+        }
+        expected = hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
+        if item["event_id"] != expected:
+            raise ValueError("pipeline transition event_id is invalid")
+        parsed.append((item, timestamp))
+    if len({item["event_id"] for item, _ in parsed}) != len(parsed):
+        raise ValueError("pipeline transition outbox has duplicate event ids")
+    for (prior, prior_time), (current, current_time) in zip(parsed, parsed[1:]):
+        if prior["to_status"] != current["from_status"] or prior_time >= current_time:
+            raise ValueError("pipeline transition outbox chain is invalid")
+    if parsed and (parsed[0][0]["from_status"] != "pending" or parsed[-1][0]["to_status"] != record.status):
+        raise ValueError("pipeline transition outbox does not match record status")
 
 
 class RunManifest(_StrictModel):

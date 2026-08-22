@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import hashlib
 import json
 import os
 import stat
@@ -10,9 +12,9 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .coarse import CoarseDecision, run_coarse
 from .config import AnnotationConfig
@@ -22,7 +24,7 @@ from .models import CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
 from .prompts import PROMPT_VERSION
 from .qwen_client import InvalidModelResponse, ModelCallError, ModelOutOfMemory, QwenClient
 from .refine import RefineDecision, run_refine
-from .workspace import EpisodeRecord, WorkspaceStore
+from .workspace import EpisodeRecord, Status, WorkspaceStore
 
 
 _STATUSES = ("pending", "coarse_done", "refine_done", "accepted", "needs_review", "failed")
@@ -32,6 +34,53 @@ _VALIDATION_ISSUE_CODES = {
     "start_subtask_range", "complete_start_index", "complete_boundary_count",
     "dagger_suffix_length", "boundary_order", "boundary_range", "segment_too_short",
 }
+_OUTBOX_KEY = "_pipeline_transition_events"
+_MAX_LOG_BYTES = 64 * 1024 * 1024
+_MAX_LOG_LINE_BYTES = 64 * 1024
+_MAX_MODEL_METADATA_BYTES = 64 * 1024
+
+
+class AuditPersistenceError(RuntimeError):
+    """Workspace state is durable but its derived audit log could not be synchronized."""
+
+
+class _SourceOrVideoError(Exception):
+    pass
+
+
+class TransitionEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    event_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    timestamp: datetime
+    episode: int = Field(ge=0)
+    from_status: Status
+    to_status: Status
+    event: Literal["coarse_review", "coarse_completed", "refine_completed", "accepted", "refine_review", "error"]
+    category: Literal[
+        "invalid_model_response", "model_oom", "model_call", "source_or_video",
+        "unexpected_error", "workspace_state",
+    ] | None = None
+    reasons: tuple[str, ...] = ()
+
+    @field_validator("timestamp")
+    @classmethod
+    def utc_timestamp(cls, value: datetime) -> datetime:
+        return _utc(value)
+
+    @field_validator("reasons", mode="before")
+    @classmethod
+    def restore_reasons(cls, value: object, info) -> object:
+        if info.mode == "json" and isinstance(value, list):
+            return tuple(value)
+        return value
+
+    @field_validator("reasons")
+    @classmethod
+    def strict_reasons(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value) or any(not item for item in value):
+            raise ValueError("transition reasons must be unique nonempty strings")
+        return value
 
 
 class WorkspaceSummary(BaseModel):
@@ -109,6 +158,7 @@ class PipelineServices:
     run_coarse: Callable[..., Awaitable[CoarseDecision]] = run_coarse
     run_refine: Callable[..., Awaitable[RefineDecision]] = run_refine
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+    close_client: bool = False
 
 
 class _RunLog:
@@ -117,39 +167,45 @@ class _RunLog:
         self.clock = clock
         self.lock = asyncio.Lock()
 
-    def prepare(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.is_symlink():
-            raise ValueError("run log must not be a symlink")
-        if self.path.exists() and not self.path.is_file():
-            raise ValueError("run log must be a regular file")
-
-    async def transition(self, episode: int, old: str, new: str, event: str, *, category: str | None = None, reasons: Sequence[str] = ()) -> None:
-        payload: dict[str, object] = {
-            "timestamp": _utc(self.clock()).isoformat().replace("+00:00", "Z"),
-            "episode": episode, "from_status": old, "to_status": new, "event": event,
-        }
-        if category is not None:
-            payload["category"] = category
-        if reasons:
-            payload["reasons"] = list(reasons)
-        line = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False) + "\n"
+    async def sync(self, store: _Store) -> None:
         async with self.lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            if self.path.is_symlink():
-                raise ValueError("run log must not be a symlink")
-            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            descriptor = os.open(self.path, flags, 0o600)
+            self._sync_locked(store)
+
+    def _sync_locked(self, store: _Store) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.parent / "run-log.lock"
+        lock_fd = _open_regular(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            expected = _workspace_events(store)
+            log_fd = _open_regular(self.path, os.O_RDWR | os.O_CREAT, 0o600)
             try:
-                mode = os.fstat(descriptor).st_mode
-                if not stat.S_ISREG(mode):
-                    raise ValueError("run log must be a regular file")
-                os.write(descriptor, line.encode("utf-8"))
-                os.fsync(descriptor)
+                existing = _read_log(log_fd)
+                expected_by_id = {item.event_id: item for item in expected}
+                for event_id, item in existing.items():
+                    if event_id not in expected_by_id or item != expected_by_id[event_id]:
+                        raise ValueError("run log contains an event absent from the durable outbox")
+                missing = [item for item in expected if item.event_id not in existing]
+                encoded_missing = [
+                    json.dumps(
+                        item.model_dump(mode="json"), sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=True, allow_nan=False,
+                    ).encode() + b"\n"
+                    for item in missing
+                ]
+                if os.fstat(log_fd).st_size + sum(map(len, encoded_missing)) > _MAX_LOG_BYTES:
+                    raise ValueError("run log would exceed the bounded size limit")
+                os.lseek(log_fd, 0, os.SEEK_END)
+                for line in encoded_missing:
+                    _write_all(log_fd, line)
+                os.fsync(log_fd)
             finally:
-                os.close(descriptor)
+                os.close(log_fd)
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
 
 
 async def annotate_dataset(
@@ -180,8 +236,10 @@ async def annotate_dataset(
     store = service.workspace_factory(config.work_dir)
     store.initialize(config, dataset, install.revision)
     logger = _RunLog(config.work_dir.resolve(), service.clock)
-    logger.prepare()
-    client = service.client_factory(config)
+    try:
+        await logger.sync(store)
+    except Exception as exc:
+        raise AuditPersistenceError("could not synchronize durable transition audit") from exc
     semaphore = asyncio.Semaphore(max_concurrency)
     stop_requested = asyncio.Event()
 
@@ -189,6 +247,7 @@ async def annotate_dataset(
     for index in selected:
         if store.load_episode(index).status in {"pending", "coarse_done", "refine_done"}:
             resumable.append(index)
+    client = service.client_factory(config)
 
     async def process(index: int) -> BaseException | None:
         try:
@@ -199,7 +258,7 @@ async def annotate_dataset(
                     config, dataset, dataset.episodes[index], store, install.revision,
                     client, service, logger, stop_requested,
                 )
-        except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+        except BaseException as exc:
             stop_requested.set()
             return exc
         return None
@@ -219,9 +278,11 @@ async def annotate_dataset(
         task_indices[task] = index
         return True
 
-    for _ in range(min(max_concurrency, len(resumable))):
-        launch()
+    primary: BaseException | None = None
+    result: WorkspaceSummary | None = None
     try:
+        for _ in range(min(max_concurrency, len(resumable))):
+            launch()
         while active:
             done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
             for task in sorted(done, key=lambda item: task_indices[item]):
@@ -235,12 +296,25 @@ async def annotate_dataset(
                     pass
         if interrupted is not None:
             raise interrupted
-    except asyncio.CancelledError:
+        result = WorkspaceSummary.from_store_summary(store.summary())
+    except BaseException as exc:
+        primary = exc
         stop_requested.set()
         if active:
             await asyncio.shield(asyncio.gather(*active, return_exceptions=True))
-        raise
-    return WorkspaceSummary.from_store_summary(store.summary())
+    finally:
+        if services is None or service.close_client:
+            close = getattr(client, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except BaseException:
+                    if primary is None:
+                        raise
+    if primary is not None:
+        raise primary
+    assert result is not None
+    return result
 
 
 async def _process_episode(config, dataset, episode, store, revision, client, services, logger, stop_requested) -> None:
@@ -248,10 +322,13 @@ async def _process_episode(config, dataset, episode, store, revision, client, se
     coarse: CoarseDecision | None = None
     try:
         if record.status == "pending":
-            coarse = await services.run_coarse(
-                config, episode, client=client, source_fps=float(dataset.fps),
-                expected_source_fingerprint=record.source_fingerprint,
-            )
+            try:
+                coarse = await services.run_coarse(
+                    config, episode, client=client, source_fps=float(dataset.fps),
+                    expected_source_fingerprint=record.source_fingerprint,
+                )
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                raise _SourceOrVideoError from exc
             if not isinstance(coarse, CoarseDecision):
                 raise TypeError("run_coarse must return CoarseDecision")
             try:
@@ -267,8 +344,7 @@ async def _process_episode(config, dataset, episode, store, revision, client, se
                 return
             updated = _replace(record, services.clock, status="coarse_done", coarse_attempts=_coarse_attempts(coarse),
                 prompt_version=PROMPT_VERSION, model_revision=revision, sampling_details=details)
-            await _save_transition(store, logger, record, updated, "coarse_completed")
-            record = updated
+            record = await _save_transition(store, logger, record, updated, "coarse_completed")
             if stop_requested.is_set():
                 return
         if record.status == "coarse_done":
@@ -281,10 +357,13 @@ async def _process_episode(config, dataset, episode, store, revision, client, se
                 except Exception:
                     await _fail(store, logger, record, services.clock, "workspace_state")
                     return
-            refined = await services.run_refine(
-                config, episode, coarse, client=client, source_fps=float(dataset.fps),
-                expected_source_fingerprint=record.source_fingerprint,
-            )
+            try:
+                refined = await services.run_refine(
+                    config, episode, coarse, client=client, source_fps=float(dataset.fps),
+                    expected_source_fingerprint=record.source_fingerprint,
+                )
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                raise _SourceOrVideoError from exc
             if not isinstance(refined, RefineDecision):
                 raise TypeError("run_refine must return RefineDecision")
             try:
@@ -298,8 +377,7 @@ async def _process_episode(config, dataset, episode, store, revision, client, se
                 return
             updated = _replace(record, services.clock, status="refine_done", refine_attempts=_refine_attempts(refined),
                 final_annotation=_annotation(refined.annotation), sampling_details=details)
-            await _save_transition(store, logger, record, updated, "refine_completed")
-            record = updated
+            record = await _save_transition(store, logger, record, updated, "refine_completed")
             if stop_requested.is_set():
                 return
         if record.status == "refine_done":
@@ -329,6 +407,8 @@ async def _process_episode(config, dataset, episode, store, revision, client, se
                 await _save_transition(store, logger, record, updated, "refine_review", reasons=refined.reasons)
             else:
                 await _fail(store, logger, record, services.clock, refined.failure_category or "model_oom")
+    except AuditPersistenceError:
+        raise
     except InvalidModelResponse:
         current = store.load_episode(episode.episode_index)
         updated = _replace(current, services.clock, status="needs_review", review_reasons=["invalid_model_response"])
@@ -337,17 +417,34 @@ async def _process_episode(config, dataset, episode, store, revision, client, se
         await _fail(store, logger, store.load_episode(episode.episode_index), services.clock, "model_oom")
     except ModelCallError:
         await _fail(store, logger, store.load_episode(episode.episode_index), services.clock, "model_call")
-    except (FileNotFoundError, OSError, ValueError):
+    except _SourceOrVideoError:
         await _fail(store, logger, store.load_episode(episode.episode_index), services.clock, "source_or_video")
+    except ValueError:
+        raise
     except (KeyboardInterrupt, asyncio.CancelledError):
         raise
     except Exception:
         await _fail(store, logger, store.load_episode(episode.episode_index), services.clock, "unexpected_error")
 
 
-async def _save_transition(store, logger, old, new, event, *, category=None, reasons=()) -> None:
-    store.save_episode(new)
-    await logger.transition(old.episode_index, old.status, new.status, event, category=category, reasons=reasons)
+async def _save_transition(store, logger, old, new, event, *, category=None, reasons=()) -> EpisodeRecord:
+    transition = _transition_event(old, new, event, category, reasons)
+    details = dict(new.sampling_details)
+    prior_events = _record_events(old)
+    details[_OUTBOX_KEY] = [
+        *[item.model_dump(mode="json") for item in prior_events],
+        transition.model_dump(mode="json"),
+    ]
+    persisted = EpisodeRecord.model_validate(new.model_dump() | {"sampling_details": details})
+    try:
+        store.save_episode(persisted)
+    except (OSError, ValueError) as exc:
+        raise AuditPersistenceError("could not atomically persist transition state") from exc
+    try:
+        await logger.sync(store)
+    except Exception as exc:
+        raise AuditPersistenceError("state saved but transition log synchronization failed") from exc
+    return persisted
 
 
 async def _fail(store, logger, record, clock, category, *, details=None) -> None:
@@ -359,7 +456,7 @@ async def _fail(store, logger, record, clock, category, *, details=None) -> None
 def _replace(record: EpisodeRecord, clock, **changes) -> EpisodeRecord:
     now = _utc(clock())
     changes["updated_at"] = max(now, record.updated_at + timedelta(microseconds=1))
-    return EpisodeRecord.model_validate(record.model_dump() | changes)
+    return record.model_copy(update=changes)
 
 
 def _coarse_attempts(decision: CoarseDecision) -> list[CoarseResult]:
@@ -410,6 +507,165 @@ def _validate_refine_context(
         raise ValueError("refine decision does not match immutable run context")
 
 
+def _transition_event(
+    old: EpisodeRecord,
+    new: EpisodeRecord,
+    event: str,
+    category: str | None,
+    reasons: Sequence[str],
+) -> TransitionEvent:
+    payload = {
+        "run_fingerprint": new.run_fingerprint,
+        "episode": new.episode_index,
+        "from_status": old.status,
+        "to_status": new.status,
+        "updated_at": new.updated_at.isoformat(),
+        "event": event,
+        "category": category,
+        "reasons": list(reasons),
+    }
+    event_id = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
+    ).hexdigest()
+    return TransitionEvent(
+        event_id=event_id,
+        timestamp=new.updated_at,
+        episode=new.episode_index,
+        from_status=old.status,
+        to_status=new.status,
+        event=event,
+        category=category,
+        reasons=tuple(reasons),
+    )
+
+
+def _record_events(record: EpisodeRecord) -> tuple[TransitionEvent, ...]:
+    raw = record.sampling_details.get(_OUTBOX_KEY, [])
+    if not isinstance(raw, list):
+        raise ValueError("transition outbox must be a list")
+    events: list[TransitionEvent] = []
+    for item in raw:
+        event = TransitionEvent.model_validate_json(
+            json.dumps(item, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        )
+        if event.episode != record.episode_index:
+            raise ValueError("transition outbox episode does not match record")
+        expected = _transition_event_from_values(record.run_fingerprint, event)
+        if event.event_id != expected:
+            raise ValueError("transition outbox event_id is invalid")
+        events.append(event)
+    if len({item.event_id for item in events}) != len(events):
+        raise ValueError("transition outbox contains duplicate event ids")
+    for prior, current in zip(events, events[1:]):
+        if prior.to_status != current.from_status or prior.timestamp >= current.timestamp:
+            raise ValueError("transition outbox chain is invalid")
+    if events:
+        if events[0].from_status != "pending" or events[-1].to_status != record.status:
+            raise ValueError("transition outbox does not cover record status")
+    elif record.status != "pending":
+        raise ValueError("non-pending record is missing its transition outbox")
+    return tuple(events)
+
+
+def _transition_event_from_values(run_fingerprint: str, event: TransitionEvent) -> str:
+    payload = {
+        "run_fingerprint": run_fingerprint,
+        "episode": event.episode,
+        "from_status": event.from_status,
+        "to_status": event.to_status,
+        "updated_at": event.timestamp.isoformat(),
+        "event": event.event,
+        "category": event.category,
+        "reasons": list(event.reasons),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
+    ).hexdigest()
+
+
+def _workspace_events(store: _Store) -> list[TransitionEvent]:
+    summary = store.summary()
+    total = summary.get("total")
+    if type(total) is not int or total < 0:
+        raise ValueError("workspace summary total is invalid")
+    events = [event for index in range(total) for event in _record_events(store.load_episode(index))]
+    return sorted(events, key=lambda item: (item.timestamp, item.episode, item.event_id))
+
+
+def _open_regular(path: Path, flags: int, mode: int) -> int:
+    if path.is_symlink():
+        raise ValueError("audit path must not be a symlink")
+    safe_flags = flags | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, safe_flags, mode)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("audit path must be a regular file")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _read_log(descriptor: int) -> dict[str, TransitionEvent]:
+    size = os.fstat(descriptor).st_size
+    if size > _MAX_LOG_BYTES:
+        raise ValueError("run log exceeds the bounded size limit")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    data = bytearray()
+    while len(data) <= _MAX_LOG_BYTES:
+        chunk = os.read(descriptor, min(1024 * 1024, _MAX_LOG_BYTES + 1 - len(data)))
+        if not chunk:
+            break
+        data.extend(chunk)
+    if len(data) > _MAX_LOG_BYTES:
+        raise ValueError("run log exceeds the bounded size limit")
+    if data and not data.endswith(b"\n"):
+        raise ValueError("run log has a partial trailing line")
+    result: dict[str, TransitionEvent] = {}
+    for raw_line in data.splitlines():
+        if not raw_line or len(raw_line) > _MAX_LOG_LINE_BYTES:
+            raise ValueError("run log line is empty or oversized")
+        try:
+            payload = _strict_json_object(raw_line)
+            event = TransitionEvent.model_validate_json(
+                json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            )
+        except Exception:
+            raise ValueError("run log contains malformed or unsafe event JSON") from None
+        if event.event_id in result:
+            raise ValueError("run log contains duplicate event ids")
+        result[event.event_id] = event
+    return result
+
+
+def _strict_json_object(value: bytes | str) -> dict[str, Any]:
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = item
+        return result
+
+    parsed = json.loads(
+        value,
+        object_pairs_hook=unique,
+        parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonstandard JSON")),
+    )
+    if not isinstance(parsed, dict):
+        raise ValueError("JSON value must be an object")
+    return parsed
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("audit log write made no progress")
+        view = view[written:]
+
+
 def _episode_selection(values: Sequence[int] | None, total: int) -> list[int]:
     if values is None:
         return list(range(total))
@@ -428,27 +684,45 @@ def _episode_selection(values: Sequence[int] | None, total: int) -> list[int]:
 def _installed_model(config: AnnotationConfig) -> ModelInstall:
     local = config.model.local_path.resolve()
     metadata = local / "model-install.json"
-    if metadata.is_symlink() or not metadata.is_file():
-        raise ValueError("verified model-install.json is required")
     try:
-        def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-            value: dict[str, Any] = {}
-            for key, item in pairs:
-                if key in value:
-                    raise ValueError("duplicate JSON key")
-                value[key] = item
-            return value
-
-        raw = json.loads(
-            metadata.read_text(encoding="utf-8"),
-            object_pairs_hook=unique_object,
-            parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonstandard JSON")),
+        raw = _strict_json_object(
+            _read_bounded_regular(metadata, _MAX_MODEL_METADATA_BYTES).decode("utf-8")
         )
         install = ModelInstall.from_dict(raw)
     except Exception:
         raise ValueError("model-install.json is invalid") from None
     _validate_install(config, install)
     return install
+
+
+def _read_bounded_regular(path: Path, limit: int) -> bytes:
+    if path.is_symlink():
+        raise ValueError("file must not be a symlink")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            raise ValueError("file must be a bounded regular file")
+        chunks: list[bytes] = []
+        length = 0
+        while length <= limit:
+            chunk = os.read(descriptor, min(64 * 1024, limit + 1 - length))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            length += len(chunk)
+        after = os.fstat(descriptor)
+        current = os.stat(path, follow_symlinks=False)
+        def identity(value):
+            return (
+                value.st_dev, value.st_ino, value.st_mode, value.st_size,
+                value.st_mtime_ns, value.st_ctime_ns,
+            )
+        if length > limit or length != after.st_size or identity(before) != identity(after) or identity(after) != identity(current):
+            raise ValueError("file identity changed while reading")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def _validate_install(config: AnnotationConfig, install: object) -> None:
