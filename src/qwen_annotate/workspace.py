@@ -11,12 +11,14 @@ import json
 import math
 import os
 import re
-import tempfile
+import secrets
+import stat
 import threading
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator, model_validator
 
@@ -138,6 +140,14 @@ class EpisodeRecord(_StrictModel):
                 raise ValueError("accepted requires decision_source")
             if self.validation_issues or self.review_reasons:
                 raise ValueError("accepted records cannot retain unresolved review issues")
+            if self.decision_source == "model" and (
+                self.prompt_version != PROMPT_VERSION
+                or self.model_revision is None
+                or not self.sampling_details
+            ):
+                raise ValueError(
+                    "model acceptance requires exact prompt_version, model_revision, and sampling provenance"
+                )
         elif self.decision_source is not None:
             raise ValueError("decision_source is only valid for accepted records")
         if self.status == "needs_review" and not (self.review_reasons or self.validation_issues):
@@ -265,9 +275,12 @@ class WorkspaceStore:
         self.root.mkdir(parents=True, exist_ok=True)
         for relative in ("episodes", "previews", "previews/needs_review", "logs"):
             path = self.root / relative
+            if path.is_symlink():
+                raise ValueError(f"workspace layout component must not be a symlink: {path}")
             if path.exists() and not path.is_dir():
                 raise ValueError(f"workspace layout path is not a directory: {path}")
             path.mkdir(exist_ok=True)
+        self._assert_safe_layout()
 
     def initialize(
         self,
@@ -305,8 +318,9 @@ class WorkspaceStore:
         )
         self.create_layout()
         with self._locked():
+            self._assert_safe_layout()
             manifest_path = self.root / "manifest.json"
-            if manifest_path.exists():
+            if _safe_entry_exists(manifest_path):
                 manifest = self._load_manifest()
                 candidate = self._manifest(config, dataset, model_revision, code_version, run_hash, manifest.created_at)
                 if manifest != candidate:
@@ -320,7 +334,7 @@ class WorkspaceStore:
             for episode in dataset.episodes:
                 expected_source = source_fingerprints[episode.episode_index]
                 path = self._episode_path(episode.episode_index)
-                if path.exists():
+                if _safe_entry_exists(path):
                     current = self._load_episode_unlocked(episode.episode_index)
                     if current.source_fingerprint != expected_source or current.run_fingerprint != run_hash:
                         raise ValueError(
@@ -342,6 +356,7 @@ class WorkspaceStore:
     def load_episode(self, index: int) -> EpisodeRecord:
         index = _validate_index(index)
         with self._locked():
+            self._assert_safe_layout()
             return self._load_episode_unlocked(index)
 
     def save_episode(self, record: EpisodeRecord) -> None:
@@ -353,13 +368,22 @@ class WorkspaceStore:
         record = EpisodeRecord.model_validate(record.model_dump())
         self.create_layout()
         with self._locked():
+            self._assert_safe_layout()
             self._validate_manifest_index(record.episode_index)
             path = self._episode_path(record.episode_index)
-            if path.exists():
+            manifest_exists = _safe_entry_exists(self.root / "manifest.json")
+            episode_exists = _safe_entry_exists(path)
+            if manifest_exists and not episode_exists:
+                raise ValueError(
+                    f"workspace is corrupt: manifest episode {record.episode_index} is missing"
+                )
+            if episode_exists:
                 prior = self._load_episode_unlocked(record.episode_index)
                 self._validate_transition(prior, record)
                 if prior == record:
                     return
+            elif record.status != "pending":
+                raise ValueError("a new standalone episode record must start pending")
             self._validate_final_annotation(record)
             _atomic_json_write(path, record.model_dump(mode="json"))
             self._write_summary_unlocked()
@@ -368,19 +392,46 @@ class WorkspaceStore:
         self,
         index: int,
         *,
-        source_fingerprint: str,
-        run_fingerprint: str,
+        episode: EpisodeInfo | None = None,
+        source_fingerprint: str | None = None,
+        run_fingerprint: str | None = None,
     ) -> EpisodeRecord:
         """Explicitly discard all derived state and reset one record to pending."""
         index = _validate_index(index)
         with self._locked():
+            self._assert_safe_layout()
             prior = self._load_episode_unlocked(index)
+            if _safe_entry_exists(self.root / "manifest.json"):
+                manifest = self._load_manifest()
+                if index >= manifest.total_episodes:
+                    raise ValueError(
+                        f"episode index {index} is outside manifest range [0, {manifest.total_episodes})"
+                    )
+                if episode is None:
+                    raise ValueError("manifest invalidation requires current EpisodeInfo")
+                if source_fingerprint is not None:
+                    raise ValueError("caller-provided source_fingerprint is not allowed with a manifest")
+                if run_fingerprint is not None and run_fingerprint != manifest.run_fingerprint:
+                    raise ValueError("run_fingerprint must equal manifest.run_fingerprint")
+                if episode.episode_index != index:
+                    raise ValueError("EpisodeInfo index must match the invalidated episode")
+                if episode.length != manifest.episode_lengths[index]:
+                    raise ValueError("EpisodeInfo length must match the manifest")
+                source_hash = compute_source_fingerprint(manifest.dataset_root, episode)
+                run_hash = manifest.run_fingerprint
+            else:
+                if source_fingerprint is None or run_fingerprint is None:
+                    raise ValueError(
+                        "standalone invalidation requires source_fingerprint and run_fingerprint"
+                    )
+                source_hash = source_fingerprint
+                run_hash = run_fingerprint
             reset = EpisodeRecord(
                 episode_index=index,
-                source_fingerprint=source_fingerprint,
-                run_fingerprint=run_fingerprint,
+                source_fingerprint=source_hash,
+                run_fingerprint=run_hash,
                 created_at=prior.created_at,
-                updated_at=self._now(minimum=prior.updated_at),
+                updated_at=self._now_strictly_after(prior.updated_at),
             )
             _atomic_json_write(self._episode_path(index), reset.model_dump(mode="json"))
             self._write_summary_unlocked()
@@ -400,10 +451,12 @@ class WorkspaceStore:
 
     def summary(self) -> dict[str, object]:
         with self._locked():
+            self._assert_safe_layout()
             return self._summary_unlocked()
 
     def write_summary(self) -> dict[str, object]:
         with self._locked():
+            self._assert_safe_layout()
             return self._write_summary_unlocked()
 
     def _manifest(
@@ -416,6 +469,7 @@ class WorkspaceStore:
         created_at: datetime,
     ) -> RunManifest:
         effective = config.model_dump(mode="json", exclude={"model": {"api_key"}})
+        effective["model"]["endpoint"] = _redacted_endpoint(str(config.model.endpoint))
         return RunManifest(
             dataset_root=dataset.root.resolve(),
             dataset_version=dataset.version,
@@ -438,12 +492,15 @@ class WorkspaceStore:
         )
 
     def _load_manifest(self) -> RunManifest:
-        payload = _read_json_object(self.root / "manifest.json")
+        path = self.root / "manifest.json"
+        _reject_symlink_path(path)
+        payload = _read_json_object(path)
         return RunManifest.model_validate_json(_canonical_json(payload))
 
     def _load_episode_unlocked(self, index: int) -> EpisodeRecord:
         path = self._episode_path(index)
-        if not path.is_file() or path.is_symlink():
+        _reject_symlink_path(path)
+        if not path.is_file():
             raise FileNotFoundError(f"Missing episode record: {path}")
         try:
             record = EpisodeRecord.model_validate_json(_canonical_json(_read_json_object(path)))
@@ -455,7 +512,7 @@ class WorkspaceStore:
 
     def _validate_manifest_index(self, index: int) -> None:
         manifest_path = self.root / "manifest.json"
-        if manifest_path.exists():
+        if _safe_entry_exists(manifest_path):
             total = self._load_manifest().total_episodes
             if index >= total:
                 raise ValueError(f"episode index {index} is outside manifest range [0, {total})")
@@ -469,12 +526,14 @@ class WorkspaceStore:
             or prior.run_fingerprint != current.run_fingerprint
         ):
             raise ValueError("episode fingerprints cannot change without explicit invalidation")
-        if prior.created_at != current.created_at or current.updated_at < prior.updated_at:
-            raise ValueError("episode timestamps cannot move backward or change creation time")
+        if prior.created_at != current.created_at:
+            raise ValueError("episode creation time cannot change")
         if prior.status == current.status:
-            if prior.status in {"accepted", "failed"} and prior != current:
-                raise ValueError(f"illegal transition from terminal status {prior.status}")
+            if prior != current:
+                raise ValueError(f"non-identical same-status update is forbidden for {prior.status}")
             return
+        if current.updated_at <= prior.updated_at:
+            raise ValueError("updated_at must strictly increase for every state change")
         if prior.status == "needs_review" and current.status == "accepted" and current.decision_source != "human":
             raise ValueError("needs_review may only transition to a human decision")
         allowed: dict[str, set[str]] = {
@@ -492,10 +551,16 @@ class WorkspaceStore:
         validate_zero_transition = record.status == "refine_done" and not record.refine_attempts
         if (
             (record.status != "accepted" and not validate_zero_transition)
-            or not (self.root / "manifest.json").exists()
+            or not _safe_entry_exists(self.root / "manifest.json")
         ):
             return
         manifest = self._load_manifest()
+        if (
+            record.status == "accepted"
+            and record.decision_source == "model"
+            and record.model_revision != manifest.model_revision
+        ):
+            raise ValueError("accepted model_revision must match the workspace manifest")
         issues = validate_annotation(
             record.final_annotation,
             manifest.mode,
@@ -521,7 +586,7 @@ class WorkspaceStore:
                 raise ValueError(f"duplicate episode index {index}")
             records[index] = self._load_episode_unlocked(index)
         manifest_path = self.root / "manifest.json"
-        if manifest_path.exists():
+        if _safe_entry_exists(manifest_path):
             total = self._load_manifest().total_episodes
             expected = set(range(total))
             actual = set(records)
@@ -552,6 +617,17 @@ class WorkspaceStore:
         value = value.astimezone(UTC)
         return max(value, minimum) if minimum is not None else value
 
+    def _now_strictly_after(self, prior: datetime) -> datetime:
+        return max(self._now(), prior + timedelta(microseconds=1))
+
+    def _assert_safe_layout(self) -> None:
+        for relative in ("episodes", "previews", "previews/needs_review", "logs"):
+            path = self.root / relative
+            if path.is_symlink():
+                raise ValueError(f"workspace layout component must not be a symlink: {path}")
+            if not path.is_dir():
+                raise ValueError(f"workspace layout component is not a directory: {path}")
+
     def _locked(self):
         return _WorkspaceLock(self.root / "logs" / "workspace.lock", self._thread_lock)
 
@@ -565,10 +641,30 @@ class _WorkspaceLock:
     def __enter__(self) -> "_WorkspaceLock":
         self._thread_lock.acquire()
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._handle = self._path.open("a+b")
+            if self._path.parent.is_symlink() or not self._path.parent.is_dir():
+                raise ValueError("workspace lock parent is a symlink or unsafe directory")
+            flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+            parent_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                parent_fd = os.open(self._path.parent, parent_flags)
+                try:
+                    fd = os.open(self._path.name, flags, 0o600, dir_fd=parent_fd)
+                finally:
+                    os.close(parent_fd)
+            except OSError as exc:
+                raise ValueError("workspace lock must not be a symlink or unsafe file") from exc
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                os.close(fd)
+                raise ValueError("workspace lock must be a regular file, not a symlink")
+            self._handle = os.fdopen(fd, "a+b")
             fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
         except BaseException:
+            if self._handle is not None and not self._handle.closed:
+                self._handle.close()
             self._thread_lock.release()
             raise
         return self
@@ -583,7 +679,6 @@ class _WorkspaceLock:
 
 
 def _atomic_json_write(path: Path, value: Mapping[str, object] | dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     data = json.dumps(
         value,
         ensure_ascii=False,
@@ -591,41 +686,59 @@ def _atomic_json_write(path: Path, value: Mapping[str, object] | dict[str, objec
         separators=(",", ":"),
         allow_nan=False,
     ) + "\n"
-    temporary: Path | None = None
+    directory_fd: int | None = None
+    temporary_name: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            directory_fd = os.open(path.parent, flags)
+        except OSError as exc:
+            raise ValueError(f"JSON parent is a symlink or unsafe directory: {path.parent}") from exc
+        _reject_symlink_entry(directory_fd, path.name)
+        temporary_name = f".{path.name}.{secrets.token_hex(12)}.tmp"
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        with os.fdopen(temporary_fd, "w", encoding="utf-8") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        temporary = None
-        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _reject_symlink_entry(directory_fd, path.name)
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
+        os.fsync(directory_fd)
     finally:
-        if temporary is not None:
+        if temporary_name is not None and directory_fd is not None:
             try:
-                temporary.unlink()
+                os.unlink(temporary_name, dir_fd=directory_fd)
             except FileNotFoundError:
                 pass
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
     try:
-        size = path.stat().st_size
+        _reject_symlink_path(path)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            os.close(fd)
+            raise ValueError("JSON path must be a regular file")
+        size = file_stat.st_size
         if size > _MAX_JSON_BYTES:
+            os.close(fd)
             raise ValueError(f"JSON file exceeds {_MAX_JSON_BYTES} bytes")
-        text = path.read_text(encoding="utf-8")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            text = handle.read(_MAX_JSON_BYTES + 1)
         value = json.loads(
             text,
             object_pairs_hook=_unique_object,
@@ -655,6 +768,45 @@ def _json_numbers_are_finite(value: JsonValue) -> bool:
     if isinstance(value, dict):
         return all(_json_numbers_are_finite(item) for item in value.values())
     return True
+
+
+def _safe_entry_exists(path: Path) -> bool:
+    """Return existence without ever accepting a symlink entry."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"workspace path must not be a symlink: {path}")
+    return True
+
+
+def _reject_symlink_path(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"workspace path must not be a symlink: {path}")
+
+
+def _reject_symlink_entry(directory_fd: int, name: str) -> None:
+    try:
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"JSON target must not be a symlink: {name}")
+
+
+def _redacted_endpoint(endpoint: str) -> str:
+    parsed = urlsplit(endpoint)
+    hostname = parsed.hostname
+    if not parsed.scheme or hostname is None:
+        raise ValueError("model endpoint must contain a scheme and host")
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    netloc = host if parsed.port is None else f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
 def _contained_file(root: Path, path: Path, label: str) -> tuple[Path, Path]:

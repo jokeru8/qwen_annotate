@@ -24,6 +24,11 @@ from tests.fixtures import make_config
 SHA = "a" * 40
 FP = "b" * 64
 NOW = datetime(2026, 8, 22, tzinfo=UTC)
+MODEL_AUDIT = {
+    "prompt_version": PROMPT_VERSION,
+    "model_revision": SHA,
+    "sampling_details": {"coarse": {"frames": [0, 5, 9]}},
+}
 
 
 def make_index(tmp_path: Path, lengths: list[int] = [10, 12]) -> DatasetIndex:
@@ -100,6 +105,36 @@ def test_models_are_strict_and_status_fields_are_consistent() -> None:
     assert audit.sampling_details["coarse"] == {"frames": [0, 4, 8], "camera": "eye"}
 
 
+@pytest.mark.parametrize(
+    "audit",
+    [
+        {},
+        {"prompt_version": "wrong", "model_revision": SHA, "sampling_details": {"fps": 1}},
+        {"prompt_version": PROMPT_VERSION, "model_revision": SHA, "sampling_details": {}},
+    ],
+)
+def test_model_acceptance_requires_exact_reproducibility_provenance(audit: dict) -> None:
+    data = pending().model_dump() | {
+        "status": "accepted",
+        "final_annotation": {"start_subtask_index": 0, "boundaries": []},
+        "decision_source": "model",
+    } | audit
+    with pytest.raises(ValidationError, match="provenance|prompt_version|sampling"):
+        EpisodeRecord.model_validate(data)
+
+
+def test_human_acceptance_does_not_need_model_provenance() -> None:
+    record = EpisodeRecord.model_validate(
+        pending().model_dump()
+        | {
+            "status": "accepted",
+            "final_annotation": {"start_subtask_index": 0, "boundaries": []},
+            "decision_source": "human",
+        }
+    )
+    assert record.prompt_version is None and record.sampling_details == {}
+
+
 def test_all_legal_transitions_and_human_review_acceptance(tmp_path: Path) -> None:
     store = WorkspaceStore(tmp_path / "work", clock=lambda: NOW)
     store.create_layout()
@@ -157,7 +192,7 @@ def test_zero_transition_episode_flows_through_refine_done_to_accepted(
         final_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[]),
     )
     store.save_episode(refined)
-    accepted = transition(refined, "accepted", decision_source="model")
+    accepted = transition(refined, "accepted", decision_source="model", **MODEL_AUDIT)
     store.save_episode(accepted)
     assert store.load_episode(0).status == "accepted"
 
@@ -201,16 +236,94 @@ def test_refine_done_without_refine_attempts_requires_zero_transition_final(
 def test_needs_review_can_only_be_accepted_by_a_human(tmp_path: Path) -> None:
     store = WorkspaceStore(tmp_path / "work")
     store.create_layout()
-    review = EpisodeRecord.model_validate(
-        pending().model_dump() | {"status": "needs_review", "review_reasons": ["check"]}
-    )
+    base = pending()
+    store.save_episode(base)
+    review = transition(base, "needs_review", review_reasons=["check"])
     store.save_episode(review)
     model_accept = transition(
         review, "accepted", final_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[]),
-        review_reasons=[], decision_source="model",
+        review_reasons=[], decision_source="model", **MODEL_AUDIT,
     )
     with pytest.raises(ValueError, match="human"):
         store.save_episode(model_accept)
+
+
+def test_state_changes_require_strictly_increasing_updated_at(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path / "work")
+    store.create_layout()
+    record = pending()
+    store.save_episode(record)
+    changed = record.model_copy(
+        update={"status": "coarse_done", "coarse_attempts": [coarse_result()]}
+    )
+    with pytest.raises(ValueError, match="updated_at"):
+        store.save_episode(changed)
+
+
+@pytest.mark.parametrize("status", ["pending", "coarse_done", "refine_done", "needs_review"])
+def test_nonidentical_same_status_updates_are_rejected(status: str, tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path / "work")
+    store.create_layout()
+    base = pending()
+    if status == "coarse_done":
+        base = transition(base, status, coarse_attempts=[coarse_result()])
+    elif status == "refine_done":
+        coarse = transition(base, "coarse_done", coarse_attempts=[coarse_result()])
+        base = transition(
+            coarse,
+            status,
+            refine_attempts=[refine_result()],
+        )
+    elif status == "needs_review":
+        base = transition(base, status, review_reasons=["ambiguous"])
+    initial = pending()
+    store.save_episode(initial)
+    if status != "pending":
+        if status == "refine_done":
+            coarse = transition(initial, "coarse_done", coarse_attempts=[coarse_result()])
+            store.save_episode(coarse)
+        store.save_episode(base)
+    mutation = base.model_copy(
+        update={"updated_at": base.updated_at + timedelta(seconds=1)}
+    )
+    with pytest.raises(ValueError, match="same-status"):
+        store.save_episode(mutation)
+    store.save_episode(base)  # exact retry remains idempotent
+
+
+def test_manifest_missing_episode_cannot_be_recreated_by_save(tmp_path: Path) -> None:
+    index = make_index(tmp_path, [10])
+    config = make_config(index.root, tmp_path / "work")
+    store = WorkspaceStore(config.work_dir, clock=lambda: NOW)
+    store.initialize(config, index, SHA)
+    base = store.load_episode(0)
+    (store.root / "episodes/episode_000000.json").unlink()
+    accepted = transition(
+        base,
+        "accepted",
+        final_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[]),
+        decision_source="model",
+        **MODEL_AUDIT,
+    )
+    with pytest.raises(ValueError, match="missing|corrupt"):
+        store.save_episode(accepted)
+    assert not (store.root / "episodes/episode_000000.json").exists()
+
+
+def test_standalone_store_only_creates_new_pending_records(tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path / "work")
+    store.create_layout()
+    accepted = EpisodeRecord.model_validate(
+        pending().model_dump()
+        | {
+            "status": "accepted",
+            "final_annotation": {"start_subtask_index": 0, "boundaries": []},
+            "decision_source": "model",
+        }
+        | MODEL_AUDIT
+    )
+    with pytest.raises(ValueError, match="new.*pending"):
+        store.save_episode(accepted)
 
 
 @pytest.mark.parametrize(
@@ -225,11 +338,30 @@ def test_rejects_skipped_backward_and_terminal_transitions(tmp_path: Path, old: 
         "pending": base,
         "coarse_done": transition(base, "coarse_done", coarse_attempts=[coarse_result()]),
         "refine_done": transition(transition(base, "coarse_done", coarse_attempts=[coarse_result()]), "refine_done", refine_attempts=[refine_result()]),
-        "accepted": EpisodeRecord.model_validate(base.model_dump() | {"status": "accepted", "final_annotation": {"start_subtask_index": 0, "boundaries": []}, "decision_source": "model"}),
+        "accepted": EpisodeRecord.model_validate(base.model_dump() | {"status": "accepted", "final_annotation": {"start_subtask_index": 0, "boundaries": []}, "decision_source": "model"} | MODEL_AUDIT),
         "failed": EpisodeRecord.model_validate(base.model_dump() | {"status": "failed", "failure_category": "model_unavailable"}),
     }
-    store.save_episode(records[old])
-    candidate_data = records[old].model_dump() | {"status": new, "updated_at": NOW + timedelta(seconds=2)}
+    store.save_episode(base)
+    if old == "coarse_done":
+        store.save_episode(records[old])
+    elif old == "refine_done":
+        store.save_episode(records["coarse_done"])
+        store.save_episode(records[old])
+    elif old == "accepted":
+        store.save_episode(records["coarse_done"])
+        store.save_episode(records["refine_done"])
+        records[old] = transition(
+            records["refine_done"], "accepted",
+            final_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[]),
+            decision_source="model", **MODEL_AUDIT,
+        )
+        store.save_episode(records[old])
+    elif old == "failed":
+        records[old] = transition(base, "failed", failure_category="model_unavailable")
+        store.save_episode(records[old])
+    candidate_data = records[old].model_dump() | {
+        "status": new, "updated_at": records[old].updated_at + timedelta(seconds=1)
+    }
     if new == "pending":
         candidate_data |= {
             "coarse_attempts": [], "refine_attempts": [], "final_annotation": None,
@@ -240,7 +372,7 @@ def test_rejects_skipped_backward_and_terminal_transitions(tmp_path: Path, old: 
     if new == "refine_done":
         candidate_data |= {"coarse_attempts": [coarse_result().model_dump()], "refine_attempts": [refine_result().model_dump()]}
     if new == "accepted":
-        candidate_data |= {"final_annotation": {"start_subtask_index": 0, "boundaries": []}, "decision_source": "model"}
+        candidate_data |= {"final_annotation": {"start_subtask_index": 0, "boundaries": []}, "decision_source": "model"} | MODEL_AUDIT
     if new == "needs_review":
         candidate_data |= {"review_reasons": ["manual check"], "decision_source": None}
     with pytest.raises(ValueError, match="transition"):
@@ -257,8 +389,14 @@ def test_active_stages_can_fail(tmp_path: Path, status: str) -> None:
     elif status == "refine_done":
         base = transition(transition(base, "coarse_done", coarse_attempts=[coarse_result()]), status, refine_attempts=[refine_result()])
     elif status == "needs_review":
-        base = EpisodeRecord.model_validate(base.model_dump() | {"status": status, "review_reasons": ["check"]})
-    store.save_episode(base)
+        base = transition(base, status, review_reasons=["check"])
+    initial = pending()
+    store.save_episode(initial)
+    if status != "pending":
+        if status == "refine_done":
+            coarse = transition(initial, "coarse_done", coarse_attempts=[coarse_result()])
+            store.save_episode(coarse)
+        store.save_episode(base)
     failed = transition(base, "failed", failure_category="video_corrupt", review_reasons=[])
     store.save_episode(failed)
     assert store.load_episode(0).status == "failed"
@@ -267,11 +405,16 @@ def test_active_stages_can_fail(tmp_path: Path, status: str) -> None:
 def test_explicit_invalidation_clears_all_derived_state(tmp_path: Path) -> None:
     store = WorkspaceStore(tmp_path / "work")
     store.create_layout()
-    accepted = EpisodeRecord.model_validate(pending().model_dump() | {
-        "status": "accepted", "coarse_attempts": [coarse_result().model_dump()], "refine_attempts": [refine_result().model_dump()],
-        "final_annotation": {"start_subtask_index": 0, "boundaries": [5]}, "decision_source": "model",
-        "prompt_version": "old", "model_revision": SHA, "sampling_details": {"fps": 5.0},
-    })
+    base = pending()
+    store.save_episode(base)
+    coarse = transition(base, "coarse_done", coarse_attempts=[coarse_result()])
+    store.save_episode(coarse)
+    refined = transition(coarse, "refine_done", refine_attempts=[refine_result()])
+    store.save_episode(refined)
+    accepted = transition(
+        refined, "accepted", final_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[5]),
+        decision_source="model", **MODEL_AUDIT,
+    )
     store.save_episode(accepted)
     reset = store.invalidate_episode(0, source_fingerprint="d" * 64, run_fingerprint="e" * 64)
     assert reset.status == "pending"
@@ -280,6 +423,41 @@ def test_explicit_invalidation_clears_all_derived_state(tmp_path: Path) -> None:
     assert reset.final_annotation is None and reset.validation_issues == []
     assert reset.failure_category is None and reset.decision_source is None
     assert reset.prompt_version is None and reset.model_revision is None and reset.sampling_details == {}
+    assert reset.updated_at > accepted.updated_at
+
+
+def test_manifest_invalidation_recomputes_source_and_enforces_run_integrity(tmp_path: Path) -> None:
+    index = make_index(tmp_path, [10])
+    config = make_config(index.root, tmp_path / "work")
+    store = WorkspaceStore(config.work_dir, clock=lambda: NOW)
+    manifest = store.initialize(config, index, SHA)
+    episode = index.episodes[0]
+    video = next(iter(episode.videos.values()))
+    video.write_bytes(b"source changed to a different size")
+    reset = store.invalidate_episode(0, episode=episode)
+    assert reset.source_fingerprint == compute_source_fingerprint(index.root, episode)
+    assert reset.run_fingerprint == manifest.run_fingerprint
+    assert reset.updated_at > NOW
+    with pytest.raises(ValueError, match="run_fingerprint"):
+        store.invalidate_episode(0, episode=episode, run_fingerprint="e" * 64)
+    with pytest.raises(ValueError, match="caller-provided source"):
+        store.invalidate_episode(0, episode=episode, source_fingerprint="f" * 64)
+    with pytest.raises(ValueError, match="index"):
+        store.invalidate_episode(0, episode=episode.model_copy(update={"episode_index": 1}))
+    with pytest.raises(ValueError, match="length"):
+        store.invalidate_episode(0, episode=episode.model_copy(update={"length": 11}))
+
+
+def test_manifest_invalidation_rejects_out_of_range_rogue_record(tmp_path: Path) -> None:
+    index = make_index(tmp_path, [10])
+    config = make_config(index.root, tmp_path / "work")
+    store = WorkspaceStore(config.work_dir, clock=lambda: NOW)
+    store.initialize(config, index, SHA)
+    payload = store.load_episode(0).model_dump(mode="json") | {"episode_index": 1}
+    (store.root / "episodes/episode_000001.json").write_text(json.dumps(payload))
+    rogue_episode = index.episodes[0].model_copy(update={"episode_index": 1})
+    with pytest.raises(ValueError, match="range"):
+        store.invalidate_episode(1, episode=rogue_episode)
 
 
 def test_source_fingerprint_is_stable_and_tracks_required_dimensions(tmp_path: Path) -> None:
@@ -345,6 +523,23 @@ def test_initialize_layout_manifest_redaction_roundtrip_and_exact_records(tmp_pa
         assert record.source_fingerprint == compute_source_fingerprint(index.root, episode)
 
 
+def test_manifest_strips_all_endpoint_credentials_query_and_fragment(tmp_path: Path) -> None:
+    index = make_index(tmp_path, [10])
+    config = make_config(index.root, tmp_path / "work")
+    secret_endpoint = "http://alice:password@[::1]:8123/v1/chat?token=SECRET&api_key=SECRET2#fragment"
+    secret_model = config.model.__class__.model_validate(
+        config.model.model_dump() | {"endpoint": secret_endpoint, "api_key": "SECRET3"}
+    )
+    config = config.model_copy(
+        update={"model": secret_model}
+    )
+    store = WorkspaceStore(config.work_dir, clock=lambda: NOW)
+    manifest = store.initialize(config, index, SHA)
+    raw = (store.root / "manifest.json").read_text()
+    assert all(secret not in raw for secret in ["alice", "password", "SECRET", "SECRET2", "SECRET3", "token", "api_key", "fragment"])
+    assert manifest.effective_config["model"]["endpoint"] == "http://[::1]:8123/v1/chat"
+
+
 def test_initialize_resumes_compatible_and_rejects_incompatible_state(tmp_path: Path) -> None:
     index = make_index(tmp_path)
     config = make_config(index.root, tmp_path / "work")
@@ -374,10 +569,45 @@ def test_initialized_store_rejects_invalid_final_annotation(tmp_path: Path) -> N
     store.save_episode(refined)
     invalid = transition(
         refined, "accepted", final_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[5]),
-        decision_source="model",
+        decision_source="model", **MODEL_AUDIT,
     )
     with pytest.raises(ValueError, match="final annotation"):
         store.save_episode(invalid)
+
+
+def test_initialized_store_requires_model_revision_to_match_manifest(tmp_path: Path) -> None:
+    index = make_index(tmp_path, [10])
+    config = make_config(index.root, tmp_path / "work")
+    store = WorkspaceStore(config.work_dir, clock=lambda: NOW)
+    store.initialize(config, index, SHA)
+    base = store.load_episode(0)
+    coarse = transition(
+        base,
+        "coarse_done",
+        coarse_attempts=[CoarseResult(
+            start_subtask_index=0,
+            observed_subtask_indices=[0],
+            coarse_boundaries=[],
+            confidence=0.8,
+        )],
+    )
+    store.save_episode(coarse)
+    refined = transition(
+        coarse,
+        "refine_done",
+        final_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[]),
+    )
+    store.save_episode(refined)
+    accepted = transition(
+        refined,
+        "accepted",
+        decision_source="model",
+        prompt_version=PROMPT_VERSION,
+        model_revision="b" * 40,
+        sampling_details={"frames": [0, 9]},
+    )
+    with pytest.raises(ValueError, match="model_revision"):
+        store.save_episode(accepted)
 
 
 def test_resume_revalidates_semantically_accepted_records(tmp_path: Path) -> None:
@@ -389,7 +619,7 @@ def test_resume_revalidates_semantically_accepted_records(tmp_path: Path) -> Non
     payload = json.loads(path.read_text())
     payload |= {
         "status": "accepted", "final_annotation": {"start_subtask_index": 0, "boundaries": [5]},
-        "decision_source": "model",
+        "decision_source": "model", **MODEL_AUDIT,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="final annotation"):
@@ -408,13 +638,66 @@ def test_save_is_atomic_cleans_temp_and_fsyncs_file_and_directory(tmp_path: Path
     loaded = store.load_episode(0)
     assert loaded.episode_index == 0
 
-    def fail_replace(source, target):
+    def fail_replace(source, target, **kwargs):
         raise OSError("replace failed")
     monkeypatch.setattr("qwen_annotate.workspace.os.replace", fail_replace)
     with pytest.raises(OSError, match="replace failed"):
         store.save_episode(transition(loaded, "failed", failure_category="test"))
     assert not list(store.root.rglob("*.tmp"))
     assert store.load_episode(0) == loaded
+
+
+@pytest.mark.parametrize(
+    "component",
+    ["episodes", "previews", "previews/needs_review", "logs"],
+)
+def test_layout_rejects_symlink_components_without_touching_target(
+    component: str, tmp_path: Path
+) -> None:
+    root = tmp_path / "work"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel"
+    sentinel.write_text("unchanged")
+    link = root / component
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        WorkspaceStore(root).create_layout()
+    assert sentinel.read_text() == "unchanged"
+    assert list(outside.iterdir()) == [sentinel]
+
+
+@pytest.mark.parametrize("target", ["lock", "manifest", "summary", "episode"])
+def test_workspace_rejects_symlink_file_targets_without_touching_outside(
+    target: str, tmp_path: Path
+) -> None:
+    root = tmp_path / "work"
+    store = WorkspaceStore(root)
+    store.create_layout()
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"sentinel":"unchanged"}')
+    if target == "lock":
+        link = root / "logs/workspace.lock"
+        link.symlink_to(outside)
+        operation = store.summary
+    elif target == "manifest":
+        index = make_index(tmp_path, [10])
+        config = make_config(index.root, root)
+        link = root / "manifest.json"
+        link.symlink_to(outside)
+        operation = lambda: store.initialize(config, index, SHA)
+    elif target == "summary":
+        link = root / "summary.json"
+        link.symlink_to(outside)
+        operation = lambda: store.save_episode(pending())
+    else:
+        link = root / "episodes/episode_000000.json"
+        link.symlink_to(outside)
+        operation = lambda: store.save_episode(pending())
+    with pytest.raises((ValueError, OSError), match="symlink|follow"):
+        operation()
+    assert outside.read_text() == '{"sentinel":"unchanged"}'
 
 
 def test_episode_commit_survives_summary_failure_and_summary_is_recoverable(tmp_path: Path, monkeypatch) -> None:
