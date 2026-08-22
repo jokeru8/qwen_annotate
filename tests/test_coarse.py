@@ -1,4 +1,7 @@
 import json
+import asyncio
+import math
+import time
 from pathlib import Path
 
 import pytest
@@ -9,6 +12,7 @@ from qwen_annotate.config import AnnotationConfig
 from qwen_annotate.lerobot import EpisodeInfo
 from qwen_annotate.models import CoarseBoundary, CoarseResult
 from qwen_annotate.video import FrameSample
+from qwen_annotate.workspace import compute_source_fingerprint
 
 
 def make_config(tmp_path: Path, *, mode: str = "complete", subtask_count: int = 3) -> AnnotationConfig:
@@ -33,12 +37,21 @@ def make_config(tmp_path: Path, *, mode: str = "complete", subtask_count: int = 
 
 
 def make_episode(tmp_path: Path, *, length: int = 101, camera: str = "cam.eye") -> EpisodeInfo:
+    source = tmp_path / "source"
+    parquet = source / "data" / "episode.parquet"
+    video = source / "videos" / f"{camera}.mp4"
+    parquet.parent.mkdir(parents=True, exist_ok=True)
+    video.parent.mkdir(parents=True, exist_ok=True)
+    if not parquet.exists():
+        parquet.touch()
+    if not video.exists():
+        video.touch()
     return EpisodeInfo(
         episode_index=7,
         length=length,
         task="arrange objects",
-        parquet=tmp_path / "episode.parquet",
-        videos={camera: tmp_path / f"{camera}.mp4"},
+        parquet=parquet,
+        videos={camera: video},
     )
 
 
@@ -262,6 +275,26 @@ def test_two_sampling_grids_preserve_endpoints_cap_and_differ_when_possible() ->
     assert coarse_pass_indices(1, 20.0, 2.0, 8, 1) == [0]
 
 
+def test_sampling_grids_have_complementary_phase_over_most_available_interior_frames() -> None:
+    for frame_count in range(1, 80):
+        for source_fps in (5.0, 20.0, 29.97):
+            for target_fps in (0.25, 1.0, 8.0, 40.0):
+                for cap in (2, 3, 8, 17):
+                    first = coarse_pass_indices(frame_count, source_fps, target_fps, cap, 0)
+                    second = coarse_pass_indices(frame_count, source_fps, target_fps, cap, 1)
+                    for grid in (first, second):
+                        assert grid == sorted(set(grid))
+                        assert grid[0] == 0 and grid[-1] == frame_count - 1
+                        assert len(grid) <= cap and all(0 <= value < frame_count for value in grid)
+                    assert len(first) == len(second)
+                    interiors = len(first) - 2
+                    slack = frame_count - len(first)
+                    if interiors > 0 and slack > 0:
+                        possible_new = min(interiors, slack)
+                        new_second = len(set(second[1:-1]) - set(first[1:-1]))
+                        assert new_second >= math.ceil(possible_new / 2)
+
+
 @pytest.mark.asyncio
 async def test_sampler_receives_exact_video_camera_grid_and_source_fps(tmp_path: Path) -> None:
     sampler = RecordingSampler()
@@ -270,11 +303,15 @@ async def test_sampler_receives_exact_video_camera_grid_and_source_fps(tmp_path:
 
     decision = await run_coarse(make_config(tmp_path), episode, sampler, client)
 
-    assert [call[0] for call in sampler.calls] == [episode.videos["cam.eye"], episode.videos["cam.eye"]]
-    assert [call[1] for call in sampler.calls] == ["cam.eye", "cam.eye"]
-    assert [call[2] for call in sampler.calls] == [list(grid) for grid in decision.sampled_frame_indices]
-    assert [call[3] for call in sampler.calls] == [20.0, 20.0]
+    assert len(sampler.calls) == 1
+    assert sampler.calls[0][0] == episode.videos["cam.eye"].resolve()
+    assert sampler.calls[0][1] == "cam.eye"
+    assert sampler.calls[0][2] == sorted(set().union(*decision.sampled_frame_indices))
+    assert sampler.calls[0][3] == 20.0
     assert decision.sampled_frame_indices[0] != decision.sampled_frame_indices[1]
+    assert [[sample.frame_index for sample in call[1]] for call in client.calls] == [
+        list(grid) for grid in decision.sampled_frame_indices
+    ]
 
 
 @pytest.mark.asyncio
@@ -293,6 +330,54 @@ async def test_sampler_evidence_must_exactly_match_request(tmp_path: Path, corru
     with pytest.raises(ValueError, match="sampler evidence"):
         await run_coarse(make_config(tmp_path), make_episode(tmp_path), RecordingSampler(corrupt=corrupt), client)
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_sampler_timestamp_must_match_exact_source_frame_time(tmp_path: Path) -> None:
+    def wrong_timestamp(samples):
+        return [samples[0].model_copy(update={"timestamp_seconds": 99.0}), *samples[1:]]
+
+    with pytest.raises(ValueError, match="timestamp"):
+        await run_coarse(
+            make_config(tmp_path),
+            make_episode(tmp_path),
+            RecordingSampler(corrupt=wrong_timestamp),
+            RecordingClient([]),
+        )
+
+
+@pytest.mark.asyncio
+async def test_blocking_sampler_runs_once_without_blocking_event_loop(tmp_path: Path) -> None:
+    events = []
+    base = RecordingSampler()
+
+    def blocking_sampler(*args):
+        events.append("sampler_start")
+        time.sleep(0.08)
+        events.append("sampler_end")
+        return base(*args)
+
+    async def heartbeat():
+        await asyncio.sleep(0.01)
+        events.append("heartbeat")
+
+    client = RecordingClient([result([0, 1, 2], [20, 60]), result([0, 1, 2], [21, 61])])
+    annotation, _ = await asyncio.gather(
+        run_coarse(make_config(tmp_path), make_episode(tmp_path), blocking_sampler, client),
+        heartbeat(),
+    )
+    assert annotation.status == "coarse_done"
+    assert events.index("heartbeat") < events.index("sampler_end")
+    assert len(base.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_sampler_failure_from_background_decode_propagates(tmp_path: Path) -> None:
+    def broken_sampler(*args):
+        raise RuntimeError("decode failed")
+
+    with pytest.raises(RuntimeError, match="decode failed"):
+        await run_coarse(make_config(tmp_path), make_episode(tmp_path), broken_sampler, RecordingClient([]))
 
 
 @pytest.mark.asyncio
@@ -378,7 +463,7 @@ def decision_fields(
     start=0,
     observed=(0, 1, 2),
     centers=(21, 61),
-    grids=((0, 20, 40, 60, 80, 100), (0, 21, 40, 60, 80, 100)),
+    grids=((0, 20, 40, 60, 80, 100), (0, 30, 50, 70, 90, 100)),
 ):
     return {
         "mode": mode,
@@ -538,6 +623,206 @@ def test_model_validate_json_rejects_tampered_sample_grid() -> None:
     payload["sampled_frame_indices"][0] = [0, 50, 50, 100]
     with pytest.raises(ValidationError, match="sampled"):
         CoarseDecision.model_validate_json(json.dumps(payload))
+
+
+def test_decision_rejects_two_insufficiently_independent_sparse_grids() -> None:
+    with pytest.raises(ValidationError, match="independent"):
+        CoarseDecision(
+            **decision_fields(
+                grids=((0, 20, 40, 60, 80, 100), (0, 21, 40, 60, 80, 100))
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.append(9),
+        lambda value: value.extend([9]),
+        lambda value: value.insert(0, 9),
+        lambda value: value.pop(),
+        lambda value: value.remove(value[0]),
+        lambda value: value.clear(),
+        lambda value: value.reverse(),
+        lambda value: value.sort(),
+        lambda value: value.__setitem__(0, value[0]),
+        lambda value: value.__delitem__(0),
+        lambda value: value.__iadd__([9]),
+        lambda value: value.__imul__(2),
+    ],
+)
+@pytest.mark.parametrize("field", ["observed_subtask_indices", "coarse_boundaries", "uncertainties"])
+def test_attempt_audit_lists_block_every_mutation_api(field, mutate) -> None:
+    first = result([0, 1, 2], [20, 60], uncertainties=["review note"])
+    second = result([0, 1, 2], [21, 61], uncertainties=["review note"])
+    decision = CoarseDecision(
+        **decision_fields(
+            attempts=(first, second),
+            status="needs_review",
+            reasons=("coarse_uncertain",),
+            start=None,
+            observed=(),
+            centers=(),
+        )
+    )
+    before = decision.model_dump(mode="json")
+
+    with pytest.raises(TypeError, match="immutable"):
+        mutate(getattr(decision.attempts[0], field))
+
+    assert decision.model_dump(mode="json") == before
+
+
+def test_decision_deep_copies_caller_owned_attempt_lists() -> None:
+    first = result([0, 1, 2], [20, 60])
+    second = result([0, 1, 2], [21, 61])
+    decision = CoarseDecision(**decision_fields(attempts=(first, second)))
+    assert decision.attempts[0] is not first
+
+    first.observed_subtask_indices.append(99)
+    first.coarse_boundaries.clear()
+    first.uncertainties.append("changed later")
+
+    assert decision.status == "coarse_done"
+    assert decision.attempts[0].observed_subtask_indices == [0, 1, 2]
+    assert len(decision.attempts[0].coarse_boundaries) == 2
+    assert decision.attempts[0].uncertainties == []
+
+
+def test_malformed_model_construct_attempt_is_rejected_as_validation_error() -> None:
+    malformed = CoarseResult.model_construct(
+        start_subtask_index=0,
+        observed_subtask_indices=None,
+        coarse_boundaries=None,
+        confidence=0.9,
+        uncertainties=None,
+    )
+    with pytest.raises(ValidationError, match="attempt"):
+        CoarseDecision(
+            **decision_fields(
+                attempts=(malformed, malformed),
+                status="needs_review",
+                reasons=("illegal_coarse_sequence",),
+                start=None,
+                observed=(),
+                centers=(),
+            )
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"fps":20.0,"fps":21.0}',
+        '{"fps":NaN}',
+        '[{"fps":20.0}]',
+        '{"fps":20.0 trailing secret-source-content}',
+    ],
+)
+async def test_source_info_requires_unique_standard_json_object_without_echoing_content(
+    tmp_path: Path, raw: str
+) -> None:
+    config = make_config(tmp_path)
+    episode = make_episode(tmp_path)
+    (config.source / "meta" / "info.json").write_text(raw, encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:
+        await run_coarse(config, episode, RecordingSampler(), RecordingClient([]))
+
+    assert "secret-source-content" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_authoritative_source_fps_must_match_current_metadata(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="authoritative"):
+        await run_coarse(
+            make_config(tmp_path),
+            make_episode(tmp_path),
+            RecordingSampler(),
+            RecordingClient([]),
+            source_fps=19.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_primary_video_must_be_regular_contained_source_file(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    contained = make_episode(tmp_path)
+    outside = tmp_path / "outside.mp4"
+    outside.touch()
+    external = contained.model_copy(update={"videos": {"cam.eye": outside}})
+    with pytest.raises(ValueError, match="inside source"):
+        await run_coarse(config, external, RecordingSampler(), RecordingClient([]))
+
+    link = contained.videos["cam.eye"]
+    link.unlink()
+    link.symlink_to(outside)
+    with pytest.raises(ValueError, match="symlink"):
+        await run_coarse(config, contained, RecordingSampler(), RecordingClient([]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["metadata", "video"])
+async def test_source_change_during_sampling_is_detected(tmp_path: Path, changed: str) -> None:
+    config = make_config(tmp_path)
+    episode = make_episode(tmp_path)
+    base = RecordingSampler()
+
+    def changing_sampler(*args):
+        samples = base(*args)
+        if changed == "metadata":
+            (config.source / "meta" / "info.json").write_text('{"fps":20.0,"changed":true}', encoding="utf-8")
+        else:
+            episode.videos["cam.eye"].write_bytes(b"changed")
+        return samples
+
+    with pytest.raises(ValueError, match="changed during coarse"):
+        await run_coarse(config, episode, changing_sampler, RecordingClient([]))
+
+
+@pytest.mark.asyncio
+async def test_primary_video_symlink_swap_during_sampling_is_detected(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    episode = make_episode(tmp_path)
+    outside = tmp_path / "replacement.mp4"
+    outside.touch()
+    base = RecordingSampler()
+
+    def swapping_sampler(*args):
+        samples = base(*args)
+        episode.videos["cam.eye"].unlink()
+        episode.videos["cam.eye"].symlink_to(outside)
+        return samples
+
+    with pytest.raises(ValueError, match="changed during coarse"):
+        await run_coarse(config, episode, swapping_sampler, RecordingClient([]))
+
+
+@pytest.mark.asyncio
+async def test_expected_source_fingerprint_is_checked_before_sampling(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+    episode = make_episode(tmp_path)
+    actual = compute_source_fingerprint(config.source, episode)
+    client = RecordingClient([result([0, 1, 2], [20, 60]), result([0, 1, 2], [21, 61])])
+    accepted = await run_coarse(
+        config,
+        episode,
+        RecordingSampler(),
+        client,
+        source_fps=20.0,
+        expected_source_fingerprint=actual,
+    )
+    assert accepted.status == "coarse_done"
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        await run_coarse(
+            config,
+            episode,
+            RecordingSampler(),
+            RecordingClient([]),
+            expected_source_fingerprint="0" * 64,
+        )
 
 
 @pytest.mark.asyncio

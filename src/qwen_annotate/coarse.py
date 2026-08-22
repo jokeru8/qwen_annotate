@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import math
+import os
+import stat
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -48,6 +53,39 @@ class _Completer(Protocol):
 Sampler = Callable[[Path, str, list[int], float], list[FrameSample]]
 
 
+class _FrozenList(list):
+    """A list-compatible immutable snapshot for public Pydantic result fields."""
+
+    @staticmethod
+    def _immutable(*args: object, **kwargs: object) -> None:
+        raise TypeError("coarse audit lists are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+
+@dataclass(frozen=True)
+class _SourceState:
+    root: Path
+    info_entry: Path
+    video_entry: Path
+    video_resolved: Path
+    fps: float
+    info_identity: tuple[int, ...]
+    video_identity: tuple[int, ...]
+    info_sha256: str
+
+
 class CoarseDecision(BaseModel):
     """Auditable outcome of two independent whole-episode model passes."""
 
@@ -72,9 +110,12 @@ class CoarseDecision(BaseModel):
         parsed: list[CoarseResult] = []
         for attempt in value:
             if isinstance(attempt, CoarseResult):
-                parsed.append(attempt)
+                _validate_attempt_shape(attempt)
+                parsed.append(_freeze_attempt(attempt))
             elif isinstance(attempt, dict):
-                parsed.append(_attempt_from_mapping(attempt))
+                restored = _attempt_from_mapping(attempt)
+                _validate_attempt_shape(restored)
+                parsed.append(_freeze_attempt(restored))
             else:
                 raise ValueError("attempts must contain exactly two CoarseResult values")
         return tuple(parsed)
@@ -85,6 +126,7 @@ class CoarseDecision(BaseModel):
             _validate_attempt_shape(attempt)
         for grid in self.sampled_frame_indices:
             _validate_sampled_grid(grid, self.frame_count)
+        _validate_grid_independence(self.sampled_frame_indices, self.frame_count)
 
         recomputed_set = _decision_reasons(
             self.attempts[0],
@@ -144,23 +186,40 @@ def coarse_pass_indices(
 ) -> list[int]:
     """Return one of two endpoint-preserving deterministic sparse grids.
 
-    Pass zero is the canonical uniform grid. Pass one moves one interior point
-    by one original frame whenever an alternative sorted grid exists. If every
-    frame is selected (or there are only endpoint samples), the grids coincide.
+    Pass zero is the canonical uniform grid. Pass one samples approximately a
+    half base interval later across the interior. If every frame is selected
+    (or there are only endpoint samples), the grids coincide.
     """
     if type(pass_id) is not int or pass_id not in (0, 1):
         raise ValueError("pass_id must be 0 or 1")
     base = uniform_indices(frame_count, source_fps, target_fps, max_frames)
     if pass_id == 0 or len(base) <= 2 or len(base) == frame_count:
         return base
-    shifted = list(base)
-    for index in range(1, len(shifted) - 1):
-        if shifted[index] + 1 < shifted[index + 1]:
-            shifted[index] += 1
-            return shifted
-        if shifted[index] - 1 > shifted[index - 1]:
-            shifted[index] -= 1
-            return shifted
+    span = frame_count - 1
+    sample_count = len(base)
+    shifted = [0]
+    for index in range(1, sample_count - 1):
+        ideal = round((index + 0.5) * span / (sample_count - 1))
+        lower = shifted[-1] + 1
+        upper = span - (sample_count - 1 - index)
+        shifted.append(min(upper, max(lower, ideal)))
+    shifted.append(span)
+    required = _minimum_distinct_interior(frame_count, sample_count)
+    while len(set(shifted[1:-1]) - set(base[1:-1])) < required:
+        changed = False
+        base_values = set(base[1:-1])
+        for index in range(1, sample_count - 1):
+            lower = shifted[index - 1] + 1
+            upper = shifted[index + 1] - 1
+            for candidate in (shifted[index] - 1, shifted[index] + 1, lower, upper):
+                if lower <= candidate <= upper and candidate not in base_values:
+                    shifted[index] = candidate
+                    changed = True
+                    break
+            if changed:
+                break
+        if not changed:
+            break
     return shifted
 
 
@@ -169,30 +228,50 @@ async def run_coarse(
     episode: EpisodeInfo,
     sampler: Sampler = extract_frames,
     client: _Completer | None = None,
+    *,
+    source_fps: float | None = None,
+    expected_source_fingerprint: str | None = None,
 ) -> CoarseDecision:
     """Run two semantic passes and accept only deterministic agreement."""
     _validate_inputs(config, episode)
-    source_fps = _read_source_fps(config.source)
+    source = _prepare_source(
+        config,
+        episode,
+        authoritative_fps=source_fps,
+        expected_fingerprint=expected_source_fingerprint,
+    )
+    effective_fps = source.fps
     completer: _Completer = client if client is not None else QwenClient(
         endpoint=str(config.model.endpoint),
         api_key=config.model.api_key,
         model=config.model.name,
     )
     camera = config.primary_camera
-    video = episode.videos[camera]
     attempts: list[CoarseResult] = []
-    sampled_grids: list[tuple[int, ...]] = []
-
-    for pass_id in (0, 1):
-        indices = coarse_pass_indices(
+    grids = [
+        coarse_pass_indices(
             episode.length,
-            source_fps,
+            effective_fps,
             config.sampling.coarse_fps,
             config.sampling.coarse_max_frames,
             pass_id,
         )
-        samples = sampler(video, camera, indices, source_fps)
-        _validate_samples(samples, indices, camera)
+        for pass_id in (0, 1)
+    ]
+    union = sorted(set(grids[0]) | set(grids[1]))
+    union_samples = await asyncio.to_thread(
+        sampler,
+        source.video_resolved,
+        camera,
+        union,
+        effective_fps,
+    )
+    _validate_samples(union_samples, union, camera, effective_fps)
+    _assert_source_unchanged(source, episode, expected_source_fingerprint)
+    by_index = {sample.frame_index: sample for sample in union_samples}
+
+    for pass_id, indices in enumerate(grids):
+        samples = [by_index[index] for index in indices]
         prompt = build_coarse_prompt(
             config,
             episode_index=episode.episode_index,
@@ -203,7 +282,7 @@ async def run_coarse(
         if not isinstance(attempt, CoarseResult):
             raise TypeError("client.complete must return a CoarseResult")
         attempts.append(attempt)
-        sampled_grids.append(tuple(indices))
+        _assert_source_unchanged(source, episode, expected_source_fingerprint)
 
     first, second = attempts
     found = _decision_reasons(first, second, config.mode, len(config.subtasks), episode.length)
@@ -214,7 +293,7 @@ async def run_coarse(
         "frame_count": episode.length,
         "attempts": (first, second),
         "reasons": reasons,
-        "sampled_frame_indices": (sampled_grids[0], sampled_grids[1]),
+        "sampled_frame_indices": (tuple(grids[0]), tuple(grids[1])),
     }
     if reasons:
         return CoarseDecision(
@@ -261,16 +340,174 @@ def _validate_inputs(config: AnnotationConfig, episode: EpisodeInfo) -> None:
         raise ValueError("coarse_max_frames must be an integer of at least 2")
 
 
-def _read_source_fps(source: Path) -> float:
-    info_path = source / "meta" / "info.json"
+def _prepare_source(
+    config: AnnotationConfig,
+    episode: EpisodeInfo,
+    *,
+    authoritative_fps: float | None,
+    expected_fingerprint: str | None,
+) -> _SourceState:
+    try:
+        root = config.source.resolve(strict=True)
+    except OSError:
+        raise ValueError("configured source root must exist") from None
+    if not root.is_dir():
+        raise ValueError("configured source root must be a directory")
+    info_entry = root / "meta" / "info.json"
+    video_entry, video_resolved = _contained_regular_file(
+        root,
+        episode.videos[config.primary_camera],
+        "primary video",
+    )
+    info_entry, _ = _contained_regular_file(root, info_entry, "source info.json")
+    info_identity, info_sha256 = _capture_file(info_entry, with_digest=True)
+    metadata_fps = _read_source_fps(info_entry)
+    info_identity_after_parse, info_sha256_after_parse = _capture_file(
+        info_entry, with_digest=True
+    )
+    if (
+        info_identity_after_parse != info_identity
+        or info_sha256_after_parse != info_sha256
+    ):
+        raise ValueError("source evidence changed during coarse annotation")
+    if authoritative_fps is not None:
+        if isinstance(authoritative_fps, bool) or not isinstance(authoritative_fps, (int, float)):
+            raise ValueError("authoritative source_fps must be a positive finite number")
+        effective = float(authoritative_fps)
+        if not math.isfinite(effective) or effective <= 0:
+            raise ValueError("authoritative source_fps must be a positive finite number")
+        if not math.isclose(effective, metadata_fps, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("authoritative source_fps does not match current source metadata")
+    else:
+        effective = metadata_fps
+    video_identity, _ = _capture_file(video_entry, with_digest=False)
+    if expected_fingerprint is not None:
+        _validate_expected_fingerprint(expected_fingerprint)
+        if _source_fingerprint(root, episode) != expected_fingerprint:
+            raise ValueError("expected source fingerprint does not match current episode source")
+    return _SourceState(
+        root=root,
+        info_entry=info_entry,
+        video_entry=video_entry,
+        video_resolved=video_resolved,
+        fps=effective,
+        info_identity=info_identity,
+        video_identity=video_identity,
+        info_sha256=info_sha256,
+    )
+
+
+def _contained_regular_file(root: Path, path: Path, label: str) -> tuple[Path, Path]:
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise ValueError(f"{label} path must be absolute")
+    lexical = Path(os.path.abspath(path))
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError:
+        raise ValueError(f"{label} must be inside source root") from None
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{label} must not use a symlink")
+    try:
+        resolved = lexical.resolve(strict=True)
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        raise ValueError(f"{label} must resolve inside source root") from None
+    try:
+        file_stat = os.stat(lexical, follow_symlinks=False)
+    except OSError:
+        raise ValueError(f"{label} must exist") from None
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError(f"{label} must be a regular file")
+    return lexical, resolved
+
+
+def _identity(file_stat: os.stat_result) -> tuple[int, ...]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_mode,
+        file_stat.st_size,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _capture_file(path: Path, *, with_digest: bool) -> tuple[tuple[int, ...], str]:
+    if path.is_symlink():
+        raise ValueError("source evidence changed during coarse annotation")
+    try:
+        before = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("source evidence changed during coarse annotation")
+        data = path.read_bytes() if with_digest else b""
+        after = os.stat(path, follow_symlinks=False)
+    except OSError:
+        raise ValueError("source evidence changed during coarse annotation") from None
+    if _identity(before) != _identity(after):
+        raise ValueError("source evidence changed during coarse annotation")
+    digest = hashlib.sha256(data).hexdigest() if with_digest else ""
+    return _identity(after), digest
+
+
+def _assert_source_unchanged(
+    source: _SourceState,
+    episode: EpisodeInfo,
+    expected_fingerprint: str | None,
+) -> None:
+    try:
+        current_video_resolved = source.video_entry.resolve(strict=True)
+    except OSError:
+        raise ValueError("source evidence changed during coarse annotation") from None
+    if current_video_resolved != source.video_resolved:
+        raise ValueError("source evidence changed during coarse annotation")
+    info_identity, info_sha256 = _capture_file(source.info_entry, with_digest=True)
+    video_identity, _ = _capture_file(source.video_entry, with_digest=False)
+    if (
+        info_identity != source.info_identity
+        or info_sha256 != source.info_sha256
+        or video_identity != source.video_identity
+    ):
+        raise ValueError("source evidence changed during coarse annotation")
+    if expected_fingerprint is not None and _source_fingerprint(source.root, episode) != expected_fingerprint:
+        raise ValueError("source fingerprint changed during coarse annotation")
+
+
+def _validate_expected_fingerprint(value: object) -> None:
+    if not isinstance(value, str) or len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ValueError("expected source fingerprint must be lowercase SHA-256")
+
+
+def _source_fingerprint(root: Path, episode: EpisodeInfo) -> str:
+    from .workspace import compute_source_fingerprint
+
+    return compute_source_fingerprint(root, episode)
+
+
+def _read_source_fps(info_path: Path) -> float:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON object key")
+            result[key] = value
+        return result
+
     try:
         payload = json.loads(
             info_path.read_text(encoding="utf-8"),
-            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"invalid constant {value}")),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError("non-standard JSON constant")),
         )
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        raise ValueError(f"unable to read source fps from {info_path}: {exc}") from exc
-    value = payload.get("fps") if isinstance(payload, dict) else None
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("source info.json must contain valid standard JSON with unique keys") from None
+    if not isinstance(payload, dict):
+        raise ValueError("source info.json must contain a JSON object")
+    value = payload.get("fps")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("source metadata fps must be a positive finite number")
     fps = float(value)
@@ -279,7 +516,12 @@ def _read_source_fps(source: Path) -> float:
     return fps
 
 
-def _validate_samples(samples: object, requested: list[int], camera: str) -> None:
+def _validate_samples(
+    samples: object,
+    requested: list[int],
+    camera: str,
+    source_fps: float,
+) -> None:
     if not isinstance(samples, list) or len(samples) != len(requested):
         raise ValueError("sampler evidence must contain exactly the requested frames")
     actual: list[int] = []
@@ -288,6 +530,16 @@ def _validate_samples(samples: object, requested: list[int], camera: str) -> Non
             raise ValueError("sampler evidence must contain FrameSample values")
         if sample.camera_key != camera:
             raise ValueError("sampler evidence camera must match the requested camera")
+        expected_timestamp = sample.frame_index / source_fps
+        if not math.isclose(
+            sample.timestamp_seconds,
+            expected_timestamp,
+            rel_tol=1e-9,
+            abs_tol=1e-7,
+        ):
+            raise ValueError(
+                "sampler evidence timestamp must match frame_index/source_fps within 1e-7 seconds"
+            )
         actual.append(sample.frame_index)
     if actual != requested:
         raise ValueError("sampler evidence indices must match requested order without duplicates")
@@ -304,6 +556,50 @@ def _validate_sampled_grid(grid: tuple[int, ...], frame_count: int) -> None:
         raise ValueError("sampled frame indices must be within the episode")
     if any(left >= right for left, right in zip(grid, grid[1:])):
         raise ValueError("sampled frame indices must be sorted and unique")
+
+
+def _minimum_distinct_interior(frame_count: int, sample_count: int) -> int:
+    interiors = max(0, sample_count - 2)
+    available_outside_first_grid = max(0, frame_count - sample_count)
+    possible_new = min(interiors, available_outside_first_grid)
+    return (possible_new + 1) // 2
+
+
+def _validate_grid_independence(
+    grids: tuple[tuple[int, ...], tuple[int, ...]], frame_count: int
+) -> None:
+    first, second = grids
+    if len(first) != len(second):
+        raise ValueError("sampled grids must have the same capped sample count")
+    required = _minimum_distinct_interior(frame_count, len(first))
+    distinct = len(set(second[1:-1]) - set(first[1:-1]))
+    if distinct < required:
+        raise ValueError(
+            "sampled grids are not sufficiently independent for the available sparse frames"
+        )
+
+
+def _freeze_attempt(attempt: CoarseResult) -> CoarseResult:
+    boundaries = _FrozenList(
+        CoarseBoundary.model_construct(
+            from_subtask_index=getattr(boundary, "from_subtask_index", None),
+            to_subtask_index=getattr(boundary, "to_subtask_index", None),
+            estimated_frame=getattr(boundary, "estimated_frame", None),
+            evidence=getattr(boundary, "evidence", None),
+        )
+        if isinstance(boundary, CoarseBoundary)
+        else boundary
+        for boundary in getattr(attempt, "coarse_boundaries", [])
+    )
+    return CoarseResult.model_construct(
+        start_subtask_index=getattr(attempt, "start_subtask_index", None),
+        observed_subtask_indices=_FrozenList(
+            list(getattr(attempt, "observed_subtask_indices", []))
+        ),
+        coarse_boundaries=boundaries,
+        confidence=getattr(attempt, "confidence", None),
+        uncertainties=_FrozenList(list(getattr(attempt, "uncertainties", []))),
+    )
 
 
 def _attempt_from_mapping(value: dict[object, object]) -> CoarseResult:
