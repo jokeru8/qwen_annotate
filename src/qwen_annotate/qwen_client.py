@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import re
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Any, Generic, TypeVar
+from numbers import Real
+from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
 from qwen_annotate.video import FrameSample, as_data_url
 
 
-T = TypeVar("T", bound=BaseModel)
 Send = Callable[..., Awaitable[Any]]
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -62,7 +63,7 @@ class _StrictJSONError(ValueError):
     pass
 
 
-class QwenClient(Generic[T]):
+class QwenClient:
     """Call an OpenAI-compatible Qwen endpoint with a finite total call budget.
 
     ``max_attempts`` limits every outbound call made by one :meth:`complete`,
@@ -85,12 +86,7 @@ class QwenClient(Generic[T]):
     ) -> None:
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("max_attempts must be a positive integer")
-        if isinstance(retry_seconds, (int, float)) and not isinstance(retry_seconds, bool):
-            delays = (float(retry_seconds),)
-        else:
-            delays = tuple(float(delay) for delay in retry_seconds)
-        if not delays or any(delay < 0 for delay in delays):
-            raise ValueError("retry_seconds must contain nonnegative delays")
+        delays = _normalize_retry_seconds(retry_seconds)
         if endpoint is not None and base_url is not None and str(endpoint) != str(base_url):
             raise ValueError("endpoint and base_url must not disagree")
 
@@ -114,7 +110,7 @@ class QwenClient(Generic[T]):
         else:
             self._send = send
 
-    async def complete(
+    async def complete[T: BaseModel](
         self,
         prompt: str,
         frames: list[FrameSample],
@@ -159,31 +155,25 @@ class QwenClient(Generic[T]):
                     excerpt=excerpt,
                 ) from None
 
-            try:
-                payload = _strict_json_loads(content)
-                if repair_used:
-                    if original_json is _NOT_PARSED:
-                        raise ValueError("original response has no recoverable semantic JSON baseline")
-                    if not _json_semantically_equal(payload, original_json):
-                        raise ValueError("format repair changed semantic JSON values")
-                return response_type.model_validate(payload)
-            except (json.JSONDecodeError, ValidationError, ValueError) as exc:
-                last_invalid = self._safe_excerpt(content)
-                if not repair_used and attempt_count < self._max_attempts:
-                    original_json = _recover_semantic_baseline(content)
-                    repair_used = True
-                    request = self._repair_request(content, response_type, schema)
-                    continue
-                category = (
-                    "JSON parsing"
-                    if isinstance(exc, (json.JSONDecodeError, _StrictJSONError))
-                    else "schema validation"
-                )
-                raise InvalidModelResponse(
-                    f"model response failed strict {category}",
-                    attempt_count=attempt_count,
-                    excerpt=last_invalid,
-                ) from exc
+            result, category = _parse_typed_response(
+                content,
+                response_type,
+                repair_used=repair_used,
+                semantic_baseline=original_json,
+            )
+            if result is not None:
+                return result
+            last_invalid = _redacted_response_excerpt(content)
+            if not repair_used and attempt_count < self._max_attempts:
+                original_json = _recover_semantic_baseline(content)
+                repair_used = True
+                request = self._repair_request(content, response_type, schema)
+                continue
+            raise InvalidModelResponse(
+                f"model response failed strict {category}",
+                attempt_count=attempt_count,
+                excerpt=last_invalid,
+            ) from None
 
         # The loop exits only if future changes add a zero-cost branch.
         raise InvalidModelResponse(
@@ -196,7 +186,7 @@ class QwenClient(Generic[T]):
         self,
         prompt: str,
         frames: list[FrameSample],
-        response_type: type[T],
+        response_type: type[BaseModel],
         schema: dict[str, Any],
     ) -> dict[str, Any]:
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -223,7 +213,7 @@ class QwenClient(Generic[T]):
     def _repair_request(
         self,
         invalid_response: str,
-        response_type: type[T],
+        response_type: type[BaseModel],
         schema: dict[str, Any],
     ) -> dict[str, Any]:
         repair_prompt = (
@@ -355,6 +345,7 @@ def _strict_json_loads(content: str) -> Any:
         content,
         parse_constant=_reject_json_constant,
         parse_float=_parse_finite_json_float,
+        object_pairs_hook=_reject_duplicate_object_pairs,
     )
 
 
@@ -367,6 +358,65 @@ def _parse_finite_json_float(token: str) -> float:
     if not math.isfinite(value):
         raise _StrictJSONError(f"JSON float is outside the finite range: {token}")
     return value
+
+
+def _reject_duplicate_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _StrictJSONError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _parse_typed_response[T: BaseModel](
+    content: str,
+    response_type: type[T],
+    *,
+    repair_used: bool,
+    semantic_baseline: Any,
+) -> tuple[T | None, str]:
+    """Parse without allowing raw parser/validation exceptions to escape."""
+    try:
+        payload = _strict_json_loads(content)
+        if repair_used:
+            if semantic_baseline is _NOT_PARSED:
+                raise ValueError("original response has no recoverable semantic JSON baseline")
+            if not _json_semantically_equal(payload, semantic_baseline):
+                raise ValueError("format repair changed semantic JSON values")
+        return response_type.model_validate(payload), ""
+    except (json.JSONDecodeError, _StrictJSONError):
+        return None, "JSON parsing"
+    except (ValidationError, ValueError):
+        return None, "schema validation"
+
+
+def _redacted_response_excerpt(content: str) -> str:
+    digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"<model response redacted; chars={len(content)}; sha256={digest}>"
+
+
+def _normalize_retry_seconds(value: float | Sequence[float]) -> tuple[float, ...]:
+    if isinstance(value, Real) and not isinstance(value, bool):
+        raw_delays: tuple[object, ...] = (value,)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        raw_delays = tuple(value)
+    else:
+        raise ValueError("retry_seconds must be a real number or a sequence of real numbers")
+    if not raw_delays:
+        raise ValueError("retry_seconds must contain at least one delay")
+    delays: list[float] = []
+    for delay in raw_delays:
+        if isinstance(delay, bool) or not isinstance(delay, Real):
+            raise ValueError("retry_seconds must contain only real numbers")
+        try:
+            converted = float(delay)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("retry_seconds values must fit in a finite float") from exc
+        if not math.isfinite(converted) or converted < 0:
+            raise ValueError("retry_seconds must contain finite nonnegative delays")
+        delays.append(converted)
+    return tuple(delays)
 
 
 def _json_semantically_equal(left: Any, right: Any) -> bool:

@@ -21,6 +21,7 @@ class SemanticPayload(BaseModel):
     value: bool | int | float
     label: str = "same"
     nested: list[bool | int | float] = Field(default_factory=list)
+    metadata: dict[str, int] = Field(default_factory=dict)
 
 
 def valid_json(boundary: int = 20) -> str:
@@ -34,6 +35,26 @@ def frame(index: int, payload: bytes) -> FrameSample:
         timestamp_seconds=float(index),
         jpeg=payload,
     )
+
+
+def exception_text_graph(error: BaseException) -> str:
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    artifacts: list[str] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        artifacts.extend([str(current), repr(current), repr(current.args)])
+        errors = getattr(current, "errors", None)
+        if callable(errors):
+            artifacts.append(repr(errors()))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return "\n".join(artifacts)
 
 
 @pytest.mark.asyncio
@@ -528,6 +549,34 @@ async def test_schema_validation_is_strict_even_after_repair() -> None:
     assert "validation" in str(caught.value).lower()
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        "UNIQUE_RAW_SECRET_" + ("m" * 400) + " {broken",
+        json.dumps({
+            "start_subtask_index": "UNIQUE_RAW_SECRET_" + ("s" * 400),
+            "boundaries": [],
+        }),
+    ],
+)
+@pytest.mark.asyncio
+async def test_invalid_response_exception_graph_never_retains_raw_output(response: str) -> None:
+    secret = "UNIQUE_RAW_SECRET_"
+
+    async def send(**kwargs):
+        return response
+
+    with pytest.raises(InvalidModelResponse) as caught:
+        await QwenClient(send=send, max_attempts=1).complete(
+            "prompt", [], FinalAnnotation
+        )
+    assert secret not in exception_text_graph(caught.value)
+    assert secret not in caught.value.excerpt
+    assert len(caught.value.excerpt) <= 256
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
 @pytest.mark.asyncio
 async def test_error_excerpt_is_redacted_and_bounded() -> None:
     secret = "super-secret-api-key"
@@ -552,3 +601,74 @@ def test_constructor_rejects_invalid_attempt_and_delay_configuration() -> None:
         QwenClient(send=send, max_attempts=0)
     with pytest.raises(ValueError):
         QwenClient(send=send, retry_seconds=[-1])
+
+
+@pytest.mark.parametrize(
+    "delays",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        [0, float("nan")],
+        [float("inf")],
+        [float("-inf")],
+        True,
+        [False],
+        "1.0",
+        10**400,
+    ],
+)
+def test_constructor_rejects_non_real_or_nonfinite_retry_delays(delays) -> None:
+    async def send(**kwargs):
+        return valid_json()
+
+    with pytest.raises(ValueError, match="retry_seconds"):
+        QwenClient(send=send, retry_seconds=delays)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        '{"value":1,"value":2}',
+        '{"value":1,"metadata":{"x":1,"x":2}}',
+    ],
+)
+@pytest.mark.asyncio
+async def test_duplicate_json_keys_are_rejected_at_any_depth(response: str) -> None:
+    async def send(**kwargs):
+        return response
+
+    with pytest.raises(InvalidModelResponse):
+        await QwenClient(send=send, max_attempts=1).complete("prompt", [], SemanticPayload)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_keys_cannot_form_wrapped_repair_baseline() -> None:
+    replies = iter([
+        'wrapped: {"value":1,"value":1}',
+        '{"value":1}',
+    ])
+
+    async def send(**kwargs):
+        return next(replies)
+
+    with pytest.raises(InvalidModelResponse):
+        await QwenClient(send=send, max_attempts=2).complete(
+            "prompt", [], SemanticPayload
+        )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_keys_in_repair_response_are_rejected() -> None:
+    replies = iter([
+        'wrapped: {"value":1}',
+        '{"value":1,"value":1}',
+    ])
+
+    async def send(**kwargs):
+        return next(replies)
+
+    with pytest.raises(InvalidModelResponse):
+        await QwenClient(send=send, max_attempts=2).complete(
+            "prompt", [], SemanticPayload
+        )
