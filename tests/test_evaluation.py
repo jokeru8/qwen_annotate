@@ -117,6 +117,10 @@ def test_synthetic_dagger_views_are_deterministic_bounded_and_relative() -> None
         assert 0 <= view.start_frame < view.end_frame <= 500
         assert view.end_frame - view.start_frame >= 20
         assert all(0 < boundary < view.end_frame - view.start_frame for boundary in view.expected_boundaries_relative)
+    assert not any(
+        view.kind == "singleton" and view.expected_start_subtask_index == 3
+        for view in views
+    )
 
 
 def test_short_segments_are_skipped_without_invalid_dagger_views() -> None:
@@ -144,6 +148,54 @@ def test_evaluate_dagger_passes_only_frame_ranges_to_sampler_and_inference() -> 
     assert seen == [(4, 30, 90), {"frames": [30, 89]}]
     assert metrics.start_subtask_index_accuracy == 1.0
     assert metrics.accepted_coverage == 1.0
+
+
+@pytest.mark.parametrize(
+    "start,boundaries",
+    [
+        (2, [60, 30]),  # reversed
+        (2, [30, 100]),  # out of the virtual range
+        (2, [30]),  # wrong transition count
+        (1, [30, 60]),  # wrong starting subtask
+    ],
+)
+def test_dagger_evaluation_independently_blocks_structurally_invalid_predictions(
+    start: int, boundaries: list[int],
+) -> None:
+    view = DaggerView(
+        source_episode=0, start_frame=50, end_frame=150,
+        expected_start_subtask_index=2, expected_boundaries_relative=[30, 60], kind="suffix",
+    )
+
+    metrics = evaluate_dagger(
+        [view], sampler=lambda *_: object(),
+        inference=lambda _: DaggerPrediction(
+            start_subtask_index=start, boundaries=boundaries, status="accepted",
+            constraint_violated=False,
+        ),
+        fps=20, min_segment_frames=8, obvious_error_threshold_seconds=100.0,
+    )
+
+    assert metrics.constraint_violation_count == 1
+    assert metrics.constraint_violation_blocked_count == 0
+    assert metrics.constraint_blocking_rate == 0.0
+    assert metrics.false_accept_count == 1
+
+
+def test_dagger_evaluation_derives_minimum_segment_violation() -> None:
+    view = DaggerView(
+        source_episode=0, start_frame=10, end_frame=110,
+        expected_start_subtask_index=1, expected_boundaries_relative=[30, 60], kind="suffix",
+    )
+    metrics = evaluate_dagger(
+        [view], sampler=lambda *_: object(),
+        inference=lambda _: DaggerPrediction(
+            start_subtask_index=1, boundaries=[4, 60], status="needs_review",
+        ),
+        fps=20, min_segment_frames=8,
+    )
+    assert metrics.constraint_violation_count == 1
+    assert metrics.constraint_violation_blocked_count == 1
 
 
 def _write_evaluation_fixture(root: Path, *, boundary: int, status: str = "accepted") -> tuple[Path, Path]:
@@ -227,3 +279,48 @@ def test_cli_rejects_misaligned_golden_episode_metadata(tmp_path: Path) -> None:
     )
     assert result.exit_code == 1
     assert not output.exists()
+
+
+@pytest.mark.parametrize("reason", ["invalid_model_response", "boundary_order", "coarse_boundary_count"])
+def test_complete_evaluation_counts_recorded_pre_final_constraint_failures(
+    tmp_path: Path, reason: str,
+) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=100, status="needs_review")
+    path = work / "episodes" / "episode_000000.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["final_annotation"] = None
+    record["review_reasons"] = [reason]
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    from qwen_annotate.evaluation import evaluate_complete
+
+    metrics = evaluate_complete(work, golden)
+    assert metrics.constraint_violation_count == 1
+    assert metrics.constraint_violation_blocked_count == 1
+    assert metrics.constraint_blocking_rate == 1.0
+
+
+def test_complete_evaluation_rejects_dagger_workspace(tmp_path: Path) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=100)
+    path = work / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["mode"] = "dagger_patch"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    from qwen_annotate.evaluation import evaluate_complete
+
+    with pytest.raises(ValueError, match="complete workspace"):
+        evaluate_complete(work, golden)
+
+
+def test_complete_evaluation_rejects_golden_dagger_extension(tmp_path: Path) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=100)
+    path = golden / "meta" / "lerobot_annotations.json"
+    annotations = json.loads(path.read_text(encoding="utf-8"))
+    annotations["episodes"]["0"]["start_subtask_index"] = 0
+    path.write_text(json.dumps(annotations), encoding="utf-8")
+
+    from qwen_annotate.evaluation import evaluate_complete
+
+    with pytest.raises(ValueError, match="complete golden"):
+        evaluate_complete(work, golden)

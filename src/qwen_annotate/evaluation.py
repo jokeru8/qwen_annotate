@@ -19,6 +19,21 @@ from .workspace import EpisodeRecord, RunManifest
 
 EvaluationStatus = Literal["pending", "coarse_done", "refine_done", "accepted", "needs_review", "failed"]
 
+_DETERMINISTIC_REJECTION_REASONS = frozenset({
+    "invalid_model_response",
+    "illegal_coarse_sequence",
+    "coarse_boundary_count",
+    "coarse_boundary_order",
+    "refine_transition_mismatch",
+    "start_subtask_range",
+    "complete_start_index",
+    "complete_boundary_count",
+    "dagger_suffix_length",
+    "boundary_order",
+    "boundary_range",
+    "segment_too_short",
+})
+
 
 class _FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
@@ -226,7 +241,8 @@ def make_dagger_views(
                     kind="suffix",
                 ))
             singleton_end = right - minimum
-            if singleton_end - start >= minimum:
+            has_next_subtask = subtask_index < len(boundaries[episode])
+            if has_next_subtask and singleton_end - start >= minimum:
                 result.append(DaggerView(
                     source_episode=episode,
                     start_frame=start,
@@ -244,6 +260,7 @@ def evaluate_dagger(
     sampler: Callable[[int, int, int], object],
     inference: Callable[[object], DaggerPrediction],
     fps: float,
+    min_segment_frames: int = 1,
     obvious_error_threshold_seconds: float = 1.0,
 ) -> EvaluationMetrics:
     """Evaluate virtual views while keeping frame-range sampling explicit."""
@@ -253,6 +270,7 @@ def evaluate_dagger(
     predicted_starts: dict[int, int] = {}
     golden_starts: dict[int, int] = {}
     violations: dict[int, bool] = {}
+    minimum = _positive_integer(min_segment_frames, "min_segment_frames")
     for index, raw_view in enumerate(views):
         view = DaggerView.model_validate(raw_view)
         if view.end_frame <= view.start_frame:
@@ -264,7 +282,9 @@ def evaluate_dagger(
         statuses[index] = prediction.status
         golden_starts[index] = view.expected_start_subtask_index
         predicted_starts[index] = prediction.start_subtask_index
-        violations[index] = prediction.constraint_violated
+        violations[index] = prediction.constraint_violated or _dagger_prediction_violates(
+            view, prediction, minimum
+        )
     return evaluate_boundaries(
         predicted, golden, statuses, fps,
         predicted_start_indices=predicted_starts,
@@ -284,11 +304,14 @@ def evaluate_complete(
     work = Path(work_dir).resolve()
     golden_root = Path(golden_dataset).resolve()
     manifest = RunManifest.model_validate_json(json.dumps(_read_object(work / "manifest.json")))
+    if manifest.mode != "complete":
+        raise ValueError("evaluate_complete requires a complete workspace manifest")
     annotations = _load_golden(golden_root, manifest)
     predicted: dict[int, list[int]] = {}
     predicted_starts: dict[int, int] = {}
     statuses: dict[int, str] = {}
     violations: dict[int, bool] = {}
+    records: dict[int, EpisodeRecord] = {}
     expected_indices = set(range(manifest.total_episodes))
     if set(annotations.boundaries) != expected_indices:
         raise ValueError("golden annotation episode indices do not match the workspace manifest")
@@ -298,6 +321,7 @@ def evaluate_complete(
         ))
         if record.episode_index != index:
             raise ValueError("workspace episode index does not match its filename")
+        records[index] = record
         statuses[index] = record.status
         if record.final_annotation is None:
             continue
@@ -305,9 +329,11 @@ def evaluate_complete(
         predicted[index] = list(annotation.boundaries)
         predicted_starts[index] = annotation.start_subtask_index
         violations[index] = bool(validate_annotation(
-            annotation, manifest.mode, len(manifest.subtasks), manifest.episode_lengths[index],
+            annotation, "complete", len(manifest.subtasks), manifest.episode_lengths[index],
             manifest.min_segment_frames,
-        ))
+        )) or _record_has_deterministic_rejection(record)
+    for index in expected_indices - set(violations):
+        violations[index] = _record_has_deterministic_rejection(records[index])
     return evaluate_boundaries(
         predicted,
         annotations.boundaries,
@@ -363,18 +389,17 @@ def _load_golden(root: Path, manifest: RunManifest) -> _Golden:
         index = int(key)
         if not isinstance(raw, dict) or raw.get("episode_index") != index:
             raise ValueError(f"golden annotation episode {key} has an invalid identity")
+        if "start_subtask_index" in raw:
+            raise ValueError("complete golden annotations must not carry start_subtask_index")
         if raw.get("high_level_instruction") != manifest.high_level_instruction:
             raise ValueError(f"golden annotation episode {key} has a mismatched high-level instruction")
         current = _boundary_sequence(raw.get("boundaries"), f"golden episode {key} boundaries")
-        start = raw.get("start_subtask_index", 0)
-        if type(start) is not int or start < 0:
-            raise ValueError(f"golden annotation episode {key} has an invalid start_subtask_index")
+        start = 0
         if index not in lengths:
             raise ValueError(f"golden annotation episode {key} has no episode metadata")
-        mode = "dagger_patch" if "start_subtask_index" in raw else "complete"
         issues = validate_annotation(
             FinalAnnotation(start_subtask_index=start, boundaries=current),
-            mode, len(manifest.subtasks), lengths[index], 1,
+            "complete", len(manifest.subtasks), lengths[index], 1,
         )
         if issues:
             raise ValueError(f"golden annotation episode {key} is invalid: {issues[0].code}")
@@ -386,6 +411,36 @@ def _load_golden(root: Path, manifest: RunManifest) -> _Golden:
         if index >= len(manifest.episode_lengths) or manifest.episode_lengths[index] != length:
             raise ValueError("golden episode lengths do not match workspace manifest")
     return _Golden(boundaries, starts, fps)
+
+
+def _dagger_prediction_violates(
+    view: DaggerView,
+    prediction: DaggerPrediction,
+    min_segment_frames: int,
+) -> bool:
+    """Independently enforce virtual-view sequence and frame constraints."""
+    boundaries = prediction.boundaries
+    length = view.end_frame - view.start_frame
+    wrong_identity = prediction.start_subtask_index != view.expected_start_subtask_index
+    wrong_count = len(boundaries) != len(view.expected_boundaries_relative)
+    singleton_transition = view.kind == "singleton" and bool(boundaries)
+    wrong_order = any(left >= right for left, right in zip(boundaries, boundaries[1:]))
+    wrong_range = any(boundary <= 0 or boundary >= length for boundary in boundaries)
+    points = [0, *boundaries, length]
+    short_segment = any(
+        right - left < min_segment_frames for left, right in zip(points, points[1:])
+    )
+    return any((
+        wrong_identity, wrong_count, singleton_transition, wrong_order, wrong_range, short_segment,
+    ))
+
+
+def _record_has_deterministic_rejection(record: EpisodeRecord) -> bool:
+    return bool(
+        record.validation_issues
+        or _DETERMINISTIC_REJECTION_REASONS.intersection(record.review_reasons)
+        or record.failure_category == "invalid_model_response"
+    )
 
 
 def launch_gate_report(metrics: EvaluationMetrics) -> dict[str, Any]:
