@@ -20,8 +20,6 @@ from .workspace import (
     EpisodeRecord,
     RunManifest,
     WorkspaceStore,
-    compute_run_fingerprint,
-    compute_source_fingerprint,
 )
 
 
@@ -296,12 +294,15 @@ def evaluate_complete(
     work = Path(work_dir).resolve()
     golden_root = Path(golden_dataset).resolve()
     store = WorkspaceStore(work)
-    manifest = store._load_manifest()  # secure workspace peer loader
+    manifest = store.load_manifest()
+    if manifest.mode != "complete":
+        raise ValueError("evaluate_complete requires a complete workspace manifest")
+    verified_manifest, runtime_config = store.load_manifest_with_provenance()
+    if verified_manifest != manifest:
+        raise ValueError("workspace manifest changed during evaluation startup")
     summary = store.summary()
     if summary["total"] != manifest.total_episodes:
         raise ValueError("workspace episode count does not match manifest")
-    if manifest.mode != "complete":
-        raise ValueError("evaluate_complete requires a complete workspace manifest")
     annotations = _load_golden(golden_root, manifest)
     predicted: dict[int, list[int]] = {}
     predicted_starts: dict[int, int] = {}
@@ -315,8 +316,7 @@ def evaluate_complete(
         record = store.load_episode(index)
         if record.episode_index != index:
             raise ValueError("workspace episode index does not match its filename")
-        if record.run_fingerprint != manifest.run_fingerprint:
-            raise ValueError("episode run fingerprint does not match workspace manifest")
+        store.validate_record_provenance(record, manifest=manifest)
         records[index] = record
         statuses[index] = record.status
         if record.final_annotation is None:
@@ -330,7 +330,7 @@ def evaluate_complete(
         )) or _record_has_deterministic_rejection(record)
     for index in expected_indices - set(violations):
         violations[index] = _record_has_deterministic_rejection(records[index])
-    _validate_source_provenance(work, manifest, records)
+    _validate_source_provenance(store, runtime_config, manifest, records)
     return evaluate_boundaries(
         predicted,
         annotations.boundaries,
@@ -441,30 +441,12 @@ def _record_has_deterministic_rejection(record: EpisodeRecord) -> bool:
 
 
 def _validate_source_provenance(
-    work: Path,
+    store: WorkspaceStore,
+    config: AnnotationConfig,
     manifest: RunManifest,
     records: Mapping[int, EpisodeRecord],
 ) -> DatasetIndex:
     """Re-inspect the authoritative source and verify cached episode provenance."""
-    raw = json.loads(json.dumps(manifest.effective_config, allow_nan=False))
-    if not isinstance(raw, dict):
-        raise ValueError("manifest effective_config must be an object")
-    model = raw.get("model")
-    if not isinstance(model, dict):
-        raise ValueError("manifest model provenance is invalid")
-    model["api_key"] = "evaluation-local-redacted"
-    config = AnnotationConfig.model_validate_json(json.dumps(raw), strict=True)
-    if (
-        config.source.resolve() != manifest.dataset_root.resolve()
-        or config.work_dir.resolve() != work
-        or config.mode != manifest.mode
-        or config.high_level_instruction != manifest.high_level_instruction
-        or config.subtasks != manifest.subtasks
-        or config.sampling.min_segment_frames != manifest.min_segment_frames
-        or config.model.name != manifest.model_repo
-        or compute_run_fingerprint(config, manifest.model_revision) != manifest.run_fingerprint
-    ):
-        raise ValueError("manifest run/model provenance is invalid")
     dataset = inspect_dataset(config, probe=probe_video)
     if (
         dataset.root.resolve() != manifest.dataset_root.resolve()
@@ -480,8 +462,7 @@ def _validate_source_provenance(
         raise ValueError("current source task instruction does not match workspace manifest")
     for episode in dataset.episodes:
         record = records[episode.episode_index]
-        if record.source_fingerprint != compute_source_fingerprint(dataset.root, episode):
-            raise ValueError(f"episode {episode.episode_index} source fingerprint is stale")
+        store.validate_record_provenance(record, manifest=manifest, episode=episode)
     return dataset
 
 

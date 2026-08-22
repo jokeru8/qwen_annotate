@@ -452,6 +452,89 @@ class WorkspaceStore:
             self._assert_safe_layout()
             return self._load_episode_unlocked(index)
 
+    def load_manifest(self) -> RunManifest:
+        """Securely load the authoritative typed workspace manifest."""
+        with self._locked():
+            self._assert_safe_layout()
+            return self._load_manifest()
+
+    def load_manifest_with_provenance(self) -> tuple[RunManifest, AnnotationConfig]:
+        """Load a manifest and verify its immutable run/prompt/config provenance.
+
+        The run hash is recomputed from the untouched persisted lexical paths.
+        Relative paths have no stable resolution base in the v1 manifest, so they
+        are used only for hashing; the returned runtime config is anchored to the
+        authoritative absolute manifest dataset and this workspace root.
+        """
+        with self._locked():
+            self._assert_safe_layout()
+            manifest = self._load_manifest()
+            raw = json.loads(_canonical_json(manifest.effective_config))
+            if not isinstance(raw, dict):
+                raise ValueError("manifest effective_config must be an object")
+            model = raw.get("model")
+            if not isinstance(model, dict):
+                raise ValueError("manifest model provenance is invalid")
+            model["api_key"] = "workspace-local-redacted"
+            persisted = AnnotationConfig.model_validate_json(_canonical_json(raw), strict=True)
+            if manifest.prompt_version != PROMPT_VERSION:
+                raise ValueError("manifest prompt version does not match the supported prompt contract")
+            if (
+                (persisted.source.is_absolute()
+                 and persisted.source.resolve() != manifest.dataset_root.resolve())
+                or (persisted.work_dir.is_absolute() and persisted.work_dir.resolve() != self.root)
+                or persisted.mode != manifest.mode
+                or persisted.high_level_instruction != manifest.high_level_instruction
+                or persisted.subtasks != manifest.subtasks
+                or persisted.sampling.min_segment_frames != manifest.min_segment_frames
+                or persisted.model.name != manifest.model_repo
+                or compute_run_fingerprint(persisted, manifest.model_revision) != manifest.run_fingerprint
+            ):
+                raise ValueError("manifest run/prompt/config provenance is invalid")
+
+            runtime_raw = json.loads(_canonical_json(raw))
+            runtime_raw["source"] = str(manifest.dataset_root)
+            runtime_raw["work_dir"] = str(self.root)
+            return manifest, AnnotationConfig.model_validate_json(
+                _canonical_json(runtime_raw), strict=True
+            )
+
+    def validate_record_provenance(
+        self,
+        record: EpisodeRecord,
+        *,
+        manifest: RunManifest | None = None,
+        episode: EpisodeInfo | None = None,
+    ) -> None:
+        """Fail closed when an episode belongs to another run/source/model context."""
+        record = EpisodeRecord.model_validate(record.model_dump())
+        with self._locked():
+            self._assert_safe_layout()
+            authoritative = self._load_manifest()
+            if manifest is not None and manifest != authoritative:
+                raise ValueError("supplied manifest is not the authoritative workspace manifest")
+            manifest = authoritative
+            if record.episode_index >= manifest.total_episodes:
+                raise ValueError("episode identity is outside the workspace manifest")
+            if record.run_fingerprint != manifest.run_fingerprint:
+                raise ValueError("episode run fingerprint does not match workspace manifest")
+            if record.status == "accepted" and record.decision_source == "model":
+                if record.prompt_version != manifest.prompt_version:
+                    raise ValueError("model prompt version does not match workspace manifest")
+                if record.model_revision != manifest.model_revision:
+                    raise ValueError("model revision does not match workspace manifest")
+            self._validate_final_annotation(record)
+            if episode is not None:
+                if (
+                    episode.episode_index != record.episode_index
+                    or episode.length != manifest.episode_lengths[record.episode_index]
+                ):
+                    raise ValueError("source episode identity does not match workspace manifest")
+                if record.source_fingerprint != compute_source_fingerprint(
+                    manifest.dataset_root, episode
+                ):
+                    raise ValueError(f"episode {record.episode_index} source fingerprint is stale")
+
     def save_episode(self, record: EpisodeRecord) -> None:
         """Atomically save a legal transition, then refresh the recoverable summary.
 

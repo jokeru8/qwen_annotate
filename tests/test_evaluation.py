@@ -17,6 +17,7 @@ from qwen_annotate.evaluation import (
     make_dagger_views,
 )
 from qwen_annotate.lerobot import EpisodeInfo, VideoProbe
+from qwen_annotate.prompts import PROMPT_VERSION
 from qwen_annotate.workspace import compute_run_fingerprint, compute_source_fingerprint
 from tests.fixtures import make_lerobot_fixture
 
@@ -248,7 +249,7 @@ def _write_evaluation_fixture(root: Path, *, boundary: int, status: str = "accep
         "camera_keys": ["observation.images.cam"], "total_episodes": 1, "total_frames": 300,
         "episode_lengths": [300], "mode": "complete", "high_level_instruction": "task",
         "subtasks": [{"skill": "a", "text": "A"}, {"skill": "b", "text": "B"}],
-        "code_version": "0.1.0", "prompt_version": "v1", "model_repo": config.model.name,
+        "code_version": "0.1.0", "prompt_version": PROMPT_VERSION, "model_repo": config.model.name,
         "model_revision": revision,
         "effective_config": config.model_dump(mode="json", exclude={"model": {"api_key"}}),
         "min_segment_frames": 8, "run_fingerprint": run_sha,
@@ -399,6 +400,85 @@ def test_source_provenance_preserves_hashed_lexical_config_paths(tmp_path: Path)
     from qwen_annotate.evaluation import evaluate_complete
 
     assert evaluate_complete(work, golden).false_accept_count == 0
+
+
+def test_relative_hashed_paths_evaluate_from_a_different_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=100)
+    manifest_path = work / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["effective_config"]["source"] = "source"
+    manifest["effective_config"]["work_dir"] = "work"
+    monkeypatch.chdir(tmp_path)
+    config_payload = json.loads(json.dumps(manifest["effective_config"]))
+    config_payload["model"]["api_key"] = "local"
+    relative_config = AnnotationConfig.model_validate(config_payload)
+    run_sha = compute_run_fingerprint(relative_config, manifest["model_revision"])
+    manifest["run_fingerprint"] = run_sha
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    episode_path = work / "episodes" / "episode_000000.json"
+    episode = json.loads(episode_path.read_text(encoding="utf-8"))
+    episode["run_fingerprint"] = run_sha
+    episode_path.write_text(json.dumps(episode), encoding="utf-8")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    from qwen_annotate.evaluation import evaluate_complete
+
+    assert evaluate_complete(work, golden).false_accept_count == 0
+
+
+@pytest.mark.parametrize("field,value", [
+    ("prompt_version", "other-supported-looking-prompt"),
+    ("model_revision", "c" * 40),
+])
+def test_model_accepted_record_provenance_tampering_creates_no_report(
+    tmp_path: Path, field: str, value: str,
+) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=100)
+    manifest = json.loads((work / "manifest.json").read_text(encoding="utf-8"))
+    episode_path = work / "episodes" / "episode_000000.json"
+    episode = json.loads(episode_path.read_text(encoding="utf-8"))
+    episode.update({
+        "decision_source": "model",
+        "prompt_version": manifest["prompt_version"],
+        "model_revision": manifest["model_revision"],
+        "sampling_details": {"evaluation_fixture": True},
+    })
+    episode[field] = value
+    episode_path.write_text(json.dumps(episode), encoding="utf-8")
+    output = tmp_path / f"tampered-{field}.json"
+
+    from qwen_annotate.evaluation import evaluate_complete
+
+    with pytest.raises(ValueError, match=field.replace("_", " ")):
+        evaluate_complete(work, golden)
+    result = CliRunner().invoke(
+        app, ["evaluate", str(work), "--golden", str(golden), "--output", str(output)],
+    )
+    assert result.exit_code == 1
+    assert not output.exists()
+
+
+def test_manifest_prompt_contract_tampering_creates_no_report(tmp_path: Path) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=100)
+    manifest_path = work / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["prompt_version"] = "tampered-prompt-contract"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    output = tmp_path / "tampered-manifest-prompt.json"
+
+    from qwen_annotate.evaluation import evaluate_complete
+
+    with pytest.raises(ValueError, match="prompt version"):
+        evaluate_complete(work, golden)
+    result = CliRunner().invoke(
+        app, ["evaluate", str(work), "--golden", str(golden), "--output", str(output)],
+    )
+    assert result.exit_code == 1
+    assert not output.exists()
 
 
 def test_complete_evaluation_rejects_dagger_workspace(tmp_path: Path) -> None:
