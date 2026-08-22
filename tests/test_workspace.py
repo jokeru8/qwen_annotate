@@ -7,10 +7,12 @@ from threading import Barrier, Thread
 import pytest
 from pydantic import ValidationError
 
+from qwen_annotate.coarse import CoarseDecision
 from qwen_annotate.config import Subtask
 from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo
 from qwen_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
 from qwen_annotate.prompts import PROMPT_VERSION
+from qwen_annotate.refine import RefineDecision
 from qwen_annotate.workspace import (
     EpisodeRecord,
     RunManifest,
@@ -69,6 +71,51 @@ def refine_result() -> RefineResult:
         confidence=0.9,
         visible_cues=["release"],
     )
+
+
+def zero_transition_review_audit() -> tuple[CoarseDecision, RefineDecision]:
+    attempt = CoarseResult(
+        start_subtask_index=0,
+        observed_subtask_indices=[0],
+        coarse_boundaries=[],
+        confidence=0.9,
+    )
+    coarse = CoarseDecision(
+        mode="complete",
+        subtask_count=1,
+        frame_count=10,
+        status="coarse_done",
+        attempts=(attempt, attempt.model_copy(deep=True)),
+        reasons=(),
+        start_subtask_index=0,
+        observed_subtask_indices=(0,),
+        boundary_centers=(),
+        sampled_frame_indices=((0, 9), (0, 9)),
+    )
+    refined = RefineDecision(
+        mode="complete",
+        subtask_count=1,
+        frame_count=10,
+        min_segment_frames=11,
+        agreement_tolerance_frames=12,
+        start_subtask_index=0,
+        observed_subtask_indices=(0,),
+        coarse_boundary_centers=(),
+        source_fps=5.0,
+        refine_window_seconds=2.5,
+        refine_fps=8.0,
+        dense_radius_seconds=0.5,
+        camera_order=("cam.eye",),
+        broad_radius_frames=12,
+        base_broad_stride=1,
+        dense_radius_frames=2,
+        status="needs_review",
+        attempts=(),
+        provenance=(),
+        reasons=("segment_too_short",),
+        candidate_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[]),
+    )
+    return coarse, refined
 
 
 def transition(record: EpisodeRecord, status: str, **updates) -> EpisodeRecord:
@@ -256,6 +303,58 @@ def test_refine_done_without_refine_attempts_requires_zero_transition_final(
     }
     with pytest.raises(ValidationError, match="refine_done"):
         EpisodeRecord.model_validate(data)
+
+
+def test_audited_zero_transition_review_forbids_unrelated_final_annotation_on_model_save_and_replay(
+    tmp_path: Path,
+) -> None:
+    coarse_decision, refine_decision = zero_transition_review_audit()
+    base = pending()
+    coarse = transition(base, "coarse_done", coarse_attempts=[
+        CoarseResult.model_validate(item.model_dump(mode="json"))
+        for item in coarse_decision.attempts
+    ])
+    details = {
+        "coarse_decision": coarse_decision.model_dump(mode="json"),
+        "refine_decision": refine_decision.model_dump(mode="json"),
+    }
+    valid = transition(coarse, "refine_done", sampling_details=details)
+    assert valid.final_annotation is None
+
+    adversarial_payload = valid.model_dump() | {
+        "final_annotation": {"start_subtask_index": 0, "boundaries": [5]}
+    }
+    with pytest.raises(ValidationError, match="refine_done|annotation"):
+        EpisodeRecord.model_validate(adversarial_payload)
+
+    save_store = WorkspaceStore(tmp_path / "save")
+    save_store.create_layout()
+    save_store.save_episode(base)
+    save_store.save_episode(coarse)
+    bypassed = valid.model_copy(
+        update={"final_annotation": FinalAnnotation(start_subtask_index=0, boundaries=[5])}
+    )
+    with pytest.raises(ValidationError, match="refine_done|annotation"):
+        save_store.save_episode(bypassed)
+
+    replay_store = WorkspaceStore(tmp_path / "replay")
+    replay_store.create_layout()
+    replay_store.save_episode(base)
+    replay_store.save_episode(coarse)
+    episode_path = replay_store.root / "episodes" / "episode_000000.json"
+    adversarial_json = valid.model_dump(mode="json") | {
+        "final_annotation": {"start_subtask_index": 0, "boundaries": [5]}
+    }
+    episode_path.write_text(json.dumps(adversarial_json))
+    with pytest.raises(ValueError, match="Invalid episode record"):
+        replay_store.load_episode(0)
+
+    valid_store = WorkspaceStore(tmp_path / "valid")
+    valid_store.create_layout()
+    valid_store.save_episode(base)
+    valid_store.save_episode(coarse)
+    valid_store.save_episode(valid)
+    assert valid_store.load_episode(0) == valid
 
 
 def test_needs_review_can_only_be_accepted_by_a_human(tmp_path: Path) -> None:

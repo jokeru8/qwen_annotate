@@ -181,6 +181,7 @@ def _is_audited_zero_transition_review(record: EpisodeRecord) -> bool:
         coarse.status == "coarse_done"
         and refined.status == "needs_review"
         and not refined.attempts
+        and record.final_annotation is None
         and candidate is not None
         and tuple(candidate.boundaries) == ()
         and refined.annotation is None
