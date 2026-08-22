@@ -28,7 +28,7 @@ def config(mode: str = "complete", subtasks=None) -> AnnotationConfig:
 
 def test_coarse_prompt_contains_ordered_template_and_required_rules():
     prompt = build_coarse_prompt(config("dagger_patch", [{"skill": "pick", "text": "pick"}, {"skill": "place", "text": "place"}]), 2, 20, 3)
-    assert PROMPT_VERSION == "coarse-v1/refine-v1"
+    assert PROMPT_VERSION == "coarse-v2/refine-v1"
     context = json.loads(prompt.split("BEGIN_UNTRUSTED_CONTEXT_JSON\n", 1)[1].split("\nEND_UNTRUSTED_CONTEXT_JSON", 1)[0])
     assert context["subtasks"] == [{"index": 0, "skill": "pick", "text": "pick"}, {"index": 1, "skill": "place", "text": "place"}]
     assert "Do not invent or rewrite labels" in prompt
@@ -55,6 +55,20 @@ def test_coarse_prompt_defines_n_and_concrete_transition_frame_range():
     assert "Define N as len(template subtasks) = 2." in prompt
     assert "estimated_frame values must be strictly increasing integers" in prompt
     assert "concrete valid transition range [1, 4]" in prompt
+
+
+def test_coarse_prompt_reserves_exact_frame_uncertainty_for_refine():
+    """Catches treating normal sparse-frame localization error as a coarse rejection."""
+    prompt = build_coarse_prompt(
+        config("complete", [{"skill": "a", "text": "A"}, {"skill": "b", "text": "B"}]),
+        0,
+        100,
+        0,
+    )
+    assert "Only report uncertainties when you cannot determine" in prompt
+    assert "subtask order, the starting subtask, or an approximate transition neighborhood" in prompt
+    assert "Normal uncertainty about the exact transition frame is handled by refine" in prompt
+    assert "uncertainties=[]" in prompt
 
 
 def test_coarse_prompt_handles_one_frame_transition_range():

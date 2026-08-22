@@ -7,7 +7,7 @@ from .config import AnnotationConfig
 from .models import CoarseResult, RefineResult
 
 
-PROMPT_VERSION = "coarse-v1/refine-v1"
+PROMPT_VERSION = "coarse-v2/refine-v1"
 
 
 def _integer(name: str, value: object) -> int:
@@ -80,7 +80,8 @@ def build_coarse_prompt(config: AnnotationConfig, episode_index: int, frame_coun
             if frame_count > 1
             else "There are no valid transition-frame integers because the concrete valid transition range is empty for a one-frame episode; do not emit coarse boundaries."
         ),
-        "If evidence is insufficient, report uncertainties and do not guess.",
+        "Only report uncertainties when you cannot determine the subtask order, the starting subtask, or an approximate transition neighborhood from the sparse evidence.",
+        "Normal uncertainty about the exact transition frame is handled by refine; when order, start, and approximate neighborhoods are clear, set uncertainties=[] and provide the best approximate estimated_frame without guessing false semantic certainty.",
         "Return JSON only, matching the supplied coarse response schema; do not include commentary or hidden reasoning.",
     ]
     return "\n".join(lines)

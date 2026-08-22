@@ -141,6 +141,8 @@ uv run qwen-annotate status WORK_DIR --json
 
 每个 episode 的阶段是 `pending → coarse_done → refine_done → accepted`。coarse 使用主相机、覆盖完整时间范围的两套独立稀疏采样，必须在合法模板序列上达成一致。refine 对每个 transition 先用配置相机做 broad window，再在候选点附近做 dense 连续帧判断；最终边界是“下一 subtask 的第一帧”。模型只能引用 prompt 中带整数 index 的模板，不能发明标签。
 
+当前 prompt 版本是 `coarse-v2/refine-v1`。coarse 的 `uncertainties` 仅表示稀疏证据不足以判断 subtask 顺序、起始 subtask 或大致过渡邻域；若只是无法从稀疏帧确定精确 transition frame，应返回最合理的粗略中心并保持 `uncertainties=[]`，由 refine 阶段完成精确定位。
+
 重复执行同一命令会跳过 `accepted`、`needs_review` 和 `failed`，并从持久的 `coarse_done`/`refine_done` 继续。每个 episode 保存 source SHA-256 指纹；run fingerprint 绑定完整有效配置（API key 除外）、`PROMPT_VERSION`、model repo 和固定 revision。源 payload、prompt、模型或行为配置发生变化时，旧 workspace 会 fail closed，而不是复用过期结果。当前 CLI 没有“强制清缓存”选项；需要重跑时使用新的空 `work_dir`，保留旧目录用于审计。
 
 workspace 内 `episodes/*.json` 是权威状态，`summary.json` 可恢复，`logs/run.jsonl` 是带 event id 的派生审计链。不要手工修改这些文件。
