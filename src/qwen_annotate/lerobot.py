@@ -141,6 +141,11 @@ def inspect_dataset(
                 raise ValueError(
                     f"Episode {episode_index} references task {task!r}, absent from meta/tasks.jsonl"
                 )
+        if len(episode_tasks) != 1:
+            raise ValueError(
+                "First release supports exactly one task per episode; "
+                f"episode {episode_index} has {len(episode_tasks)}"
+            )
         task = episode_tasks[0]
         values = {
             "episode_chunk": episode_index // chunks_size,
@@ -265,7 +270,10 @@ def _task_texts(path: Path) -> dict[int, str]:
         task_index = _nonnegative_int(row, "task_index", f"tasks.jsonl row {row_number}")
         if task_index in tasks:
             raise ValueError(f"tasks.jsonl has duplicate task_index {task_index}")
-        tasks[task_index] = _required_string(row, "task", f"tasks.jsonl row {row_number}")
+        task = _required_string(row, "task", f"tasks.jsonl row {row_number}")
+        if task in tasks.values():
+            raise ValueError(f"tasks.jsonl has duplicate task text {task!r}")
+        tasks[task_index] = task
     if set(tasks) != set(range(len(tasks))):
         raise ValueError("tasks.jsonl task_index values must be contiguous from 0 through N-1")
     return tasks

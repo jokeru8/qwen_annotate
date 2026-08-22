@@ -246,6 +246,44 @@ def test_rejects_unknown_secondary_episode_task(tmp_path: Path) -> None:
         inspect_dataset(make_config(root, tmp_path / "work"), fixed_probe)
 
 
+def test_rejects_valid_multi_task_episode_for_singular_interface(tmp_path: Path) -> None:
+    root = make_lerobot_fixture(tmp_path, [12], 5.0, ["cam.eye"])
+    (root / "meta/tasks.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"task_index": 0, "task": "arrange items"}),
+                json.dumps({"task_index": 1, "task": "another valid task"}),
+            ]
+        )
+        + "\n"
+    )
+    episodes = root / "meta/episodes.jsonl"
+    row = json.loads(episodes.read_text().strip())
+    row["tasks"].append("another valid task")
+    episodes.write_text(json.dumps(row) + "\n")
+    write_metadata(root, metadata(root) | {"total_tasks": 2})
+
+    with pytest.raises(ValueError, match="exactly one task per episode"):
+        inspect_dataset(make_config(root, tmp_path / "work"), fixed_probe)
+
+
+def test_rejects_duplicate_task_texts_at_different_indices(tmp_path: Path) -> None:
+    root = make_lerobot_fixture(tmp_path, [12], 5.0, ["cam.eye"])
+    (root / "meta/tasks.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"task_index": 0, "task": "arrange items"}),
+                json.dumps({"task_index": 1, "task": "arrange items"}),
+            ]
+        )
+        + "\n"
+    )
+    write_metadata(root, metadata(root) | {"total_tasks": 2})
+
+    with pytest.raises(ValueError, match="duplicate task text"):
+        inspect_dataset(make_config(root, tmp_path / "work"), fixed_probe)
+
+
 @pytest.mark.parametrize("field", ["total_tasks", "total_chunks"])
 def test_rejects_task_and_chunk_count_mismatches(tmp_path: Path, field: str) -> None:
     root = make_lerobot_fixture(tmp_path, [12, 12, 12], 5.0, ["cam.eye"])
