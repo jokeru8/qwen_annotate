@@ -25,7 +25,9 @@ from qwen_annotate.stats import recompute_stats, recompute_video_stats
 def _write_video(path: Path, camera_value: int, episode_index: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     container = av.open(str(path), "w")
-    stream = container.add_stream("libx264", rate=10)
+    # MPEG-4 Part 2 is shipped by the PyAV/FFmpeg test environment, unlike the
+    # optional libx264 encoder which depends on how FFmpeg was built.
+    stream = container.add_stream("mpeg4", rate=10)
     stream.width, stream.height, stream.pix_fmt = 16, 12, "yuv420p"
     try:
         for frame_index in range(16):

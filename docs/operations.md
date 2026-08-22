@@ -161,7 +161,7 @@ workspace 内 `episodes/*.json` 是权威状态，`summary.json` 可恢复，`lo
 - coarse：`coarse_sequence_disagreement`、`illegal_coarse_sequence`、`coarse_boundary_count`、`coarse_boundary_order`、`coarse_uncertain`、`invalid_model_response`。
 - refine/硬约束：`refine_boundary_disagreement`、`refine_transition_mismatch`、`camera_evidence_conflict`、`start_subtask_range`、`complete_start_index`、`complete_boundary_count`、`dagger_suffix_length`、`boundary_order`、`boundary_range`、`segment_too_short`。
 
-`failed.failure_category` 为 `model_oom`、`model_call`、`source_or_video`、`unexpected_error` 或 `workspace_state`。完整详情和每次 attempt 在 episode JSON；CLI 只输出脱敏摘要。
+`failed.failure_category` 为 `model_oom`、`model_call`、`source_or_video`、`unexpected_error` 或 `workspace_state`。episode JSON 保存 coarse/refine 成功解析后的结构化 attempt、规范化 category/reason 和采样 provenance；对于请求异常或无效模型响应，它不会保存客户端的 `attempt_count`、响应摘录或逐次请求诊断。CLI 同样只输出脱敏摘要。排查 timeout、5xx、限流、worker 退出或 OOM 的逐请求细节时，应同时保留 vLLM server 的 stdout/stderr 日志和外部负载均衡日志，并按 episode 运行时段与 workspace `logs/run.jsonl` 的 UTC transition 时间关联；不要期待从 workspace 还原未持久化的服务响应。
 
 生成离线页面并导入浏览器导出的严格 decision JSON：
 
