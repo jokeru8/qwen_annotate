@@ -23,6 +23,30 @@ def test_release_validator_is_independent_and_strict(tmp_path: Path) -> None:
         ReleaseReport.model_validate(report.model_dump() | {"episode_count": "2"})
 
 
+def test_release_validator_requires_both_stats_artifacts(tmp_path: Path) -> None:
+    """Catches deleting both stats files to bypass all statistics validation."""
+    _, work, services = _fixture(tmp_path)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    (output / "meta/stats.json").unlink()
+    (output / "meta/episodes_stats.jsonl").unlink()
+    with pytest.raises(ValueError, match="stats"):
+        validate_release(output, services=services)
+
+
+def test_release_validator_cross_checks_declared_camera_dimensions(tmp_path: Path) -> None:
+    """Catches video shape metadata that disagrees with the decoded/probed payload."""
+    _, work, services = _fixture(tmp_path)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    info_path = output / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    info["features"]["cam.eye"]["shape"] = [5, 6, 3]
+    info_path.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match="shape"):
+        validate_release(output, services=services)
+
+
 @pytest.mark.parametrize("mutation", ["instruction", "boundary", "forbidden", "dagger_mixed", "episode_key"])
 def test_release_validator_rejects_annotation_corruption(tmp_path: Path, mutation: str) -> None:
     source, work, services = _fixture(tmp_path)

@@ -59,6 +59,41 @@ def _fixture(tmp_path: Path, *, mode: str = "complete") -> tuple[Path, Path, dic
         video.write_bytes((f"video-{i}").encode())
         episodes.append(EpisodeInfo(episode_index=i, length=length, task="Arrange.", parquet=parquet, videos={"cam.eye": video}))
     (source / "meta/episodes.jsonl").write_text("\n".join(rows) + "\n")
+    def feature_stats(low: float, high: float, count: int):
+        midpoint = (low + high) / 2
+        return {
+            "min": [low], "max": [high], "mean": [midpoint], "std": [0.0], "count": [count],
+            "q01": [low], "q10": [low], "q50": [midpoint], "q90": [high], "q99": [high],
+        }
+    aggregate_stats = {
+        "frame_index": feature_stats(0, 19, 40),
+        "episode_index": feature_stats(0, 1, 40),
+        "index": feature_stats(0, 39, 40),
+        "task_index": feature_stats(0, 0, 40),
+        "timestamp": feature_stats(0, 1.9, 40),
+        "cam.eye": {
+            # Historical LeRobot releases sampled pixels for image stats.
+            metric: ([24] if metric == "count" else [[[value]], [[value]], [[value]]])
+            for metric, value in {
+                "min": 0.0, "max": 1.0, "mean": 0.5, "std": 0.1,
+                "q01": 0.0, "q10": 0.1, "q50": 0.5, "q90": 0.9, "q99": 1.0,
+                "count": 0,
+            }.items()
+        },
+    }
+    (source / "meta/stats.json").write_text(json.dumps(aggregate_stats))
+    episode_stats = []
+    for i in range(2):
+        episode_stats.append({"episode_index": i, "stats": {
+            "frame_index": feature_stats(0, 19, 20),
+            "episode_index": feature_stats(i, i, 20),
+            "index": feature_stats(i * 20, i * 20 + 19, 20),
+            "task_index": feature_stats(0, 0, 20),
+            "timestamp": feature_stats(0, 1.9, 20),
+        }})
+    (source / "meta/episodes_stats.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in episode_stats) + "\n"
+    )
     cfg = AnnotationConfig.model_validate({
         "source": source, "work_dir": work, "mode": mode,
         "high_level_instruction": "Arrange.", "primary_camera": "cam.eye", "refine_cameras": ["cam.eye"],

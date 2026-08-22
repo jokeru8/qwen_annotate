@@ -138,6 +138,7 @@ def convert_dataset(
             )
         else:
             frame_count = manifest.total_frames
+            _rewrite_full_stats(staging, source, manifest, dataset, services)
             _write_public_metadata(staging, out, manifest, records, converted_at)
         validation = validate_release(
             staging,
@@ -369,31 +370,12 @@ def _rewrite_accepted_subset(
         output_episode_rows.append(row | {"episode_index": remap.output_index, "length": remap.length})
     _atomic_jsonl(staging / "meta/episodes.jsonl", output_episode_rows)
 
-    aggregate_stats = recompute_stats(rewritten_parquets)
-    features = info.get("features")
-    if not isinstance(features, dict):
-        raise ValueError("source features must be an object")
-    frame_iterator = _service(services, "iter_video_rgb_frames", iter_video_rgb_frames)
-    if not callable(frame_iterator):
-        raise TypeError("iter_video_rgb_frames service must be callable")
     expected_lengths = [remap.length for remap in remaps]
-    for camera in manifest.camera_keys:
-        feature = features.get(camera)
-        if not isinstance(feature, dict) or feature.get("dtype") != "video" or not isinstance(feature.get("shape"), list):
-            raise ValueError(f"camera feature metadata is invalid: {camera}")
-        aggregate_stats[camera] = recompute_video_stats(
-            rewritten_videos[camera], expected_lengths, feature["shape"], frame_iterator=frame_iterator,
-        )
-    source_stats_path = source / "meta/stats.json"
-    if source_stats_path.exists() or source_stats_path.is_symlink():
-        source_stats = _read_source_json(source_stats_path)
-        if set(source_stats) != set(aggregate_stats):
-            raise ValueError("source stats keys differ from declared selected feature coverage")
+    aggregate_stats, episode_stats = _compute_release_stats(
+        info, rewritten_parquets, rewritten_videos, expected_lengths, manifest.camera_keys, services,
+    )
+    _check_source_stats_keys(source, aggregate_stats)
     _atomic_json(staging / "meta/stats.json", aggregate_stats, sort_keys=False)
-    episode_stats = [
-        {"episode_index": remap.output_index, "stats": recompute_stats([parquet])}
-        for remap, parquet in zip(remaps, rewritten_parquets, strict=True)
-    ]
     _atomic_jsonl(staging / "meta/episodes_stats.jsonl", episode_stats)
 
     count = len(remaps)
@@ -413,6 +395,68 @@ def _rewrite_accepted_subset(
     ]
     _write_selection_metadata(staging, output, manifest, selected, converted_at)
     return offset
+
+
+def _rewrite_full_stats(
+    staging: Path,
+    source: Path,
+    manifest: RunManifest,
+    dataset: DatasetIndex,
+    services: Any,
+) -> None:
+    info = _read_source_json(staging / "meta/info.json")
+    episodes = sorted(dataset.episodes, key=lambda episode: episode.episode_index)
+    parquets = [episode.parquet for episode in episodes]
+    videos = {
+        camera: [episode.videos[camera] for episode in episodes]
+        for camera in manifest.camera_keys
+    }
+    lengths = [episode.length for episode in episodes]
+    aggregate, per_episode = _compute_release_stats(
+        info, parquets, videos, lengths, manifest.camera_keys, services,
+    )
+    _check_source_stats_keys(source, aggregate)
+    _atomic_json(staging / "meta/stats.json", aggregate, sort_keys=False)
+    _atomic_jsonl(staging / "meta/episodes_stats.jsonl", per_episode)
+
+
+def _compute_release_stats(
+    info: dict[str, Any],
+    parquets: list[Path],
+    videos: dict[str, list[Path]],
+    lengths: list[int],
+    cameras: list[str],
+    services: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    if len(parquets) != len(lengths) or any(len(videos.get(camera, [])) != len(lengths) for camera in cameras):
+        raise ValueError("statistics payload coverage differs from selected episodes")
+    features = info.get("features")
+    if not isinstance(features, dict):
+        raise ValueError("source features must be an object")
+    aggregate: dict[str, Any] = recompute_stats(parquets)
+    frame_iterator = _service(services, "iter_video_rgb_frames", iter_video_rgb_frames)
+    if not callable(frame_iterator):
+        raise TypeError("iter_video_rgb_frames service must be callable")
+    for camera in cameras:
+        feature = features.get(camera)
+        if not isinstance(feature, dict) or feature.get("dtype") != "video" or not isinstance(feature.get("shape"), list):
+            raise ValueError(f"camera feature metadata is invalid: {camera}")
+        aggregate[camera] = recompute_video_stats(
+            videos[camera], lengths, feature["shape"], frame_iterator=frame_iterator,
+        )
+    episodes = [
+        {"episode_index": index, "stats": recompute_stats([parquet])}
+        for index, parquet in enumerate(parquets)
+    ]
+    return aggregate, episodes
+
+
+def _check_source_stats_keys(source: Path, aggregate: dict[str, Any]) -> None:
+    source_stats_path = source / "meta/stats.json"
+    if source_stats_path.exists() or source_stats_path.is_symlink():
+        source_stats = _read_source_json(source_stats_path)
+        if set(source_stats) != set(aggregate):
+            raise ValueError("source stats keys differ from declared selected feature coverage")
 
 
 def _copy_tree(source: Path, staging: Path) -> None:

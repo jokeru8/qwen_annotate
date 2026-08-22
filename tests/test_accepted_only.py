@@ -252,6 +252,11 @@ def test_release_validator_rejects_stats_corruption(tmp_path: Path, mutation: st
         elif mutation == "camera_count":
             stats["cam.eye"]["count"] = [999]
             stats["cam.wrist"]["count"] = [999]
+            info_path = output / "meta/info.json"
+            release_info = json.loads(info_path.read_text())
+            release_info.pop("data_files_size_in_mb")
+            release_info.pop("video_files_size_in_mb")
+            info_path.write_text(json.dumps(release_info))
         elif mutation == "numeric_count":
             stats["action"]["count"] = [999]
         else:

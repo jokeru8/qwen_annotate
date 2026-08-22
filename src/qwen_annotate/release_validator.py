@@ -117,6 +117,13 @@ def validate_release(
     cameras = [key for key, value in features.items() if isinstance(key, str) and isinstance(value, dict) and value.get("dtype") == "video"]
     if not cameras or len(set(cameras)) != len(cameras):
         raise ValueError("release must define unique video cameras")
+    camera_shapes: dict[str, tuple[int, int, int]] = {}
+    for camera in cameras:
+        shape = features[camera].get("shape")
+        if (not isinstance(shape, list) or len(shape) != 3 or
+                any(type(item) is not int or item <= 0 for item in shape) or shape[2] != 3):
+            raise ValueError(f"video feature shape must be [height,width,3]: {camera}")
+        camera_shapes[camera] = (shape[0], shape[1], shape[2])
     if _integer(info, "total_videos", minimum=0) != total_episodes * len(cameras):
         raise ValueError("total_videos is inconsistent")
     _validate_splits(info.get("splits"), total_episodes)
@@ -165,8 +172,10 @@ def validate_release(
             expected_payload.add(video_rel.as_posix())
             video_paths[(expected, camera)] = video
             measured = svc.probe_video(video)
-            if measured.frames != length or not video_fps_matches(measured.fps, fps) or measured.width <= 0 or measured.height <= 0:
-                raise ValueError(f"video metadata mismatch for episode {expected}, camera {camera}")
+            expected_height, expected_width, _ = camera_shapes[camera]
+            if (measured.frames != length or not video_fps_matches(measured.fps, fps) or
+                    measured.width != expected_width or measured.height != expected_height):
+                raise ValueError(f"video metadata mismatch (including shape) for episode {expected}, camera {camera}")
         global_offset += length
     if sum(lengths) != total_frames:
         raise ValueError("frame count mismatch")
@@ -176,11 +185,6 @@ def validate_release(
     actual_payload = _payload_files(root)
     if actual_payload != expected_payload:
         raise ValueError("missing or extra episode payload files")
-    _validate_optional_metadata(
-        root, total_episodes, total_frames, lengths, features, cameras, stats_source,
-        strict_image_counts={"data_files_size_in_mb", "video_files_size_in_mb"} <= set(info),
-    )
-
     annotations = _read_object(root / "meta/lerobot_annotations.json")
     top_fields = {"source_root", "work_dir", "subtask_template", "episodes", "primary_camera", "updated_at"}
     if set(annotations) != top_fields:
@@ -202,6 +206,14 @@ def validate_release(
         expected_work = _expected_output_root.resolve(strict=False) / "meta"
         if declared_work.resolve(strict=False) != expected_work:
             raise ValueError("annotation work_dir does not match expected output/meta")
+    generated_release = (
+        _expected_output_root is not None
+        or declared_work.resolve(strict=False) == root / "meta"
+    )
+    _validate_optional_metadata(
+        root, total_episodes, total_frames, lengths, features, cameras, stats_source,
+        strict_image_counts=generated_release,
+    )
     primary = _string(annotations, "primary_camera")
     if primary not in cameras:
         raise ValueError("primary camera is absent from features")
@@ -576,9 +588,7 @@ def _validate_optional_metadata(
     source_has_stats = stats_source is not None and (stats_source / "meta/stats.json").exists()
     present = (aggregate_path.exists() or aggregate_path.is_symlink(), episode_path.exists() or episode_path.is_symlink())
     if not any(present):
-        if source_has_stats:
-            raise ValueError("release stats metadata is missing")
-        return
+        raise ValueError("release stats metadata is missing")
     if not all(present):
         raise ValueError("aggregate and episode stats must be published together")
 
