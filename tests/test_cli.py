@@ -24,7 +24,21 @@ def test_episode_parser_rejects_ambiguous_or_invalid_values(value: str) -> None:
 def test_help_loads_without_network_or_gpu_work() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "annotate" in result.stdout and "inspect" in result.stdout and "status" in result.stdout
+    assert all(command in result.stdout for command in ("annotate", "inspect", "status", "convert", "validate"))
+
+
+def test_convert_and_validate_cli_delegate_and_map_failures(monkeypatch, tmp_path: Path) -> None:
+    report = type("Report", (), {"episode_count": 2, "frame_count": 40, "output": tmp_path / "out", "path": tmp_path / "out", "valid": True})()
+    calls = []
+    monkeypatch.setattr("qwen_annotate.cli.convert_dataset", lambda work, output, accepted_only=False: calls.append((work, output, accepted_only)) or report)
+    converted = runner.invoke(app, ["convert", str(tmp_path / "work"), "--output", str(tmp_path / "out"), "--accepted-only"])
+    assert converted.exit_code == 0 and "episodes=2" in converted.stdout and calls
+    monkeypatch.setattr("qwen_annotate.cli.validate_release", lambda path, source=None: report)
+    validated = runner.invoke(app, ["validate", str(tmp_path / "out"), "--source", str(tmp_path / "source")])
+    assert validated.exit_code == 0 and "valid" in validated.stdout.lower()
+    monkeypatch.setattr("qwen_annotate.cli.validate_release", lambda *a, **k: (_ for _ in ()).throw(ValueError("secret details")))
+    failed = runner.invoke(app, ["validate", str(tmp_path / "out")])
+    assert failed.exit_code == 1 and "secret details" not in failed.output and "Traceback" not in failed.output
 
 
 def test_invalid_config_is_usage_error_without_traceback(tmp_path: Path) -> None:

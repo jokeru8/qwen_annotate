@@ -8,10 +8,12 @@ from pathlib import Path
 
 import typer
 from .config import load_config
+from .converter import convert_dataset
 from .lerobot import inspect_dataset
 from .model_manager import download_model
 from .pipeline import WorkspaceSummary, annotate_dataset
 from .review import apply_human_decision, load_human_decision, render_review_site
+from .release_validator import validate_release
 from .workspace import WorkspaceStore
 
 
@@ -117,6 +119,30 @@ def review_command(
         typer.echo("Human decision was rejected.", err=True)
         raise typer.Exit(1)
     typer.echo(f"accepted episode {accepted.episode_index}")
+
+
+@app.command("convert")
+def convert_command(
+    work_dir: Path,
+    output: Path = typer.Option(..., "--output"),
+    accepted_only: bool = typer.Option(False, "--accepted-only"),
+) -> None:
+    try:
+        report = convert_dataset(work_dir, output, accepted_only=accepted_only)
+    except Exception:
+        typer.echo("Dataset conversion failed.", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"converted episodes={report.episode_count} frames={report.frame_count} output={report.output}")
+
+
+@app.command("validate")
+def validate_command(path: Path, source: Path | None = typer.Option(None, "--source")) -> None:
+    try:
+        report = validate_release(path, source=source)
+    except Exception:
+        typer.echo("Release validation failed.", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"valid episodes={report.episode_count} frames={report.frame_count} path={report.path}")
 
 
 @model_app.command("download")
