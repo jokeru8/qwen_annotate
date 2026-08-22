@@ -21,7 +21,6 @@ _MAX_ERROR_EXCERPT = 256
 _OOM_MARKERS = (
     "out of memory",
     "cuda oom",
-    "cuda error",
     "worker died",
     "worker exited",
     "engine dead",
@@ -137,13 +136,14 @@ class QwenClient(Generic[T]):
                     excerpt=self._safe_excerpt(exc),
                 ) from exc
             except Exception as exc:
-                excerpt = self._safe_excerpt(_exception_detail(exc))
-                if self._is_oom(excerpt):
+                full_detail = _exception_detail(exc)
+                if self._is_oom(full_detail):
                     raise ModelOutOfMemory(
                         "model worker ran out of memory or exited",
                         attempt_count=attempt_count,
-                        excerpt=excerpt,
+                        excerpt=self._safe_excerpt(full_detail),
                     ) from None
+                excerpt = self._safe_excerpt(full_detail)
                 if self._is_transient(exc) and attempt_count < self._max_attempts:
                     await self._sleep(self._delay(transient_count))
                     transient_count += 1
@@ -156,16 +156,16 @@ class QwenClient(Generic[T]):
 
             try:
                 payload = json.loads(content)
-                if repair_used and original_json is not _NOT_PARSED and payload != original_json:
-                    raise ValueError("format repair changed semantic JSON values")
+                if repair_used:
+                    if original_json is _NOT_PARSED:
+                        raise ValueError("original response has no recoverable semantic JSON baseline")
+                    if payload != original_json:
+                        raise ValueError("format repair changed semantic JSON values")
                 return response_type.model_validate(payload)
             except (json.JSONDecodeError, ValidationError, ValueError) as exc:
                 last_invalid = self._safe_excerpt(content)
                 if not repair_used and attempt_count < self._max_attempts:
-                    try:
-                        original_json = json.loads(content)
-                    except json.JSONDecodeError:
-                        original_json = _NOT_PARSED
+                    original_json = _recover_semantic_baseline(content)
                     repair_used = True
                     request = self._repair_request(content, response_type, schema)
                     continue
@@ -292,3 +292,50 @@ def _exception_detail(exc: Exception) -> str:
     if response_text and response_text not in detail:
         return f"{detail}: {response_text}"
     return detail
+
+
+def _recover_semantic_baseline(content: str) -> Any:
+    """Conservatively recover one JSON object without changing its values."""
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    candidates: list[Any] = []
+    start: int | None = None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index, character in enumerate(content):
+        if start is None:
+            if character == "{":
+                start = index
+                depth = 1
+                in_string = False
+                escaped = False
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    candidate = json.loads(content[start : index + 1])
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(candidate, dict):
+                        candidates.append(candidate)
+                start = None
+
+    return candidates[0] if len(candidates) == 1 else _NOT_PARSED
