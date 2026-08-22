@@ -1,6 +1,4 @@
 import json
-from copy import deepcopy
-
 import pytest
 
 from qwen_annotate.config import AnnotationConfig
@@ -81,9 +79,14 @@ def test_schemas_match_models_are_independent_and_strict():
     assert coarse == CoarseResult.model_json_schema()
     assert refine == RefineResult.model_json_schema()
     assert coarse is not CoarseResult.model_json_schema()
-    mutated = deepcopy(coarse)
-    mutated["properties"]["confidence"]["x"] = 1
-    assert "x" not in coarse_json_schema()["properties"]["confidence"]
+    coarse["properties"]["confidence"]["x"] = 1
+    refine["properties"]["visible_cues"]["x"] = 1
+    fresh_coarse = coarse_json_schema()
+    fresh_refine = refine_json_schema()
+    assert fresh_coarse == CoarseResult.model_json_schema()
+    assert fresh_refine == RefineResult.model_json_schema()
+    assert "x" not in fresh_coarse["properties"]["confidence"]
+    assert "x" not in fresh_refine["properties"]["visible_cues"]
     def walk(node):
         if isinstance(node, dict):
             assert "label" not in node and "subtask_text" not in node
@@ -94,4 +97,3 @@ def test_schemas_match_models_are_independent_and_strict():
     assert coarse["additionalProperties"] is False
     assert refine["additionalProperties"] is False
     assert coarse["$defs"]["CoarseBoundary"]["additionalProperties"] is False
-
