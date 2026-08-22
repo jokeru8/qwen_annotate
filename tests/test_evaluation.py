@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from qwen_annotate.cli import app
+from qwen_annotate.evaluation import (
+    DaggerPrediction,
+    DaggerView,
+    evaluate_boundaries,
+    evaluate_dagger,
+    make_dagger_views,
+)
+
+
+def test_boundary_metrics_use_transition_alignment_and_nearest_rank_p90() -> None:
+    predicted = {0: [102, 198], 1: [120, 240]}
+    golden = {0: [100, 200], 1: [110, 250]}
+    statuses = {0: "accepted", 1: "needs_review"}
+
+    metrics = evaluate_boundaries(predicted, golden, statuses, fps=20)
+
+    assert metrics.accepted_coverage == 0.5
+    assert metrics.needs_review_rate == 0.5
+    assert metrics.failed_rate == 0.0
+    assert metrics.boundary_count == 4
+    assert metrics.median_absolute_error_frames == 6.0
+    assert metrics.p90_absolute_error_frames == 10.0
+    assert metrics.median_absolute_error_seconds == 0.3
+    assert metrics.p90_absolute_error_seconds == 0.5
+
+
+def test_start_accuracy_and_false_accepts_have_episode_denominators() -> None:
+    metrics = evaluate_boundaries(
+        {0: [100], 1: [240]},
+        {0: [100], 1: [200], 2: [300]},
+        {0: "accepted", 1: "accepted", 2: "failed"},
+        fps=20,
+        predicted_start_indices={0: 0, 1: 2},
+        golden_start_indices={0: 0, 1: 1, 2: 1},
+    )
+
+    assert metrics.episode_count == 3
+    assert metrics.predicted_episode_count == 2
+    assert metrics.start_index_evaluated_count == 2
+    assert metrics.start_subtask_index_accuracy == 0.5
+    assert metrics.false_accept_count == 1
+    assert metrics.missing_prediction_count == 1
+
+
+def test_misaligned_transition_counts_are_violations_and_never_silently_zipped() -> None:
+    metrics = evaluate_boundaries(
+        {0: [10]}, {0: [10, 20]}, {0: "needs_review"}, fps=10,
+    )
+    assert metrics.aligned_boundary_count == 0
+    assert metrics.transition_mismatch_count == 1
+    assert metrics.constraint_violation_count == 1
+    assert metrics.constraint_violation_blocked_count == 1
+    assert metrics.constraint_blocking_rate == 1.0
+    assert metrics.median_absolute_error_frames is None
+
+
+@pytest.mark.parametrize("fps", [0, -1, float("inf"), float("nan"), True])
+def test_invalid_fps_is_rejected(fps: object) -> None:
+    with pytest.raises(ValueError, match="fps"):
+        evaluate_boundaries({}, {}, {}, fps=fps)  # type: ignore[arg-type]
+
+
+def test_empty_evaluation_has_explicit_vacuous_rates() -> None:
+    metrics = evaluate_boundaries({}, {}, {}, fps=20)
+    assert metrics.episode_count == 0
+    assert metrics.accepted_coverage == 0.0
+    assert metrics.start_subtask_index_accuracy is None
+    assert metrics.median_absolute_error_frames is None
+    assert metrics.constraint_blocking_rate == 1.0
+
+
+def test_obvious_error_threshold_is_seconds_and_configurable() -> None:
+    default = evaluate_boundaries({0: [121]}, {0: [100]}, {0: "accepted"}, fps=20)
+    relaxed = evaluate_boundaries(
+        {0: [121]}, {0: [100]}, {0: "accepted"}, fps=20,
+        obvious_error_threshold_seconds=2.0,
+    )
+    assert default.false_accept_count == 1
+    assert relaxed.false_accept_count == 0
+
+
+def test_synthetic_dagger_views_are_deterministic_bounded_and_relative() -> None:
+    kwargs = dict(
+        golden_boundaries={0: [100, 220, 360]},
+        episode_lengths={0: 500},
+        min_segment_frames=20,
+    )
+    views = make_dagger_views(**kwargs)
+
+    assert views == make_dagger_views(**kwargs)
+    assert DaggerView(
+        source_episode=0,
+        start_frame=50,
+        end_frame=500,
+        expected_start_subtask_index=0,
+        expected_boundaries_relative=[50, 170, 310],
+        kind="suffix",
+    ) in views
+    assert DaggerView(
+        source_episode=0,
+        start_frame=50,
+        end_frame=80,
+        expected_start_subtask_index=0,
+        expected_boundaries_relative=[],
+        kind="singleton",
+    ) in views
+    for view in views:
+        assert 0 <= view.start_frame < view.end_frame <= 500
+        assert view.end_frame - view.start_frame >= 20
+        assert all(0 < boundary < view.end_frame - view.start_frame for boundary in view.expected_boundaries_relative)
+
+
+def test_short_segments_are_skipped_without_invalid_dagger_views() -> None:
+    assert make_dagger_views(
+        {0: [10]}, {0: 20}, min_segment_frames=8,
+    ) == []
+
+
+def test_evaluate_dagger_passes_only_frame_ranges_to_sampler_and_inference() -> None:
+    view = DaggerView(
+        source_episode=4, start_frame=30, end_frame=90,
+        expected_start_subtask_index=2, expected_boundaries_relative=[], kind="singleton",
+    )
+    seen: list[object] = []
+
+    def sampler(episode: int, start: int, end: int) -> object:
+        seen.append((episode, start, end))
+        return {"frames": [start, end - 1]}
+
+    def inference(evidence: object) -> DaggerPrediction:
+        seen.append(evidence)
+        return DaggerPrediction(start_subtask_index=2, boundaries=[], status="accepted")
+
+    metrics = evaluate_dagger([view], sampler=sampler, inference=inference, fps=30)
+    assert seen == [(4, 30, 90), {"frames": [30, 89]}]
+    assert metrics.start_subtask_index_accuracy == 1.0
+    assert metrics.accepted_coverage == 1.0
+
+
+def _write_evaluation_fixture(root: Path, *, boundary: int, status: str = "accepted") -> tuple[Path, Path]:
+    work = root / "work"
+    golden = root / "golden"
+    (work / "episodes").mkdir(parents=True)
+    (golden / "meta").mkdir(parents=True)
+    sha = "a" * 64
+    manifest = {
+        "dataset_root": str(root / "source"), "dataset_version": "v2.1", "fps": 20.0,
+        "camera_keys": ["observation.images.cam"], "total_episodes": 1, "total_frames": 300,
+        "episode_lengths": [300], "mode": "complete", "high_level_instruction": "task",
+        "subtasks": [{"skill": "a", "text": "A"}, {"skill": "b", "text": "B"}],
+        "code_version": "0.1.0", "prompt_version": "v1", "model_repo": "Qwen/test",
+        "model_revision": "b" * 40, "effective_config": {}, "min_segment_frames": 8,
+        "run_fingerprint": sha, "created_at": "2026-08-22T00:00:00Z",
+    }
+    (work / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    episode = {
+        "episode_index": 0, "status": status, "coarse_attempts": [], "refine_attempts": [],
+        "final_annotation": {"start_subtask_index": 0, "boundaries": [boundary]},
+        "validation_issues": [], "review_reasons": [], "failure_category": None,
+        "decision_source": "human" if status == "accepted" else None,
+        "created_at": "2026-08-22T00:00:00Z", "updated_at": "2026-08-22T00:00:01Z",
+        "source_fingerprint": sha, "run_fingerprint": sha, "prompt_version": None,
+        "model_revision": None, "sampling_details": {},
+    }
+    if status == "needs_review":
+        episode["review_reasons"] = ["uncertain"]
+    (work / "episodes" / "episode_000000.json").write_text(json.dumps(episode), encoding="utf-8")
+    annotations = {
+        "source_root": "/old/source", "work_dir": "/old/meta",
+        "subtask_template": [{"skill": "a", "text": "A"}, {"skill": "b", "text": "B"}],
+        "episodes": {"0": {"episode_index": 0, "boundaries": [100],
+                              "high_level_instruction": "task", "saved_at": "2026-01-01T00:00:00Z"}},
+        "primary_camera": "observation.images.cam", "updated_at": "2026-01-01T00:00:00Z",
+    }
+    (golden / "meta" / "lerobot_annotations.json").write_text(json.dumps(annotations), encoding="utf-8")
+    (golden / "meta" / "info.json").write_text(json.dumps({"fps": 20}), encoding="utf-8")
+    (golden / "meta" / "episodes.jsonl").write_text(
+        json.dumps({"episode_index": 0, "tasks": ["task"], "length": 300}) + "\n", encoding="utf-8",
+    )
+    return work, golden
+
+
+def test_cli_evaluate_writes_deterministic_launch_gate_report_without_overwrite(tmp_path: Path) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=100)
+    output = tmp_path / "metrics.json"
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["evaluate", str(work), "--golden", str(golden), "--output", str(output)])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["launch_gates"]["all_passed"] is True
+    first_bytes = output.read_bytes()
+    again = runner.invoke(app, ["evaluate", str(work), "--golden", str(golden), "--output", str(output)])
+    assert again.exit_code == 1
+    assert output.read_bytes() == first_bytes
+
+
+def test_cli_evaluate_exits_failure_when_quality_gate_fails(tmp_path: Path) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=140)
+    output = tmp_path / "metrics.json"
+    result = CliRunner().invoke(
+        app, ["evaluate", str(work), "--golden", str(golden), "--output", str(output)],
+    )
+    assert result.exit_code == 1
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["launch_gates"]["median_boundary_error_seconds"]["passed"] is False
+
+
+def test_cli_rejects_misaligned_golden_episode_metadata(tmp_path: Path) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=100)
+    (golden / "meta" / "episodes.jsonl").write_text(
+        json.dumps({"episode_index": 0, "tasks": ["task"], "length": 50}) + "\n", encoding="utf-8",
+    )
+    output = tmp_path / "metrics.json"
+    result = CliRunner().invoke(
+        app, ["evaluate", str(work), "--golden", str(golden), "--output", str(output)],
+    )
+    assert result.exit_code == 1
+    assert not output.exists()

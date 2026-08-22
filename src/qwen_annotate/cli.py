@@ -9,6 +9,7 @@ from pathlib import Path
 import typer
 from .config import load_config
 from .converter import convert_dataset
+from .evaluation import evaluate_complete, write_evaluation_report
 from .lerobot import inspect_dataset
 from .model_manager import download_model
 from .pipeline import WorkspaceSummary, annotate_dataset
@@ -160,6 +161,34 @@ def validate_command(
         f"valid episodes={report.episode_count} frames={report.frame_count} path={report.path} "
         f"validation_level={report.validation_level} skipped_checks={skipped}"
     )
+
+
+@app.command("evaluate")
+def evaluate_command(
+    work_dir: Path,
+    golden: Path = typer.Option(..., "--golden"),
+    output: Path = typer.Option(..., "--output"),
+    obvious_error_threshold_seconds: float = typer.Option(
+        1.0, "--obvious-error-threshold-seconds", min=0.000001
+    ),
+) -> None:
+    try:
+        metrics = evaluate_complete(
+            work_dir,
+            golden,
+            obvious_error_threshold_seconds=obvious_error_threshold_seconds,
+        )
+        report = write_evaluation_report(output, metrics)
+    except Exception:
+        typer.echo("Evaluation failed.", err=True)
+        raise typer.Exit(1)
+    gates = report["launch_gates"]
+    typer.echo(
+        f"evaluated episodes={metrics.episode_count} boundaries={metrics.aligned_boundary_count} "
+        f"launch_gates={'PASS' if gates['all_passed'] else 'FAIL'} output={output}"
+    )
+    if not gates["all_passed"]:
+        raise typer.Exit(1)
 
 
 @model_app.command("download")
