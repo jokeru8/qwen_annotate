@@ -150,3 +150,28 @@ def test_real_video_iterator_closes_container_when_consumer_stops_early(monkeypa
     assert first.shape == (4, 4, 3) and first.dtype == np.uint8
     frames.close()
     assert wrappers and wrappers[0].closed
+
+
+def test_recompute_video_stats_closes_iterator_on_bad_frame(tmp_path: Path) -> None:
+    """Catches relying on garbage collection to close a decoder after validation aborts."""
+    path = tmp_path / "bad.mp4"
+    path.touch()
+    class BadFrames:
+        def __init__(self):
+            self.closed = False
+            self.used = False
+        def __iter__(self):
+            return self
+        def __next__(self):
+            if self.used:
+                raise StopIteration
+            self.used = True
+            return np.zeros((2, 2, 3), dtype=np.float32)
+        def close(self):
+            self.closed = True
+    frames = BadFrames()
+    with pytest.raises(ValueError, match="shape or dtype"):
+        recompute_video_stats(
+            [path], [1], [2, 2, 3], frame_iterator=lambda _: frames,
+        )
+    assert frames.closed

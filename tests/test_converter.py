@@ -155,8 +155,9 @@ def test_full_conversion_preserves_legacy_stats_without_pixel_decode(tmp_path: P
     with pytest.raises(ValueError, match="stats"):
         validate_release(output, services=services)
     assert validate_release(
-        output, source=source, services=services, allow_legacy_sampled_image_stats=True,
-    ).valid
+        output, source=source, services=services,
+        allow_legacy_sampled_image_stats=True, deep_video_stats=False,
+    ).validation_level == "source_backed_legacy"
 
 
 def test_dagger_serializes_explicit_start_including_singleton(tmp_path: Path) -> None:

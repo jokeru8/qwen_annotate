@@ -28,7 +28,12 @@ def test_help_loads_without_network_or_gpu_work() -> None:
 
 
 def test_convert_and_validate_cli_delegate_and_map_failures(monkeypatch, tmp_path: Path) -> None:
-    report = type("Report", (), {"episode_count": 2, "frame_count": 40, "output": tmp_path / "out", "path": tmp_path / "out", "valid": True})()
+    report = type("Report", (), {
+        "episode_count": 2, "frame_count": 40, "output": tmp_path / "out",
+        "path": tmp_path / "out", "valid": True,
+        "validation_level": "legacy_structural",
+        "skipped_checks": ("numeric_quantile_payload_equality",),
+    })()
     calls = []
     monkeypatch.setattr("qwen_annotate.cli.convert_dataset", lambda work, output, accepted_only=False: calls.append((work, output, accepted_only)) or report)
     converted = runner.invoke(app, ["convert", str(tmp_path / "work"), "--output", str(tmp_path / "out"), "--accepted-only"])
@@ -44,7 +49,12 @@ def test_convert_and_validate_cli_delegate_and_map_failures(monkeypatch, tmp_pat
         "--allow-legacy-sampled-image-stats", "--no-deep-video-stats",
     ])
     assert validated.exit_code == 0 and "valid" in validated.stdout.lower()
+    assert "legacy_structural" in validated.stdout and "numeric_quantile_payload_equality" in validated.stdout
     assert validate_calls == [(tmp_path / "out", tmp_path / "source", True, False)]
+    contradictory = runner.invoke(app, [
+        "validate", str(tmp_path / "out"), "--allow-legacy-sampled-image-stats",
+    ])
+    assert contradictory.exit_code == 2 and "--no-deep-video-stats" in contradictory.output
     monkeypatch.setattr("qwen_annotate.cli.validate_release", lambda *a, **k: (_ for _ in ()).throw(ValueError("secret details")))
     failed = runner.invoke(app, ["validate", str(tmp_path / "out")])
     assert failed.exit_code == 1 and "secret details" not in failed.output and "Traceback" not in failed.output

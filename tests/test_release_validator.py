@@ -15,12 +15,15 @@ def test_release_validator_is_independent_and_strict(tmp_path: Path) -> None:
     convert_dataset(work, output, services=services)
     report = validate_release(output, source=source, services=services)
     assert report.valid is True and report.episode_count == 2 and report.frame_count == 40
+    assert report.validation_level == "strict_deep" and report.skipped_checks == ()
     assert report.payload_files == sorted(report.payload_files)
     assert report.payload_checksum
     assert report.preview is not None
     assert ReleaseReport.model_validate_json(report.model_dump_json()) == report
     with pytest.raises(ValidationError):
         ReleaseReport.model_validate(report.model_dump() | {"episode_count": "2"})
+    with pytest.raises(ValidationError):
+        ReleaseReport.model_validate(report.model_dump() | {"skipped_checks": ("invented",)})
 
 
 def test_release_validator_requires_both_stats_artifacts(tmp_path: Path) -> None:
@@ -142,8 +145,11 @@ def test_real_reference_dataset_is_accepted_read_only() -> None:
         REFERENCE,
         services={"probe_video": probe, "extract_frames": extractor},
         allow_legacy_sampled_image_stats=True,
+        deep_video_stats=False,
     )
     assert report.valid and report.episode_count == 47 and report.mode == "complete"
+    assert report.validation_level == "legacy_structural"
+    assert set(report.skipped_checks) == {"numeric_quantile_payload_equality", "video_payload_stat_equality"}
     assert (REFERENCE / "meta/lerobot_annotations.json").stat().st_mtime_ns == before
 
 
@@ -259,4 +265,37 @@ def test_generated_release_requires_exact_payload_size_metadata(tmp_path: Path, 
         info["video_files_size_in_mb"] = 999999
     path.write_text(json.dumps(info))
     with pytest.raises(ValueError, match="size"):
+        validate_release(
+            output, services=services,
+            allow_legacy_sampled_image_stats=True, deep_video_stats=False,
+        )
+
+
+def test_legacy_options_are_not_silently_contradictory(tmp_path: Path) -> None:
+    _, work, services = _fixture(tmp_path, legacy_stats=True)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    with pytest.raises(ValueError, match="legacy.*deep"):
         validate_release(output, services=services, allow_legacy_sampled_image_stats=True)
+
+
+def test_legacy_quantile_guarantee_is_explicit_and_source_backed_when_available(tmp_path: Path) -> None:
+    source, work, services = _fixture(tmp_path, legacy_stats=True)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    path = output / "meta/stats.json"
+    stats = json.loads(path.read_text())
+    stats["index"]["q50"] = [(stats["index"]["q10"][0] + stats["index"]["q90"][0]) / 2 + 0.01]
+    path.write_text(json.dumps(stats))
+
+    structural = validate_release(
+        output, services=services,
+        allow_legacy_sampled_image_stats=True, deep_video_stats=False,
+    )
+    assert structural.validation_level == "legacy_structural"
+    assert "numeric_quantile_payload_equality" in structural.skipped_checks
+    with pytest.raises(ValueError, match="legacy release stats"):
+        validate_release(
+            output, source=source, services=services,
+            allow_legacy_sampled_image_stats=True, deep_video_stats=False,
+        )

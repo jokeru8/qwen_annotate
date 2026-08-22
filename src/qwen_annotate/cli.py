@@ -142,6 +142,9 @@ def validate_command(
     allow_legacy_sampled_image_stats: bool = typer.Option(False, "--allow-legacy-sampled-image-stats"),
     deep_video_stats: bool = typer.Option(True, "--deep-video-stats/--no-deep-video-stats"),
 ) -> None:
+    if allow_legacy_sampled_image_stats and deep_video_stats:
+        typer.echo("Legacy sampled image stats require --no-deep-video-stats.", err=True)
+        raise typer.Exit(2)
     try:
         report = validate_release(
             path,
@@ -152,7 +155,11 @@ def validate_command(
     except Exception:
         typer.echo("Release validation failed.", err=True)
         raise typer.Exit(1)
-    typer.echo(f"valid episodes={report.episode_count} frames={report.frame_count} path={report.path}")
+    skipped = ",".join(report.skipped_checks) if report.skipped_checks else "none"
+    typer.echo(
+        f"valid episodes={report.episode_count} frames={report.frame_count} path={report.path} "
+        f"validation_level={report.validation_level} skipped_checks={skipped}"
+    )
 
 
 @model_app.command("download")

@@ -183,13 +183,19 @@ def recompute_video_stats(
         if type(expected) is not int or expected <= 0:
             raise ValueError("expected video frame count must be positive")
         decoded = 0
-        for frame in frame_iterator(path):
-            array = np.asarray(frame)
-            if array.dtype != np.uint8 or array.shape != (height, width, 3):
-                raise ValueError(f"decoded RGB frame shape or dtype differs from metadata: {path}")
-            for channel in range(3):
-                histogram[channel] += np.bincount(array[..., channel].reshape(-1), minlength=256)
-            decoded += 1
+        iterator = iter(frame_iterator(path))
+        try:
+            for frame in iterator:
+                array = np.asarray(frame)
+                if array.dtype != np.uint8 or array.shape != (height, width, 3):
+                    raise ValueError(f"decoded RGB frame shape or dtype differs from metadata: {path}")
+                for channel in range(3):
+                    histogram[channel] += np.bincount(array[..., channel].reshape(-1), minlength=256)
+                decoded += 1
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
         if decoded != expected:
             raise ValueError(f"video frame count differs from metadata: {path}")
         total_frames += decoded

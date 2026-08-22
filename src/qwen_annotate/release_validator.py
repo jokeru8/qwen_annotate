@@ -56,6 +56,10 @@ class ReleaseReport(_Report):
     payload_digests: dict[str, str]
     payload_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
     preview: BoundaryPreview | None
+    validation_level: Literal[
+        "strict_deep", "strict_structural", "legacy_structural", "source_backed_legacy"
+    ] = "strict_deep"
+    skipped_checks: tuple[str, ...] = ()
     validated_at: datetime
 
     @field_validator("validated_at")
@@ -73,6 +77,16 @@ class ReleaseReport(_Report):
             raise ValueError("payload_digests must exactly cover payload_files")
         if any(len(value) != 64 or any(char not in "0123456789abcdef" for char in value) for value in self.payload_digests.values()):
             raise ValueError("payload digests must be lowercase SHA-256")
+        if self.skipped_checks != tuple(sorted(set(self.skipped_checks))):
+            raise ValueError("skipped_checks must be sorted and unique")
+        expected_skips = {
+            "strict_deep": (),
+            "strict_structural": ("video_payload_stat_equality",),
+            "legacy_structural": ("numeric_quantile_payload_equality", "video_payload_stat_equality"),
+            "source_backed_legacy": ("numeric_quantile_payload_equality", "video_payload_stat_equality"),
+        }
+        if self.skipped_checks != expected_skips[self.validation_level]:
+            raise ValueError("validation_level and skipped_checks are inconsistent")
         return self
 
 
@@ -96,6 +110,8 @@ def validate_release(
     """Validate a converted release without consulting an annotation workspace."""
     if type(allow_legacy_sampled_image_stats) is not bool or type(deep_video_stats) is not bool:
         raise TypeError("statistics validation options must be bools")
+    if allow_legacy_sampled_image_stats and deep_video_stats:
+        raise ValueError("legacy sampled image stats are incompatible with deep video stats")
     root = _safe_root(path, "release")
     source_root = _safe_root(source, "source") if source is not None else None
     stats_source = _safe_root(_expected_stats_source, "stats source") if _expected_stats_source is not None else source_root
@@ -287,10 +303,25 @@ def validate_release(
             if _sha256(source_root / relative) != digest:
                 raise ValueError(f"payload checksum mismatch: {relative}")
     aggregate = hashlib.sha256("".join(f"{name}\0{digests[name]}\n" for name in sorted(digests)).encode()).hexdigest()
+    if allow_legacy_sampled_image_stats:
+        if stats_source is None:
+            validation_level = "legacy_structural"
+            skipped_checks = ("numeric_quantile_payload_equality", "video_payload_stat_equality")
+        else:
+            validation_level = "source_backed_legacy"
+            skipped_checks = ("numeric_quantile_payload_equality", "video_payload_stat_equality")
+    elif deep_video_stats:
+        validation_level = "strict_deep"
+        skipped_checks = ()
+    else:
+        validation_level = "strict_structural"
+        skipped_checks = ("video_payload_stat_equality",)
     return ReleaseReport(
         path=root, episode_count=total_episodes, frame_count=total_frames, mode=mode,
         subtask_template=template, payload_files=sorted(expected_payload), payload_digests=digests,
-        payload_checksum=aggregate, preview=first_preview, validated_at=datetime.now(UTC),
+        payload_checksum=aggregate, preview=first_preview,
+        validation_level=validation_level, skipped_checks=skipped_checks,
+        validated_at=datetime.now(UTC),
     )
 
 
