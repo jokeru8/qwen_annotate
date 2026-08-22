@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from pydantic import BaseModel, ConfigDict
 from qwen_annotate.models import FinalAnnotation
 from qwen_annotate.qwen_client import (
     InvalidModelResponse,
@@ -12,6 +13,13 @@ from qwen_annotate.qwen_client import (
     QwenClient,
 )
 from qwen_annotate.video import FrameSample, as_data_url
+
+
+class SemanticPayload(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    value: bool | int | float
+    label: str = "same"
 
 
 def valid_json(boundary: int = 20) -> str:
@@ -367,6 +375,62 @@ async def test_wrapped_json_repair_cannot_change_recovered_semantics() -> None:
         await QwenClient(send=send, max_attempts=2).complete(
             "prompt", [], FinalAnnotation
         )
+
+
+@pytest.mark.parametrize(
+    ("original", "repaired"),
+    [
+        ('{"value":true}', '{"value":1}'),
+        ('{"value":1}', '{"value":1.0}'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_repair_semantic_equality_is_scalar_type_sensitive(
+    original: str, repaired: str
+) -> None:
+    replies = iter(["wrapped: " + original, repaired])
+
+    async def send(**kwargs):
+        return next(replies)
+
+    with pytest.raises(InvalidModelResponse):
+        await QwenClient(send=send, max_attempts=2).complete(
+            "prompt", [], SemanticPayload
+        )
+
+
+@pytest.mark.asyncio
+async def test_repair_allows_object_key_order_only_change() -> None:
+    replies = iter([
+        'wrapped: {"value":1,"label":"same"}',
+        '{"label":"same","value":1}',
+    ])
+
+    async def send(**kwargs):
+        return next(replies)
+
+    result = await QwenClient(send=send, max_attempts=2).complete(
+        "prompt", [], SemanticPayload
+    )
+    assert type(result.value) is int
+    assert result.value == 1
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.asyncio
+async def test_nonstandard_json_numeric_constants_are_rejected(constant: str) -> None:
+    calls = 0
+
+    async def send(**kwargs):
+        nonlocal calls
+        calls += 1
+        return f'{{"value":{constant}}}'
+
+    with pytest.raises(InvalidModelResponse):
+        await QwenClient(send=send, max_attempts=1).complete(
+            "prompt", [], SemanticPayload
+        )
+    assert calls == 1
 
 
 @pytest.mark.asyncio

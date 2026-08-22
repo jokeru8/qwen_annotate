@@ -57,6 +57,10 @@ class _MalformedResponse(ValueError):
     pass
 
 
+class _StrictJSONError(ValueError):
+    pass
+
+
 class QwenClient(Generic[T]):
     """Call an OpenAI-compatible Qwen endpoint with a finite total call budget.
 
@@ -155,11 +159,11 @@ class QwenClient(Generic[T]):
                 ) from None
 
             try:
-                payload = json.loads(content)
+                payload = _strict_json_loads(content)
                 if repair_used:
                     if original_json is _NOT_PARSED:
                         raise ValueError("original response has no recoverable semantic JSON baseline")
-                    if payload != original_json:
+                    if not _json_semantically_equal(payload, original_json):
                         raise ValueError("format repair changed semantic JSON values")
                 return response_type.model_validate(payload)
             except (json.JSONDecodeError, ValidationError, ValueError) as exc:
@@ -169,7 +173,11 @@ class QwenClient(Generic[T]):
                     repair_used = True
                     request = self._repair_request(content, response_type, schema)
                     continue
-                category = "schema validation" if not isinstance(exc, json.JSONDecodeError) else "JSON parsing"
+                category = (
+                    "JSON parsing"
+                    if isinstance(exc, (json.JSONDecodeError, _StrictJSONError))
+                    else "schema validation"
+                )
                 raise InvalidModelResponse(
                     f"model response failed strict {category}",
                     attempt_count=attempt_count,
@@ -297,8 +305,8 @@ def _exception_detail(exc: Exception) -> str:
 def _recover_semantic_baseline(content: str) -> Any:
     """Conservatively recover one JSON object without changing its values."""
     try:
-        return json.loads(content)
-    except json.JSONDecodeError:
+        return _strict_json_loads(content)
+    except (json.JSONDecodeError, _StrictJSONError):
         pass
 
     candidates: list[Any] = []
@@ -330,8 +338,8 @@ def _recover_semantic_baseline(content: str) -> Any:
             depth -= 1
             if depth == 0:
                 try:
-                    candidate = json.loads(content[start : index + 1])
-                except json.JSONDecodeError:
+                    candidate = _strict_json_loads(content[start : index + 1])
+                except (json.JSONDecodeError, _StrictJSONError):
                     pass
                 else:
                     if isinstance(candidate, dict):
@@ -339,3 +347,27 @@ def _recover_semantic_baseline(content: str) -> Any:
                 start = None
 
     return candidates[0] if len(candidates) == 1 else _NOT_PARSED
+
+
+def _strict_json_loads(content: str) -> Any:
+    return json.loads(content, parse_constant=_reject_json_constant)
+
+
+def _reject_json_constant(constant: str) -> Any:
+    raise _StrictJSONError(f"non-standard JSON numeric constant: {constant}")
+
+
+def _json_semantically_equal(left: Any, right: Any) -> bool:
+    """Compare JSON values while preserving every scalar's exact JSON type."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _json_semantically_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _json_semantically_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    return bool(left == right)
