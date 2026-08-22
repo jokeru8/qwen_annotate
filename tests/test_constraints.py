@@ -73,7 +73,7 @@ def test_models_are_frozen_and_forbid_extra_fields() -> None:
             to_subtask_index=1,
             last_frame_before=1,
             first_frame_after=2,
-            boundary_frame=1,
+            boundary_frame=2,
             confidence=0.5,
             visible_cues=[],
             extra=1,
@@ -111,3 +111,60 @@ def test_dagger_out_of_range_start_has_no_negative_suffix_issue() -> None:
     issues = validate_annotation(annotation, "dagger_patch", 4, 100, 8)
     assert [issue.code for issue in issues] == ["start_subtask_range"]
     assert "-1" not in issues[0].message
+
+
+def test_models_reject_coercion_empty_evidence_and_cues() -> None:
+    with pytest.raises(ValidationError):
+        CoarseBoundary(from_subtask_index="0", to_subtask_index=1, estimated_frame=2, evidence="x")
+    with pytest.raises(ValidationError):
+        CoarseBoundary(from_subtask_index=True, to_subtask_index=1, estimated_frame=2, evidence="x")
+    with pytest.raises(ValidationError):
+        CoarseBoundary(from_subtask_index=0, to_subtask_index=1, estimated_frame=2, evidence="")
+    with pytest.raises(ValidationError):
+        RefineResult(
+            from_subtask_index=0,
+            to_subtask_index=1,
+            last_frame_before=1,
+            first_frame_after=2,
+            boundary_frame=2,
+            confidence=0.5,
+            visible_cues=[""],
+        )
+    with pytest.raises(ValidationError):
+        RefineResult(
+            from_subtask_index=0,
+            to_subtask_index=1,
+            last_frame_before=1,
+            first_frame_after=2,
+            boundary_frame=2,
+            confidence="0.5",
+            visible_cues=["cue"],
+        )
+
+
+def test_coarse_result_rejects_cross_field_inconsistency() -> None:
+    boundary = CoarseBoundary(from_subtask_index=0, to_subtask_index=1, estimated_frame=2, evidence="x")
+    with pytest.raises(ValidationError):
+        CoarseResult(start_subtask_index=1, observed_subtask_indices=[0, 1], coarse_boundaries=[boundary], confidence=0.5)
+    with pytest.raises(ValidationError):
+        CoarseResult(start_subtask_index=0, observed_subtask_indices=[0, 1, 2], coarse_boundaries=[boundary], confidence=0.5)
+    with pytest.raises(ValidationError):
+        CoarseResult(
+            start_subtask_index=0,
+            observed_subtask_indices=[0, 1, 2],
+            coarse_boundaries=[boundary, CoarseBoundary(from_subtask_index=1, to_subtask_index=2, estimated_frame=2, evidence="x")],
+            confidence=0.5,
+        )
+
+
+def test_refine_result_rejects_non_adjacent_frames() -> None:
+    with pytest.raises(ValidationError):
+        RefineResult(
+            from_subtask_index=0,
+            to_subtask_index=1,
+            last_frame_before=1,
+            first_frame_after=3,
+            boundary_frame=3,
+            confidence=0.5,
+            visible_cues=["cue"],
+        )

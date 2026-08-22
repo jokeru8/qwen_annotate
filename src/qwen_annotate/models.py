@@ -1,19 +1,25 @@
 """Immutable, strict data models exchanged by annotation stages."""
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class FrozenModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, strict=True, extra="forbid")
 
 
 class CoarseBoundary(FrozenModel):
     from_subtask_index: int = Field(ge=0)
     to_subtask_index: int = Field(ge=0)
     estimated_frame: int = Field(ge=0)
-    evidence: str
+    evidence: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def adjacent_subtasks(self) -> "CoarseBoundary":
+        if self.to_subtask_index != self.from_subtask_index + 1:
+            raise ValueError("to_subtask_index must equal from_subtask_index + 1")
+        return self
 
 
 class CoarseResult(FrozenModel):
@@ -23,6 +29,20 @@ class CoarseResult(FrozenModel):
     confidence: float = Field(ge=0, le=1)
     uncertainties: list[str] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def consistent_sequence(self) -> "CoarseResult":
+        if self.start_subtask_index != self.observed_subtask_indices[0]:
+            raise ValueError("start_subtask_index must equal observed_subtask_indices[0]")
+        expected_count = len(self.observed_subtask_indices) - 1
+        if len(self.coarse_boundaries) != expected_count:
+            raise ValueError("coarse_boundaries count must equal observed sequence length minus one")
+        for index, boundary in enumerate(self.coarse_boundaries):
+            if boundary.from_subtask_index != self.observed_subtask_indices[index] or boundary.to_subtask_index != self.observed_subtask_indices[index + 1]:
+                raise ValueError("coarse boundary subtask indices must match adjacent observed indices")
+        if any(left.estimated_frame >= right.estimated_frame for left, right in zip(self.coarse_boundaries, self.coarse_boundaries[1:])):
+            raise ValueError("estimated_frame values must be strictly increasing")
+        return self
+
 
 class RefineResult(FrozenModel):
     from_subtask_index: int = Field(ge=0)
@@ -31,7 +51,15 @@ class RefineResult(FrozenModel):
     first_frame_after: int = Field(ge=0)
     boundary_frame: int = Field(ge=0)
     confidence: float = Field(ge=0, le=1)
-    visible_cues: list[str]
+    visible_cues: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def consistent_transition(self) -> "RefineResult":
+        if self.to_subtask_index != self.from_subtask_index + 1:
+            raise ValueError("to_subtask_index must equal from_subtask_index + 1")
+        if not (self.last_frame_before + 1 == self.first_frame_after == self.boundary_frame):
+            raise ValueError("last_frame_before + 1 must equal first_frame_after and boundary_frame")
+        return self
 
 
 class FinalAnnotation(FrozenModel):
