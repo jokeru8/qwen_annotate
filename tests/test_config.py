@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from qwen_annotate.config import (
     AnnotationConfig,
@@ -77,6 +77,8 @@ def test_annotation_config_rejects_unknown_keys() -> None:
         (SamplingConfig, {"unexpected": True}),
     ],
 )
-def test_nested_models_reject_unknown_keys(model_type: type[object], payload: dict[str, object]) -> None:
+def test_nested_models_reject_unknown_keys(
+    model_type: type[BaseModel], payload: dict[str, object]
+) -> None:
     with pytest.raises(ValidationError):
-        model_type.model_validate(payload)  # type: ignore[attr-defined]
+        model_type.model_validate(payload)
