@@ -5,10 +5,13 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from typer.testing import CliRunner
 
+from qwen_annotate.cli import app
 from qwen_annotate.config import AnnotationConfig
 from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo
 from qwen_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
+from qwen_annotate.prompts import PROMPT_VERSION
 from qwen_annotate.review import HumanDecision, ReviewServices, apply_human_decision, render_review_site
 from qwen_annotate.video import FrameSample
 from qwen_annotate.workspace import EpisodeRecord, WorkspaceStore
@@ -69,7 +72,7 @@ def _workspace(tmp_path: Path, *, mode: str = "dagger_patch", reasons=None, issu
         refine_attempts=[refine], validation_issues=issues or [],
         review_reasons=reasons or ["coarse_sequence_disagreement"],
         source_fingerprint=prior.source_fingerprint, run_fingerprint=prior.run_fingerprint,
-        prompt_version="qwen-lerobot-annotation-v1", model_revision="a" * 40,
+        prompt_version=PROMPT_VERSION, model_revision="a" * 40,
         sampling_details={"coarse_decision": {"sampled_frame_indices": [[0, 100, 239], [0, 120, 239]],
                                                   "api_key": "NESTED-SECRET"},
                           "refine_decision": {"candidate_annotation": {"start_subtask_index": 1,
@@ -395,3 +398,77 @@ def test_publish_lock_symlink_and_stale_stage_safety(tmp_path: Path) -> None:
     (unowned / "keep.txt").write_text("keep")
     assert render_review_site(work, services=services).is_file()
     assert not owned.exists() and (unowned / "keep.txt").read_text() == "keep"
+
+
+def _tamper_record_context(work: Path, **updates) -> bytes:
+    path = work / "episodes/episode_000000.json"
+    payload = json.loads(path.read_text())
+    payload.update(updates)
+    payload["sampling_details"].pop("_pipeline_transition_events", None)
+    path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    return path.read_bytes()
+
+
+def test_render_stale_record_context_does_not_sample_or_replace_live(tmp_path: Path) -> None:
+    work, _, _, record, services, calls = _workspace(tmp_path)
+    page = render_review_site(work, services=services)
+    live_before = page.read_bytes()
+    call_count = len(calls)
+    _tamper_record_context(work, run_fingerprint="f" * 64)
+    with pytest.raises(ValueError, match="run fingerprint"):
+        render_review_site(work, services=services)
+    assert page.read_bytes() == live_before and len(calls) == call_count
+
+
+def test_edited_decision_cannot_bypass_stale_record_run_context(tmp_path: Path) -> None:
+    work, _, _, record, services, _ = _workspace(tmp_path)
+    before = _tamper_record_context(work, run_fingerprint="f" * 64)
+    decision = tmp_path / "decision.json"
+    decision.write_text(json.dumps({
+        "episode_index": 0, "source_fingerprint": record.source_fingerprint,
+        "run_fingerprint": record.run_fingerprint, "mode": "dagger_patch",
+        "start_subtask_index": 1, "boundaries": [184],
+    }))
+    result = CliRunner().invoke(app, ["review", str(work), "--apply", str(decision)])
+    assert result.exit_code == 1 and "Traceback" not in result.output
+    assert (work / "episodes/episode_000000.json").read_bytes() == before
+
+
+def test_direct_annotation_rejects_stale_record_context_without_write(tmp_path: Path) -> None:
+    work, _, _, record, services, _ = _workspace(tmp_path)
+    before = _tamper_record_context(work, run_fingerprint="f" * 64)
+    with pytest.raises(ValueError, match="record run fingerprint"):
+        apply_human_decision(work, 0, FinalAnnotation(start_subtask_index=1, boundaries=[184]),
+                             source_fingerprint=record.source_fingerprint, services=services)
+    assert (work / "episodes/episode_000000.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("updates,message", [
+    ({"prompt_version": "old-prompt"}, "prompt_version"),
+    ({"model_revision": "b" * 40}, "model_revision"),
+])
+def test_present_model_provenance_must_match_manifest(tmp_path: Path, updates, message) -> None:
+    work, _, _, _, services, calls = _workspace(tmp_path)
+    _tamper_record_context(work, **updates)
+    with pytest.raises(ValueError, match=message):
+        render_review_site(work, services=services)
+    assert calls == []
+
+
+def test_model_derived_review_requires_complete_manifest_provenance(tmp_path: Path) -> None:
+    work, _, _, _, services, calls = _workspace(tmp_path)
+    _tamper_record_context(work, prompt_version=None, model_revision=None)
+    with pytest.raises(ValueError, match="model-derived.*provenance"):
+        render_review_site(work, services=services)
+    assert calls == []
+
+
+def test_manual_review_without_model_provenance_remains_renderable(tmp_path: Path) -> None:
+    work, _, _, _, services, _ = _workspace(tmp_path)
+    path = work / "episodes/episode_000000.json"
+    payload = json.loads(path.read_text())
+    payload.update({"coarse_attempts": [], "refine_attempts": [],
+                    "prompt_version": None, "model_revision": None})
+    payload["sampling_details"] = {}
+    path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    assert render_review_site(work, services=services).is_file()

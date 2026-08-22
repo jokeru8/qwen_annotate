@@ -99,6 +99,7 @@ def _render_review_site_locked(root: Path, previews: Path, service: ReviewServic
     review_records = sorted((record for record in records if record.status == "needs_review"),
                             key=lambda item: item.episode_index)
     for record in review_records:
+        _validate_record_run_context(record, manifest)
         _assert_current_source(manifest, dataset, record)
 
     destination = previews / "needs_review"
@@ -153,6 +154,7 @@ def apply_human_decision(
     record = store.load_episode(episode_index)
     if record.status != "needs_review":
         raise ValueError("human decisions require a needs_review record")
+    _validate_record_run_context(record, manifest)
 
     if isinstance(annotation, HumanDecision):
         if annotation.episode_index != episode_index:
@@ -452,6 +454,24 @@ def _assert_current_source(manifest, dataset, record):
     current = compute_source_fingerprint(manifest.dataset_root, dataset.episodes[record.episode_index])
     if current != record.source_fingerprint:
         raise ValueError(f"episode {record.episode_index} source fingerprint is stale")
+
+
+def _validate_record_run_context(record: EpisodeRecord, manifest: RunManifest) -> None:
+    """Reject cached review state that belongs to another immutable model run."""
+    if record.run_fingerprint != manifest.run_fingerprint:
+        raise ValueError("record run fingerprint does not match workspace manifest")
+    model_derived = bool(
+        record.coarse_attempts
+        or record.refine_attempts
+        or "coarse_decision" in record.sampling_details
+        or "refine_decision" in record.sampling_details
+    )
+    if model_derived and (record.prompt_version is None or record.model_revision is None):
+        raise ValueError("model-derived review record is missing manifest provenance")
+    if record.prompt_version is not None and record.prompt_version != manifest.prompt_version:
+        raise ValueError("record prompt_version does not match workspace manifest")
+    if record.model_revision is not None and record.model_revision != manifest.model_revision:
+        raise ValueError("record model_revision does not match workspace manifest")
 
 
 def _load_manifest(root):
