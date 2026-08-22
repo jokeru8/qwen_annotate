@@ -129,9 +129,10 @@ class EpisodeRecord(_StrictModel):
                 self.final_annotation is not None
                 and self.final_annotation.boundaries == []
             )
-            if not self.refine_attempts and not zero_transition:
+            audited_zero_transition_review = _is_audited_zero_transition_review(self)
+            if not self.refine_attempts and not zero_transition and not audited_zero_transition_review:
                 raise ValueError(
-                    "refine_done requires refine attempts unless its final annotation has no boundaries"
+                    "refine_done requires refine attempts unless its audited annotation has no boundaries"
                 )
         if self.status == "accepted":
             if self.final_annotation is None:
@@ -157,6 +158,37 @@ class EpisodeRecord(_StrictModel):
         if self.status != "failed" and self.failure_category is not None:
             raise ValueError("failure_category is only valid for failed records")
         return self
+
+
+def _is_audited_zero_transition_review(record: EpisodeRecord) -> bool:
+    """Recognize the typed no-model-call refine review needed for short singleton episodes."""
+    coarse_payload = record.sampling_details.get("coarse_decision")
+    refine_payload = record.sampling_details.get("refine_decision")
+    if not isinstance(coarse_payload, dict) or not isinstance(refine_payload, dict):
+        return False
+    try:
+        from .coarse import CoarseDecision
+        from .refine import RefineDecision
+
+        coarse = CoarseDecision.model_validate_json(_canonical_json(coarse_payload))
+        refined = RefineDecision.model_validate_json(_canonical_json(refine_payload))
+    except Exception:
+        return False
+    candidate = refined.candidate_annotation
+    persisted_attempts = [item.model_dump(mode="json") for item in record.coarse_attempts]
+    audited_attempts = [item.model_dump(mode="json") for item in coarse.attempts]
+    return (
+        coarse.status == "coarse_done"
+        and refined.status == "needs_review"
+        and not refined.attempts
+        and candidate is not None
+        and tuple(candidate.boundaries) == ()
+        and refined.annotation is None
+        and refined.start_subtask_index == coarse.start_subtask_index
+        and refined.observed_subtask_indices == coarse.observed_subtask_indices
+        and refined.coarse_boundary_centers == coarse.boundary_centers == ()
+        and persisted_attempts == audited_attempts
+    )
 
 
 class RunManifest(_StrictModel):
@@ -550,7 +582,11 @@ class WorkspaceStore:
             raise ValueError(f"illegal transition {prior.status} -> {current.status}")
 
     def _validate_final_annotation(self, record: EpisodeRecord) -> None:
-        validate_zero_transition = record.status == "refine_done" and not record.refine_attempts
+        validate_zero_transition = (
+            record.status == "refine_done"
+            and not record.refine_attempts
+            and record.final_annotation is not None
+        )
         if (
             (record.status != "accepted" and not validate_zero_transition)
             or not _safe_entry_exists(self.root / "manifest.json")

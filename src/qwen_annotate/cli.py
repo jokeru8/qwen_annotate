@@ -1,0 +1,123 @@
+"""Operational command-line interface."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+
+import typer
+from .config import load_config
+from .lerobot import inspect_dataset
+from .model_manager import download_model
+from .pipeline import WorkspaceSummary, annotate_dataset
+from .workspace import WorkspaceStore
+
+
+app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
+model_app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
+app.add_typer(model_app, name="model")
+
+
+def parse_episode_indices(value: str) -> list[int]:
+    """Parse a deliberately whitespace-free comma-separated index list."""
+    if not isinstance(value, str) or not value or any(char.isspace() for char in value):
+        raise ValueError("episodes must be a nonempty comma-separated integer list without spaces")
+    parts = value.split(",")
+    if any(not part.isascii() or not part.isdecimal() for part in parts):
+        raise ValueError("episodes must contain only non-negative decimal integers")
+    result = [int(part) for part in parts]
+    if len(set(result)) != len(result):
+        raise ValueError("episode indices must be unique")
+    return result
+
+
+def _config(path: Path):
+    try:
+        return load_config(path)
+    except Exception:
+        typer.echo("Invalid configuration.", err=True)
+        raise typer.Exit(2)
+
+
+@app.command("inspect")
+def inspect_command(config: Path) -> None:
+    cfg = _config(config)
+    try:
+        dataset = inspect_dataset(cfg)
+    except Exception:
+        typer.echo("Dataset inspection failed.", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"version: {dataset.version}")
+    typer.echo(f"fps: {dataset.fps}")
+    typer.echo(f"cameras: {', '.join(dataset.camera_keys)}")
+    typer.echo(f"episodes: {len(dataset.episodes)}")
+    typer.echo(f"frames: {sum(item.length for item in dataset.episodes)}")
+    typer.echo("inspection: OK")
+
+
+@app.command("annotate")
+def annotate_command(
+    config: Path,
+    max_concurrency: int = typer.Option(1, min=1),
+    episodes: str | None = typer.Option(None),
+) -> None:
+    cfg = _config(config)
+    try:
+        selected = None if episodes is None else parse_episode_indices(episodes)
+    except ValueError:
+        typer.echo("Invalid --episodes value.", err=True)
+        raise typer.Exit(2)
+    try:
+        summary = asyncio.run(annotate_dataset(cfg, max_concurrency, selected))
+    except Exception:
+        typer.echo("Annotation failed.", err=True)
+        raise typer.Exit(1)
+    typer.echo(_summary_text(summary))
+    if summary.failed:
+        raise typer.Exit(1)
+
+
+@app.command("status")
+def status_command(work_dir: Path, as_json: bool = typer.Option(False, "--json")) -> None:
+    try:
+        raw = WorkspaceStore(work_dir).summary()
+        summary = WorkspaceSummary.from_store_summary(raw)
+    except Exception:
+        typer.echo("Workspace status could not be read.", err=True)
+        raise typer.Exit(1)
+    if as_json:
+        typer.echo(json.dumps(raw, sort_keys=True, separators=(",", ":")))
+    else:
+        typer.echo(_summary_text(summary))
+
+
+@model_app.command("download")
+def model_download(
+    repo: str = typer.Option("Qwen/Qwen3.8-27B"),
+    local_dir: Path = typer.Option(Path("/mnt/data/user/zhoukr/models/Qwen3.8-27B")),
+    revision: str | None = typer.Option(None),
+    max_workers: int = typer.Option(8, min=1),
+) -> None:
+    try:
+        install = download_model(repo, local_dir, revision, max_workers=max_workers)
+    except (TypeError, ValueError):
+        typer.echo("Invalid model download arguments.", err=True)
+        raise typer.Exit(2)
+    except Exception:
+        typer.echo("Model download failed.", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"revision: {install.revision}")
+    typer.echo(f"local_path: {install.local_path}")
+
+
+def _summary_text(summary: WorkspaceSummary) -> str:
+    return (
+        f"total={summary.total} pending={summary.pending} coarse_done={summary.coarse_done} "
+        f"refine_done={summary.refine_done} accepted={summary.accepted} "
+        f"needs_review={summary.needs_review} failed={summary.failed}"
+    )
+
+
+if __name__ == "__main__":
+    app()
