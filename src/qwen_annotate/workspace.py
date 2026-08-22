@@ -120,8 +120,17 @@ class EpisodeRecord(_StrictModel):
                 raise ValueError("pending records must not contain derived results or provenance")
         if self.status == "coarse_done" and not self.coarse_attempts:
             raise ValueError("coarse_done requires at least one coarse attempt")
-        if self.status == "refine_done" and (not self.coarse_attempts or not self.refine_attempts):
-            raise ValueError("refine_done requires coarse and refine attempts")
+        if self.status == "refine_done":
+            if not self.coarse_attempts:
+                raise ValueError("refine_done requires coarse attempts")
+            zero_transition = (
+                self.final_annotation is not None
+                and self.final_annotation.boundaries == []
+            )
+            if not self.refine_attempts and not zero_transition:
+                raise ValueError(
+                    "refine_done requires refine attempts unless its final annotation has no boundaries"
+                )
         if self.status == "accepted":
             if self.final_annotation is None:
                 raise ValueError("accepted requires a final annotation")
@@ -269,11 +278,32 @@ class WorkspaceStore:
         code_version: str = "0.1.0",
     ) -> RunManifest:
         """Create or safely resume a compatible workspace without touching source data."""
-        self.create_layout()
         dataset_root = _absolute_root(dataset.root)
         if dataset_root != config.source.resolve():
             raise ValueError("dataset index root is incompatible with config source")
+        try:
+            self.root.relative_to(dataset_root)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("workspace root must not equal or be nested beneath the dataset root")
+        expected_indices = {episode.episode_index for episode in dataset.episodes}
+        if expected_indices != set(range(len(dataset.episodes))):
+            raise ValueError("dataset episode indices must be contiguous")
+        source_fingerprints = {
+            episode.episode_index: compute_source_fingerprint(dataset_root, episode)
+            for episode in dataset.episodes
+        }
         run_hash = compute_run_fingerprint(config, model_revision)
+        prevalidated_manifest = self._manifest(
+            config,
+            dataset,
+            model_revision,
+            code_version,
+            run_hash,
+            self._now(),
+        )
+        self.create_layout()
         with self._locked():
             manifest_path = self.root / "manifest.json"
             if manifest_path.exists():
@@ -284,14 +314,11 @@ class WorkspaceStore:
             else:
                 if any((self.root / "episodes").iterdir()):
                     raise ValueError("workspace has episode state but no manifest")
-                manifest = self._manifest(config, dataset, model_revision, code_version, run_hash, self._now())
+                manifest = prevalidated_manifest
                 _atomic_json_write(manifest_path, manifest.model_dump(mode="json"))
 
-            expected_indices = {episode.episode_index for episode in dataset.episodes}
-            if expected_indices != set(range(len(dataset.episodes))):
-                raise ValueError("dataset episode indices must be contiguous")
             for episode in dataset.episodes:
-                expected_source = compute_source_fingerprint(dataset_root, episode)
+                expected_source = source_fingerprints[episode.episode_index]
                 path = self._episode_path(episode.episode_index)
                 if path.exists():
                     current = self._load_episode_unlocked(episode.episode_index)
@@ -451,8 +478,8 @@ class WorkspaceStore:
         if prior.status == "needs_review" and current.status == "accepted" and current.decision_source != "human":
             raise ValueError("needs_review may only transition to a human decision")
         allowed: dict[str, set[str]] = {
-            "pending": {"coarse_done", "failed"},
-            "coarse_done": {"refine_done", "failed"},
+            "pending": {"coarse_done", "needs_review", "failed"},
+            "coarse_done": {"refine_done", "needs_review", "failed"},
             "refine_done": {"accepted", "needs_review", "failed"},
             "needs_review": {"accepted", "failed"},
             "accepted": set(),
@@ -462,7 +489,11 @@ class WorkspaceStore:
             raise ValueError(f"illegal transition {prior.status} -> {current.status}")
 
     def _validate_final_annotation(self, record: EpisodeRecord) -> None:
-        if record.status != "accepted" or not (self.root / "manifest.json").exists():
+        validate_zero_transition = record.status == "refine_done" and not record.refine_attempts
+        if (
+            (record.status != "accepted" and not validate_zero_transition)
+            or not (self.root / "manifest.json").exists()
+        ):
             return
         manifest = self._load_manifest()
         issues = validate_annotation(

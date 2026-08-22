@@ -7,6 +7,7 @@ from threading import Barrier, Thread
 import pytest
 from pydantic import ValidationError
 
+from qwen_annotate.config import Subtask
 from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo
 from qwen_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
 from qwen_annotate.prompts import PROMPT_VERSION
@@ -113,6 +114,88 @@ def test_all_legal_transitions_and_human_review_acceptance(tmp_path: Path) -> No
     accepted = transition(review, "accepted", final_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[5]), validation_issues=[], review_reasons=[], decision_source="human")
     store.save_episode(accepted)
     assert store.load_episode(0) == accepted
+
+
+@pytest.mark.parametrize("from_status", ["pending", "coarse_done"])
+def test_coarse_uncertainty_can_enter_review(from_status: str, tmp_path: Path) -> None:
+    store = WorkspaceStore(tmp_path / "work")
+    store.create_layout()
+    record = pending()
+    store.save_episode(record)
+    if from_status == "coarse_done":
+        record = transition(record, "coarse_done", coarse_attempts=[coarse_result()])
+        store.save_episode(record)
+    review = transition(record, "needs_review", review_reasons=["coarse evidence is ambiguous"])
+    store.save_episode(review)
+    assert store.load_episode(0).status == "needs_review"
+
+
+@pytest.mark.parametrize("mode", ["complete", "dagger_patch"])
+def test_zero_transition_episode_flows_through_refine_done_to_accepted(
+    mode: str, tmp_path: Path
+) -> None:
+    index = make_index(tmp_path, [10])
+    config = make_config(index.root, tmp_path / "work", mode=mode)
+    if mode == "dagger_patch":
+        config = config.model_copy(
+            update={"subtasks": [Subtask(skill="first", text="First"), Subtask(skill="second", text="Second")]}
+        )
+    store = WorkspaceStore(config.work_dir, clock=lambda: NOW)
+    store.initialize(config, index, SHA)
+    base = store.load_episode(0)
+    one_subtask_coarse = CoarseResult(
+        start_subtask_index=0,
+        observed_subtask_indices=[0],
+        coarse_boundaries=[],
+        confidence=0.8,
+    )
+    coarse = transition(base, "coarse_done", coarse_attempts=[one_subtask_coarse])
+    store.save_episode(coarse)
+    refined = transition(
+        coarse,
+        "refine_done",
+        final_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[]),
+    )
+    store.save_episode(refined)
+    accepted = transition(refined, "accepted", decision_source="model")
+    store.save_episode(accepted)
+    assert store.load_episode(0).status == "accepted"
+
+
+def test_multi_subtask_complete_cannot_claim_zero_transition_refine_done(tmp_path: Path) -> None:
+    index = make_index(tmp_path, [10])
+    config = make_config(index.root, tmp_path / "work")
+    config = config.model_copy(
+        update={"subtasks": [Subtask(skill="first", text="First"), Subtask(skill="second", text="Second")]}
+    )
+    store = WorkspaceStore(config.work_dir, clock=lambda: NOW)
+    store.initialize(config, index, SHA)
+    base = store.load_episode(0)
+    coarse = transition(base, "coarse_done", coarse_attempts=[coarse_result()])
+    store.save_episode(coarse)
+    invalid = transition(
+        coarse,
+        "refine_done",
+        final_annotation=FinalAnnotation(start_subtask_index=0, boundaries=[]),
+    )
+    with pytest.raises(ValueError, match="final annotation"):
+        store.save_episode(invalid)
+
+
+@pytest.mark.parametrize(
+    "final_annotation",
+    [None, FinalAnnotation(start_subtask_index=0, boundaries=[5])],
+)
+def test_refine_done_without_refine_attempts_requires_zero_transition_final(
+    final_annotation: FinalAnnotation | None,
+) -> None:
+    data = pending().model_dump() | {
+        "status": "refine_done",
+        "coarse_attempts": [coarse_result().model_dump()],
+        "final_annotation": final_annotation.model_dump() if final_annotation else None,
+    }
+    with pytest.raises(ValidationError, match="refine_done"):
+        EpisodeRecord.model_validate(data)
 
 
 def test_needs_review_can_only_be_accepted_by_a_human(tmp_path: Path) -> None:
@@ -433,3 +516,47 @@ def test_initialize_does_not_write_source_dataset(tmp_path: Path) -> None:
     WorkspaceStore(config.work_dir, clock=lambda: NOW).initialize(config, index, SHA)
     after = {p.relative_to(index.root): (p.read_bytes(), p.stat().st_mtime_ns) for p in index.root.rglob("*") if p.is_file()}
     assert after == before
+
+
+@pytest.mark.parametrize("workspace_kind", ["equal", "nested"])
+def test_initialize_rejects_workspace_inside_source_before_any_write(
+    workspace_kind: str, tmp_path: Path
+) -> None:
+    index = make_index(tmp_path)
+    work = index.root if workspace_kind == "equal" else index.root / "annotations/work"
+    config = make_config(index.root, work)
+    before = {
+        path.relative_to(index.root).as_posix(): (
+            "dir" if path.is_dir() else path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in index.root.rglob("*")
+    }
+    with pytest.raises(ValueError, match="workspace.*dataset"):
+        WorkspaceStore(work).initialize(config, index, SHA)
+    after = {
+        path.relative_to(index.root).as_posix(): (
+            "dir" if path.is_dir() else path.read_bytes(),
+            path.stat().st_mtime_ns,
+        )
+        for path in index.root.rglob("*")
+    }
+    assert after == before
+
+
+def test_dataset_config_mismatch_is_rejected_before_workspace_write(tmp_path: Path) -> None:
+    index = make_index(tmp_path)
+    work = tmp_path / "work"
+    config = make_config(tmp_path / "different-source", work)
+    with pytest.raises(ValueError, match="incompatible"):
+        WorkspaceStore(work).initialize(config, index, SHA)
+    assert not work.exists()
+
+
+def test_manifest_inputs_are_validated_before_workspace_write(tmp_path: Path) -> None:
+    index = make_index(tmp_path)
+    work = tmp_path / "work"
+    config = make_config(index.root, work)
+    with pytest.raises(ValidationError, match="code_version"):
+        WorkspaceStore(work).initialize(config, index, SHA, code_version="")
+    assert not work.exists()
