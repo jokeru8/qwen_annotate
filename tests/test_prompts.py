@@ -62,6 +62,23 @@ def test_coarse_prompt_handles_one_frame_transition_range():
     assert "concrete valid transition range is empty for a one-frame episode" in prompt
 
 
+@pytest.mark.parametrize("mode", ["complete", "dagger_patch"])
+def test_coarse_prompt_rejects_too_few_frames_for_template_sequence(mode):
+    cfg = config(mode, [{"skill": "a", "text": "A"}, {"skill": "b", "text": "B"}])
+    with pytest.raises(ValueError, match="need at least 2 frames"):
+        build_coarse_prompt(cfg, 0, 1, 0)
+
+
+def test_coarse_prompt_accepts_frame_count_equal_to_required_sequence_length():
+    prompt = build_coarse_prompt(
+        config("complete", [{"skill": "a", "text": "A"}, {"skill": "b", "text": "B"}]),
+        0,
+        2,
+        0,
+    )
+    assert "concrete valid transition range [1, 1]" in prompt
+
+
 def test_template_escaping_preserves_unicode_and_quotes():
     prompt = build_coarse_prompt(config(subtasks=[{"skill": 'café "tool"', "text": "do \"this\""}]), 0, 2, 0)
     context_text = prompt.split("BEGIN_UNTRUSTED_CONTEXT_JSON\n", 1)[1].split("\nEND_UNTRUSTED_CONTEXT_JSON", 1)[0]
