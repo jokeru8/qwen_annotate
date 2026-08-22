@@ -379,6 +379,28 @@ def test_complete_evaluation_rejects_stale_source_episode(tmp_path: Path) -> Non
     assert not output.exists()
 
 
+def test_source_provenance_preserves_hashed_lexical_config_paths(tmp_path: Path) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=100)
+    manifest_path = work / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["effective_config"]["source"] = str(tmp_path / "source" / ".." / "source")
+    manifest["effective_config"]["work_dir"] = str(work / ".." / "work")
+    config_payload = json.loads(json.dumps(manifest["effective_config"]))
+    config_payload["model"]["api_key"] = "local"
+    lexical_config = AnnotationConfig.model_validate(config_payload)
+    run_sha = compute_run_fingerprint(lexical_config, manifest["model_revision"])
+    manifest["run_fingerprint"] = run_sha
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    episode_path = work / "episodes" / "episode_000000.json"
+    episode = json.loads(episode_path.read_text(encoding="utf-8"))
+    episode["run_fingerprint"] = run_sha
+    episode_path.write_text(json.dumps(episode), encoding="utf-8")
+
+    from qwen_annotate.evaluation import evaluate_complete
+
+    assert evaluate_complete(work, golden).false_accept_count == 0
+
+
 def test_complete_evaluation_rejects_dagger_workspace(tmp_path: Path) -> None:
     work, golden = _write_evaluation_fixture(tmp_path, boundary=100)
     path = work / "manifest.json"

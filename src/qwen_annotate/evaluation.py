@@ -449,15 +449,15 @@ def _validate_source_provenance(
     raw = json.loads(json.dumps(manifest.effective_config, allow_nan=False))
     if not isinstance(raw, dict):
         raise ValueError("manifest effective_config must be an object")
-    raw["source"] = str(manifest.dataset_root)
-    raw["work_dir"] = str(work)
     model = raw.get("model")
     if not isinstance(model, dict):
         raise ValueError("manifest model provenance is invalid")
     model["api_key"] = "evaluation-local-redacted"
     config = AnnotationConfig.model_validate_json(json.dumps(raw), strict=True)
     if (
-        config.mode != manifest.mode
+        config.source.resolve() != manifest.dataset_root.resolve()
+        or config.work_dir.resolve() != work
+        or config.mode != manifest.mode
         or config.high_level_instruction != manifest.high_level_instruction
         or config.subtasks != manifest.subtasks
         or config.sampling.min_segment_frames != manifest.min_segment_frames
