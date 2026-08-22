@@ -93,6 +93,8 @@ def validate_release(path: Path, source: Path | None = None, *, services: Any = 
     total_episodes = _integer(info, "total_episodes", minimum=0)
     total_frames = _integer(info, "total_frames", minimum=0)
     total_tasks = _integer(info, "total_tasks", minimum=0)
+    if total_tasks != 1:
+        raise ValueError("reference-compatible releases require exactly one task")
     chunks_size = _integer(info, "chunks_size", minimum=1)
     total_chunks = _integer(info, "total_chunks", minimum=0)
     if total_chunks != (total_episodes + chunks_size - 1) // chunks_size:
@@ -168,25 +170,15 @@ def validate_release(path: Path, source: Path | None = None, *, services: Any = 
     _validate_optional_metadata(root, total_episodes)
 
     annotations = _read_object(root / "meta/lerobot_annotations.json")
-    allowed_top = {"schema_version", "mode", "source_root", "work_dir", "primary_camera", "subtask_template", "min_segment_frames", "generated_at", "episodes"}
-    if set(annotations) != allowed_top:
+    top_fields = ["source_root", "work_dir", "subtask_template", "episodes", "primary_camera", "updated_at"]
+    if list(annotations) != top_fields:
         raise ValueError("annotation top-level schema mismatch")
-    if annotations["schema_version"] != "1.0":
-        raise ValueError("unsupported annotation schema_version")
-    mode = annotations["mode"]
-    if mode not in ("complete", "dagger_patch"):
-        raise ValueError("invalid annotation mode")
-    _aware_utc(annotations["generated_at"], "generated_at")
+    _aware_utc(annotations["updated_at"], "updated_at")
     for field in ("source_root", "work_dir"):
         _string(annotations, field)
-    if source_root is not None:
-        declared_source = Path(annotations["source_root"])
-        if not declared_source.is_absolute() or declared_source.resolve(strict=False) != source_root:
-            raise ValueError("annotation source_root does not match supplied source")
     primary = _string(annotations, "primary_camera")
     if primary not in cameras:
         raise ValueError("primary camera is absent from features")
-    min_segment = _integer(annotations, "min_segment_frames", minimum=1)
     template = _subtasks(annotations.get("subtask_template"))
     if annotations["subtask_template"] != info.get("subtask_template"):
         raise ValueError("subtask template differs between metadata files")
@@ -196,14 +188,22 @@ def validate_release(path: Path, source: Path | None = None, *, services: Any = 
     entries = annotations.get("episodes")
     if not isinstance(entries, dict) or set(entries) != {str(i) for i in range(total_episodes)}:
         raise ValueError("annotation episodes must exactly match dataset episodes")
+    has_starts = [isinstance(entry, dict) and "start_subtask_index" in entry for entry in entries.values()]
+    if has_starts and all(has_starts):
+        mode = "dagger_patch"
+    elif not any(has_starts):
+        mode = "complete"
+    else:
+        raise ValueError("all DAgger records must explicitly include start_subtask_index")
     _reject_forbidden(annotations)
 
     first_preview: BoundaryPreview | None = None
+    annotation_facts: list[tuple[int, list[int]]] = []
     for index in range(total_episodes):
         entry = entries[str(index)]
         if not isinstance(entry, dict):
             raise ValueError("annotation episode must be an object")
-        common = {"episode_index", "boundaries", "high_level_instruction", "saved_at", "decision_source"}
+        common = {"episode_index", "boundaries", "high_level_instruction", "saved_at"}
         allowed = common | ({"start_subtask_index"} if mode == "dagger_patch" else set())
         if set(entry) != allowed:
             raise ValueError("annotation episode schema mismatch")
@@ -212,8 +212,6 @@ def validate_release(path: Path, source: Path | None = None, *, services: Any = 
         instruction = _string(entry, "high_level_instruction")
         if instruction != mapping[str(index)] or instruction != instructions[index]:
             raise ValueError("instruction mismatch")
-        if entry["decision_source"] not in ("model", "human"):
-            raise ValueError("invalid decision_source")
         _aware_utc(entry["saved_at"], "saved_at")
         boundaries = entry.get("boundaries")
         if not isinstance(boundaries, list) or any(type(item) is not int for item in boundaries):
@@ -223,9 +221,10 @@ def validate_release(path: Path, source: Path | None = None, *, services: Any = 
         else:
             start = _integer(entry, "start_subtask_index", minimum=0)
         annotation = FinalAnnotation(start_subtask_index=start, boundaries=boundaries)
-        issues = validate_annotation(annotation, mode, len(template), lengths[index], min_segment)
+        issues = validate_annotation(annotation, mode, len(template), lengths[index], 1)
         if issues:
             raise ValueError("invalid annotation boundaries: " + ",".join(issue.code for issue in issues))
+        annotation_facts.append((start, boundaries))
         if first_preview is None and boundaries:
             boundary = boundaries[0]
             requested = [boundary - 1, boundary]
@@ -233,6 +232,8 @@ def validate_release(path: Path, source: Path | None = None, *, services: Any = 
             if len(samples) != 2 or [item.frame_index for item in samples] != requested or any(item.camera_key != primary for item in samples):
                 raise ValueError("boundary preview labels do not match requested source frames")
             first_preview = BoundaryPreview(episode_index=index, camera_key=primary, frame_indices=(boundary - 1, boundary))
+
+    _validate_task_info(root, total_episodes, instructions, lengths, template, annotation_facts)
 
     digests = {relative: _sha256(root / relative) for relative in sorted(expected_payload)}
     if source_root is not None:
@@ -328,6 +329,50 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             raise ValueError("JSONL rows must be objects")
         rows.append(value)
     return rows
+
+
+def _validate_task_info(
+    root: Path,
+    total_episodes: int,
+    instructions: list[str],
+    lengths: list[int],
+    template: list[Subtask],
+    annotations: list[tuple[int, list[int]]],
+) -> None:
+    directory = root / "meta/task_info"
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("meta/task_info must be a real directory")
+    files = {path.name for path in directory.iterdir()}
+    if files != {"task_0.json"}:
+        raise ValueError("task_info must contain exactly task_0.json")
+    value = _decode(_read_text(directory / "task_0.json"), "task_0.json")
+    if not isinstance(value, list) or len(value) != total_episodes:
+        raise ValueError("task_info must contain one entry per episode")
+    for index, item in enumerate(value):
+        if not isinstance(item, dict) or set(item) != {"episode_id", "task_id", "task_name", "label_info"}:
+            raise ValueError("task_info episode schema mismatch")
+        if _integer(item, "episode_id", minimum=0) != index or _integer(item, "task_id", minimum=0) != 0:
+            raise ValueError("task_info episode/task id mismatch")
+        if _string(item, "task_name") != instructions[index]:
+            raise ValueError("task_info task_name mismatch")
+        label = item["label_info"]
+        if not isinstance(label, dict) or set(label) != {"action_config"}:
+            raise ValueError("task_info label_info schema mismatch")
+        actions = label["action_config"]
+        start_subtask, boundaries = annotations[index]
+        expected_starts = [0, *boundaries]
+        expected_ends = [*boundaries, lengths[index]]
+        expected_subtasks = template[start_subtask:start_subtask + len(expected_starts)]
+        if not isinstance(actions, list) or len(actions) != len(expected_starts) or len(expected_subtasks) != len(actions):
+            raise ValueError("task_info action count mismatch")
+        for action, start, end, subtask in zip(actions, expected_starts, expected_ends, expected_subtasks, strict=True):
+            if not isinstance(action, dict) or set(action) != {"start_frame", "end_frame", "action_text", "skill"}:
+                raise ValueError("task_info action schema mismatch")
+            if (_integer(action, "start_frame", minimum=0) != start or
+                    _integer(action, "end_frame", minimum=1) != end or end <= start or
+                    _string(action, "action_text") != subtask.text or
+                    _string(action, "skill") != subtask.skill):
+                raise ValueError("task_info action differs from annotation/template")
 
 
 def _integer(value: dict[str, Any], key: str, minimum: int) -> int:

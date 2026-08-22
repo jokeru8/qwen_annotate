@@ -95,14 +95,26 @@ def test_full_conversion_preserves_payload_and_writes_reference_schema(tmp_path:
     assert report.episode_count == 2 and report.frame_count == 40
     assert annotations["episodes"]["0"]["boundaries"] == [10]
     assert "start_subtask_index" not in annotations["episodes"]["0"]
-    assert annotations["schema_version"] == "1.0" and annotations["mode"] == "complete"
-    assert annotations["min_segment_frames"] == 2
+    assert list(annotations) == ["source_root", "work_dir", "subtask_template", "episodes", "primary_camera", "updated_at"]
+    assert set(annotations["episodes"]["0"]) == {"episode_index", "boundaries", "high_level_instruction", "saved_at"}
+    assert annotations["work_dir"] == str(output.resolve() / "meta")
     assert info["subtask_template"] == annotations["subtask_template"]
     assert info["custom_key"] == {"preserved": True}
     assert report.payload_files == sorted(report.payload_files)
     for relative in report.payload_files:
         assert _sha(output / relative) == _sha(source / relative)
     assert ConversionReport.model_validate_json(report.model_dump_json()) == report
+    task_info = json.loads((output / "meta/task_info/task_0.json").read_text())
+    assert task_info == [
+        {"episode_id": 0, "task_id": 0, "task_name": "Arrange.", "label_info": {"action_config": [
+            {"start_frame": 0, "end_frame": 10, "action_text": "Pick.", "skill": "pick"},
+            {"start_frame": 10, "end_frame": 20, "action_text": "Place.", "skill": "place"},
+        ]}},
+        {"episode_id": 1, "task_id": 0, "task_name": "Arrange.", "label_info": {"action_config": [
+            {"start_frame": 0, "end_frame": 10, "action_text": "Pick.", "skill": "pick"},
+            {"start_frame": 10, "end_frame": 20, "action_text": "Place.", "skill": "place"},
+        ]}},
+    ]
 
 
 def test_dagger_serializes_explicit_start_including_singleton(tmp_path: Path) -> None:
@@ -112,6 +124,11 @@ def test_dagger_serializes_explicit_start_including_singleton(tmp_path: Path) ->
     episodes = json.loads((output / "meta/lerobot_annotations.json").read_text())["episodes"]
     assert episodes["0"]["start_subtask_index"] == 0
     assert episodes["1"]["start_subtask_index"] == 1 and episodes["1"]["boundaries"] == []
+    task_info = json.loads((output / "meta/task_info/task_0.json").read_text())
+    assert task_info[0]["label_info"]["action_config"][0]["action_text"] == "Pick."
+    assert task_info[1]["label_info"]["action_config"] == [
+        {"start_frame": 0, "end_frame": 20, "action_text": "Place.", "skill": "place"}
+    ]
 
 
 @pytest.mark.parametrize("status", ["pending", "coarse_done", "refine_done", "needs_review", "failed"])

@@ -50,7 +50,7 @@ class ConversionReport(BaseModel):
     def canonical_public_facts(self) -> "ConversionReport":
         if self.payload_files != sorted(set(self.payload_files)):
             raise ValueError("payload_files must be sorted and unique")
-        if self.annotation_path != "meta/lerobot_annotations.json" or self.annotation_schema_version != "1.0":
+        if self.annotation_path != "meta/lerobot_annotations.json" or self.annotation_schema_version != "reference-v2.1":
             raise ValueError("unsupported public annotation schema")
         if not self.validation.valid or self.validation.episode_count != self.episode_count or self.validation.frame_count != self.frame_count:
             raise ValueError("validation report counts must match conversion")
@@ -100,7 +100,7 @@ def convert_dataset(
         os.mkdir(staging, 0o700)
         _copy_tree(source, staging)
         converted_at = datetime.now(UTC)
-        _write_public_metadata(staging, work, manifest, records, converted_at)
+        _write_public_metadata(staging, out, manifest, records, converted_at)
         validation = validate_release(staging, source=source, services=services)
         if _tree_digest(source) != source_before:
             raise ValueError("source dataset changed during conversion")
@@ -115,7 +115,7 @@ def convert_dataset(
         return ConversionReport(
             output=out.resolve(), accepted_only=False, episode_count=manifest.total_episodes,
             frame_count=manifest.total_frames, payload_files=validation.payload_files,
-            annotation_path="meta/lerobot_annotations.json", annotation_schema_version="1.0",
+            annotation_path="meta/lerobot_annotations.json", annotation_schema_version="reference-v2.1",
             converted_at=converted_at, source_tree_digest=source_before,
             validation=published_validation,
         )
@@ -184,7 +184,7 @@ def _guard_workspace(store: WorkspaceStore, manifest: RunManifest, services: Any
     return manifest, dataset, records
 
 
-def _write_public_metadata(staging: Path, work: Path, manifest: RunManifest, records: list, converted_at: datetime) -> None:
+def _write_public_metadata(staging: Path, output: Path, manifest: RunManifest, records: list, converted_at: datetime) -> None:
     info_path = staging / "meta/info.json"
     info = _read_source_json(info_path)
     template = [item.model_dump(mode="json") for item in manifest.subtasks]
@@ -193,30 +193,50 @@ def _write_public_metadata(staging: Path, work: Path, manifest: RunManifest, rec
     info["high_level_instruction"] = instruction_map
     _atomic_json(info_path, info)
     episodes = {}
+    task_info = []
     for record in records:
         annotation = record.final_annotation
-        entry = {
-            "episode_index": record.episode_index,
+        entry = {"episode_index": record.episode_index}
+        if manifest.mode == "dagger_patch":
+            entry["start_subtask_index"] = annotation.start_subtask_index
+        entry.update({
             "boundaries": list(annotation.boundaries),
             "high_level_instruction": manifest.high_level_instruction,
             "saved_at": record.updated_at.astimezone(UTC).isoformat(),
-            "decision_source": record.decision_source,
-        }
-        if manifest.mode == "dagger_patch":
-            entry["start_subtask_index"] = annotation.start_subtask_index
+        })
         episodes[str(record.episode_index)] = entry
+        starts = [0, *annotation.boundaries]
+        ends = [*annotation.boundaries, manifest.episode_lengths[record.episode_index]]
+        selected = manifest.subtasks[
+            annotation.start_subtask_index:annotation.start_subtask_index + len(starts)
+        ]
+        actions = [
+            {
+                "start_frame": start,
+                "end_frame": end,
+                "action_text": subtask.text,
+                "skill": subtask.skill,
+            }
+            for start, end, subtask in zip(starts, ends, selected, strict=True)
+        ]
+        task_info.append({
+            "episode_id": record.episode_index,
+            "task_id": 0,
+            "task_name": manifest.high_level_instruction,
+            "label_info": {"action_config": actions},
+        })
     annotations = {
-        "schema_version": "1.0",
-        "mode": manifest.mode,
         "source_root": str(manifest.dataset_root),
-        "work_dir": str(work),
-        "primary_camera": manifest.effective_config["primary_camera"],
+        "work_dir": str(output / "meta"),
         "subtask_template": template,
-        "min_segment_frames": manifest.min_segment_frames,
-        "generated_at": converted_at.isoformat(),
         "episodes": episodes,
+        "primary_camera": manifest.effective_config["primary_camera"],
+        "updated_at": converted_at.isoformat(),
     }
-    _atomic_json(staging / "meta/lerobot_annotations.json", annotations)
+    _atomic_json(staging / "meta/lerobot_annotations.json", annotations, sort_keys=False)
+    task_dir = staging / "meta/task_info"
+    task_dir.mkdir(exist_ok=True)
+    _atomic_json(task_dir / "task_0.json", task_info, sort_keys=False)
 
 
 def _copy_tree(source: Path, staging: Path) -> None:
@@ -270,8 +290,8 @@ def _read_source_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    encoded = (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
+def _atomic_json(path: Path, value: Any, *, sort_keys: bool = True) -> None:
+    encoded = (json.dumps(value, ensure_ascii=False, sort_keys=sort_keys, separators=(",", ":"), allow_nan=False) + "\n").encode()
     directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
     name = f".{path.name}.{secrets.token_hex(12)}.tmp"
     fd = None
