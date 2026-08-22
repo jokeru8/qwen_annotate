@@ -18,7 +18,7 @@ from qwen_annotate.evaluation import (
 )
 from qwen_annotate.lerobot import EpisodeInfo, VideoProbe
 from qwen_annotate.prompts import PROMPT_VERSION
-from qwen_annotate.workspace import compute_run_fingerprint, compute_source_fingerprint
+from qwen_annotate.workspace import WorkspaceStore, compute_run_fingerprint, compute_source_fingerprint
 from tests.fixtures import make_lerobot_fixture
 
 
@@ -479,6 +479,18 @@ def test_manifest_prompt_contract_tampering_creates_no_report(tmp_path: Path) ->
     )
     assert result.exit_code == 1
     assert not output.exists()
+
+
+def test_safe_local_endpoint_round_trips_workspace_and_evaluation_provenance(tmp_path: Path) -> None:
+    work, golden = _write_evaluation_fixture(tmp_path, boundary=100)
+    store = WorkspaceStore(work)
+    manifest, runtime = store.load_manifest_with_provenance()
+    assert manifest.effective_config["model"]["endpoint"] == "http://127.0.0.1:8000/v1"
+    assert str(runtime.model.endpoint) == "http://127.0.0.1:8000/v1"
+
+    from qwen_annotate.evaluation import evaluate_complete
+
+    assert evaluate_complete(work, golden).false_accept_count == 0
 
 
 def test_complete_evaluation_rejects_dagger_workspace(tmp_path: Path) -> None:

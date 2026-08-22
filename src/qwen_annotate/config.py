@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 
 class StrictModel(BaseModel):
@@ -24,6 +24,22 @@ class ModelConfig(StrictModel):
     endpoint: HttpUrl = HttpUrl("http://127.0.0.1:8000/v1")
     api_key: str = "local"
     revision: str | None = None
+
+    @field_validator("endpoint")
+    @classmethod
+    def endpoint_is_safe_vllm_base_url(cls, value: HttpUrl) -> HttpUrl:
+        """Allow only canonical HTTP(S) authority plus path endpoint URLs."""
+        if (
+            value.username is not None
+            or value.password is not None
+            or value.query is not None
+            or value.fragment is not None
+        ):
+            raise ValueError(
+                "model endpoint supports scheme, host, optional port, and path only; "
+                "userinfo, query, and fragment are forbidden"
+            )
+        return value
 
 
 class SamplingConfig(StrictModel):

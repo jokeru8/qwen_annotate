@@ -647,21 +647,15 @@ def test_initialize_layout_manifest_redaction_roundtrip_and_exact_records(tmp_pa
         assert record.source_fingerprint == compute_source_fingerprint(index.root, episode)
 
 
-def test_manifest_strips_all_endpoint_credentials_query_and_fragment(tmp_path: Path) -> None:
+def test_unsafe_endpoint_fails_before_workspace_creation(tmp_path: Path) -> None:
     index = make_index(tmp_path, [10])
     config = make_config(index.root, tmp_path / "work")
     secret_endpoint = "http://alice:password@[::1]:8123/v1/chat?token=SECRET&api_key=SECRET2#fragment"
-    secret_model = config.model.__class__.model_validate(
-        config.model.model_dump() | {"endpoint": secret_endpoint, "api_key": "SECRET3"}
-    )
-    config = config.model_copy(
-        update={"model": secret_model}
-    )
-    store = WorkspaceStore(config.work_dir, clock=lambda: NOW)
-    manifest = store.initialize(config, index, SHA)
-    raw = (store.root / "manifest.json").read_text()
-    assert all(secret not in raw for secret in ["alice", "password", "SECRET", "SECRET2", "SECRET3", "token", "api_key", "fragment"])
-    assert manifest.effective_config["model"]["endpoint"] == "http://[::1]:8123/v1/chat"
+    with pytest.raises(ValidationError, match="userinfo, query, and fragment"):
+        config.model.__class__.model_validate(
+            config.model.model_dump() | {"endpoint": secret_endpoint, "api_key": "SECRET3"}
+        )
+    assert not config.work_dir.exists()
 
 
 def test_initialize_resumes_compatible_and_rejects_incompatible_state(tmp_path: Path) -> None:

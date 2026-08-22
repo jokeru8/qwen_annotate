@@ -82,3 +82,22 @@ def test_nested_models_reject_unknown_keys(
 ) -> None:
     with pytest.raises(ValidationError):
         model_type.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://alice:secret@127.0.0.1:8000/v1",
+        "http://127.0.0.1:8000/v1?token=secret",
+        "http://127.0.0.1:8000/v1#fragment",
+    ],
+)
+def test_model_endpoint_rejects_non_path_url_components(endpoint: str) -> None:
+    with pytest.raises(ValidationError, match="userinfo, query, and fragment"):
+        ModelConfig.model_validate({"endpoint": endpoint})
+
+
+def test_equivalent_safe_model_endpoints_have_one_canonical_serialization() -> None:
+    upper = ModelConfig.model_validate({"endpoint": "HTTP://LOCALHOST:8000/v1"})
+    canonical = ModelConfig.model_validate({"endpoint": "http://localhost:8000/v1"})
+    assert str(upper.endpoint) == str(canonical.endpoint) == "http://localhost:8000/v1"
