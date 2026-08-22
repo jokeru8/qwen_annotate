@@ -55,10 +55,10 @@ def build_coarse_prompt(config: AnnotationConfig, episode_index: int, frame_coun
     if pass_id < 0:
         raise ValueError("pass_id must be non-negative")
     count = len(config.subtasks)
-    # The prompt must be able to represent the required template sequence with
-    # distinct transition frames.  A one-subtask DAgger singleton needs none.
+    # Complete mode requires every template subtask and its distinct boundaries.
+    # DAgger may validly emit a singleton [k], which needs no boundary frames.
     required_sequence_length = count
-    if frame_count < required_sequence_length:
+    if config.mode == "complete" and frame_count < required_sequence_length:
         raise ValueError(
             f"frame_count={frame_count} cannot represent {required_sequence_length} observed subtasks: "
             f"need at least {required_sequence_length} frames for {required_sequence_length - 1} distinct boundaries"
