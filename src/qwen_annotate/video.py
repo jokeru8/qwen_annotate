@@ -40,7 +40,7 @@ def uniform_indices(frame_count: int, source_fps: float, target_fps: float, max_
     if frame_count == 1:
         return [0]
     if max_frames == 1:
-        return [0, frame_count - 1]
+        raise ValueError("max_frames must allow two endpoint samples when frame_count is greater than one")
 
     duration_seconds = (frame_count - 1) / source_fps
     desired_count = max(2, int(round(duration_seconds * target_fps)) + 1)

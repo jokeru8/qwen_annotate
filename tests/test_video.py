@@ -28,8 +28,13 @@ def test_uniform_indices_handles_a_single_frame_and_low_target_rate() -> None:
     assert uniform_indices(4, 4.0, 0.1, 8) == [0, 3]
 
 
-def test_uniform_indices_preserve_both_endpoints_when_a_one_frame_cap_conflicts() -> None:
-    assert uniform_indices(5, 30.0, 1.0, 1) == [0, 4]
+def test_uniform_indices_allow_a_one_frame_cap_for_a_one_frame_video() -> None:
+    assert uniform_indices(1, 30.0, 1.0, 1) == [0]
+
+
+def test_uniform_indices_reject_a_one_frame_cap_when_two_endpoints_are_required() -> None:
+    with pytest.raises(ValueError, match="two endpoint samples"):
+        uniform_indices(5, 30.0, 1.0, 1)
 
 
 @pytest.mark.parametrize(
