@@ -145,6 +145,15 @@ class RefineDecision(BaseModel):
     agreement_tolerance_frames: int = Field(ge=0)
     start_subtask_index: int = Field(ge=0)
     observed_subtask_indices: tuple[int, ...] = Field(min_length=1)
+    coarse_boundary_centers: tuple[int, ...]
+    source_fps: float = Field(gt=0)
+    refine_window_seconds: float = Field(gt=0)
+    refine_fps: float = Field(gt=0)
+    dense_radius_seconds: float = Field(gt=0)
+    camera_order: tuple[str, ...] = Field(min_length=1)
+    broad_radius_frames: int = Field(ge=0)
+    base_broad_stride: int = Field(ge=1)
+    dense_radius_frames: int = Field(ge=0)
     status: Literal["accepted", "needs_review", "failed"]
     attempts: tuple[SkipValidation[_ImmutableRefineResult], ...]
     provenance: tuple[SamplingProvenance, ...]
@@ -154,7 +163,8 @@ class RefineDecision(BaseModel):
     failure_category: Literal["model_oom"] | None = None
 
     @field_validator(
-        "observed_subtask_indices", "provenance", "reasons", mode="before"
+        "observed_subtask_indices", "coarse_boundary_centers", "camera_order",
+        "provenance", "reasons", mode="before"
     )
     @classmethod
     def restore_json_sequences(cls, value: object, info: ValidationInfo) -> object:
@@ -178,14 +188,21 @@ class RefineDecision(BaseModel):
             return None
         if isinstance(value, FinalAnnotation):
             payload = value.model_dump()
-        elif isinstance(value, dict):
+        elif isinstance(value, dict) and set(value) == {"start_subtask_index", "boundaries"}:
             payload = value
         else:
             raise ValueError("annotations must be FinalAnnotation-compatible")
-        parsed = FinalAnnotation.model_validate(payload)
-        return _ImmutableFinalAnnotation(
-            start_subtask_index=parsed.start_subtask_index,
-            boundaries=tuple(parsed.boundaries),
+        start = payload["start_subtask_index"]
+        boundaries = payload["boundaries"]
+        if type(start) is not int or start < 0:
+            raise ValueError("annotation start must be a non-negative strict integer")
+        if not isinstance(boundaries, (list, tuple)) or any(
+            type(boundary) is not int or boundary < 0 for boundary in boundaries
+        ):
+            raise ValueError("annotation boundaries must be non-negative strict integers")
+        return _ImmutableFinalAnnotation.model_construct(
+            start_subtask_index=start,
+            boundaries=tuple(boundaries),
         )
 
     @model_validator(mode="after")
@@ -196,6 +213,34 @@ class RefineDecision(BaseModel):
             list(self.observed_subtask_indices), self.mode, self.subtask_count
         ):
             raise ValueError("observed_subtask_indices must be a legal coarse sequence")
+        for value, name in (
+            (self.source_fps, "source_fps"),
+            (self.refine_window_seconds, "refine_window_seconds"),
+            (self.refine_fps, "refine_fps"),
+            (self.dense_radius_seconds, "dense_radius_seconds"),
+        ):
+            if type(value) is not float or not math.isfinite(value):
+                raise ValueError(f"{name} must be a strict finite float")
+        if self.broad_radius_frames != round(self.refine_window_seconds * self.source_fps):
+            raise ValueError("broad radius must be recomputable from source_fps and window seconds")
+        if self.base_broad_stride != max(1, round(self.source_fps / self.refine_fps)):
+            raise ValueError("base broad stride must be recomputable from source/refine fps")
+        if self.dense_radius_frames != round(self.dense_radius_seconds * self.source_fps):
+            raise ValueError("dense radius must be recomputable from source_fps and radius seconds")
+        if len(set(self.camera_order)) != len(self.camera_order) or any(
+            not isinstance(camera, str) or not camera for camera in self.camera_order
+        ):
+            raise ValueError("camera_order must contain unique nonempty camera names")
+        if len(self.coarse_boundary_centers) != len(self.observed_subtask_indices) - 1:
+            raise ValueError("coarse centers must correspond to every observed transition")
+        if any(
+            type(center) is not int or not 1 <= center < self.frame_count
+            for center in self.coarse_boundary_centers
+        ) or any(
+            left >= right
+            for left, right in zip(self.coarse_boundary_centers, self.coarse_boundary_centers[1:])
+        ):
+            raise ValueError("coarse centers must be ordered valid transition frames")
         if len(set(self.reasons)) != len(self.reasons):
             raise ValueError("reasons must be unique")
         if self.reasons != tuple(reason for reason in _REASON_ORDER if reason in self.reasons):
@@ -204,7 +249,7 @@ class RefineDecision(BaseModel):
         if completed != len(self.attempts):
             raise ValueError("each completed evidence call must have exactly one typed attempt")
         for result in self.attempts:
-            _validate_result(result, self.frame_count)
+            _validate_result(result)
         audit_reasons, selected = _semantic_audit(self)
         if self.status == "accepted":
             if self.reasons or self.failure_category is not None or self.annotation is None or self.candidate_annotation is not None:
@@ -241,8 +286,10 @@ class RefineDecision(BaseModel):
             if self.reasons != expected:
                 raise ValueError("needs_review reasons must exactly match the auditable outcome")
         else:
-            if self.reasons != ("model_oom",) or self.failure_category != "model_oom":
+            if self.failure_category != "model_oom" or "model_oom" not in self.reasons:
                 raise ValueError("failed decisions must identify model_oom")
+            if self.reasons != _ordered(audit_reasons):
+                raise ValueError("failed reasons must preserve prior audit reasons plus model_oom")
             if not self.provenance or self.provenance[-1].outcome != "model_oom":
                 raise ValueError("failed model_oom decisions require terminal OOM provenance")
             if self.annotation is not None or self.candidate_annotation is not None:
@@ -300,6 +347,10 @@ async def run_refine(
 
     Frame radii and strides use Python's deterministic nearest-even ``round``.
     Window endpoints and the center are always retained.
+
+    Source integrity is guarded by contained-path, metadata digest, and file
+    identity checks around evidence calls; it does not claim protection from a
+    hostile process that retains and mutates an already-open file descriptor.
     """
     cameras = _validate_context(config, episode, coarse)
     source = _prepare_source(config, episode, cameras, source_fps, expected_source_fingerprint)
@@ -311,6 +362,15 @@ async def run_refine(
         "agreement_tolerance_frames": config.sampling.agreement_tolerance_frames,
         "start_subtask_index": coarse.start_subtask_index,
         "observed_subtask_indices": tuple(coarse.observed_subtask_indices),
+        "coarse_boundary_centers": tuple(coarse.boundary_centers),
+        "source_fps": source.fps,
+        "refine_window_seconds": float(config.sampling.refine_window_seconds),
+        "refine_fps": float(config.sampling.refine_fps),
+        "dense_radius_seconds": float(config.sampling.dense_radius_seconds),
+        "camera_order": cameras,
+        "broad_radius_frames": round(config.sampling.refine_window_seconds * source.fps),
+        "base_broad_stride": max(1, round(source.fps / config.sampling.refine_fps)),
+        "dense_radius_frames": round(config.sampling.dense_radius_seconds * source.fps),
     }
     if not coarse.boundary_centers:
         annotation = FinalAnnotation(
@@ -341,9 +401,9 @@ async def run_refine(
     found: set[ReviewReason] = set()
     degraded = False
 
-    broad_radius = round(config.sampling.refine_window_seconds * source.fps)
-    base_stride = max(1, round(source.fps / config.sampling.refine_fps))
-    dense_radius = round(config.sampling.dense_radius_seconds * source.fps)
+    broad_radius = common["broad_radius_frames"]
+    base_stride = common["base_broad_stride"]
+    dense_radius = common["dense_radius_frames"]
 
     pairs = list(zip(coarse.observed_subtask_indices, coarse.observed_subtask_indices[1:]))
     for boundary_index, ((left, right), center) in enumerate(zip(pairs, coarse.boundary_centers)):
@@ -371,7 +431,7 @@ async def run_refine(
                 broad_radius, active_stride, active_cameras, broad_indices, "model_oom",
             ))
             if degraded or len(active_cameras) == 1:
-                return _oom_failure(common, attempts, provenance)
+                return _oom_failure(common, attempts, provenance, found)
             degraded = True
             active_cameras = (config.primary_camera,)
             retry_stride = base_stride * 2
@@ -396,7 +456,7 @@ async def run_refine(
                     boundary_index, left, right, "broad_retry", retry_pass, center,
                     broad_radius, retry_stride, active_cameras, retry_indices, "model_oom",
                 ))
-                return _oom_failure(common, attempts, provenance)
+                return _oom_failure(common, attempts, provenance, found)
 
         if not isinstance(broad, RefineResult):
             raise TypeError("client.complete must return a RefineResult")
@@ -406,7 +466,7 @@ async def run_refine(
         dense_center = broad.boundary_frame
         if not 1 <= dense_center < episode.length:
             found.add("refine_transition_mismatch")
-            continue
+            break
         dense_indices = _evidence_indices(dense_center, dense_radius, 1, episode.length)
         dense_samples = await _sample_stage(
             source, active_cameras, dense_indices, sampler, episode,
@@ -428,7 +488,7 @@ async def run_refine(
                 boundary_index, left, right, "dense", dense_pass, dense_center,
                 dense_radius, 1, active_cameras, dense_indices, "model_oom",
             ))
-            return _oom_failure(common, attempts, provenance)
+            return _oom_failure(common, attempts, provenance, found)
         if not isinstance(dense, RefineResult):
             raise TypeError("client.complete must return a RefineResult")
         attempts.append(dense)
@@ -440,8 +500,6 @@ async def run_refine(
         selected = choose_agreed_boundary([broad, dense], config.sampling.agreement_tolerance_frames)
         if selected is None:
             found.add("refine_boundary_disagreement")
-            if len(active_cameras) > 1:
-                found.add("camera_evidence_conflict")
             continue
         agreed.append(selected)
 
@@ -690,22 +748,44 @@ def _matches(result, left, right, length):
 
 
 def _freeze_result(value):
+    fields = {
+        "from_subtask_index", "to_subtask_index", "last_frame_before",
+        "first_frame_after", "boundary_frame", "confidence", "visible_cues",
+    }
     if isinstance(value, RefineResult):
-        parsed = RefineResult.model_validate(value.model_dump())
-    elif isinstance(value, dict):
-        parsed = RefineResult.model_validate(value)
+        payload = value.model_dump()
+    elif isinstance(value, dict) and set(value) == fields:
+        payload = value
     else:
         raise ValueError("attempts must contain RefineResult-compatible values")
-    return _ImmutableRefineResult(
-        **parsed.model_dump(exclude={"visible_cues"}), visible_cues=tuple(parsed.visible_cues)
+    _validate_attempt_payload(payload)
+    return _ImmutableRefineResult.model_construct(
+        **{field: payload[field] for field in fields - {"visible_cues"}},
+        visible_cues=tuple(payload["visible_cues"]),
     )
 
 
-def _validate_result(value, length):
+def _validate_attempt_payload(payload):
+    for field in (
+        "from_subtask_index", "to_subtask_index", "last_frame_before",
+        "first_frame_after", "boundary_frame",
+    ):
+        if type(payload.get(field)) is not int:
+            raise ValueError(f"attempt {field} must be a strict integer")
+    confidence = payload.get("confidence")
+    if type(confidence) is not float or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+        raise ValueError("attempt confidence must be a finite strict float in [0, 1]")
+    cues = payload.get("visible_cues")
+    if not isinstance(cues, (list, tuple)) or not cues or any(
+        not isinstance(cue, str) or not cue for cue in cues
+    ):
+        raise ValueError("attempt visible_cues must contain nonempty strings")
+
+
+def _validate_result(value):
     if not isinstance(value, RefineResult):
         raise ValueError("attempts must contain RefineResult values")
-    if not 1 <= value.boundary_frame < length:
-        raise ValueError("attempt boundary must be a valid episode transition frame")
+    _validate_attempt_payload(value.model_dump())
 
 
 def _mutable_annotation(value):
@@ -717,84 +797,141 @@ def _mutable_annotation(value):
 def _semantic_audit(decision: RefineDecision) -> tuple[set[ReviewReason], tuple[int, ...]]:
     """Recompute semantic review state solely from frozen attempts/provenance."""
     found: set[ReviewReason] = set()
-    boundary_indices = [item.boundary_index for item in decision.provenance]
-    unique_indices = sorted(set(boundary_indices))
-    if unique_indices and unique_indices != list(range(unique_indices[-1] + 1)):
-        raise ValueError("provenance boundary indices must be contiguous from zero")
     expected_pairs = tuple(
         zip(decision.observed_subtask_indices, decision.observed_subtask_indices[1:])
     )
-    if any(index >= len(expected_pairs) for index in unique_indices):
-        raise ValueError("provenance references a transition absent from the coarse sequence")
-    if decision.status == "accepted" and unique_indices != list(range(len(expected_pairs))):
-        raise ValueError("accepted refinement must cover every observed transition")
-
-    completed_pairs = iter(decision.attempts)
-    grouped: dict[int, list[tuple[SamplingProvenance, RefineResult]]] = {
-        index: [] for index in unique_indices
-    }
-    stages: dict[int, list[tuple[str, str]]] = {index: [] for index in unique_indices}
-    pairs: dict[int, tuple[int, int]] = {}
-    for item in decision.provenance:
-        base = item.boundary_index * 3
-        expected_pass = {"broad": base, "broad_retry": base + 1, "dense": base + 2}[item.stage]
-        if item.pass_id != expected_pass:
-            raise ValueError("provenance pass_id does not match boundary/stage")
-        stages[item.boundary_index].append((item.stage, item.outcome))
-        pair = (item.from_subtask_index, item.to_subtask_index)
-        if pair != expected_pairs[item.boundary_index]:
-            raise ValueError("provenance transition must match the exact observed pair")
-        if item.boundary_index in pairs and pairs[item.boundary_index] != pair:
-            raise ValueError("all evidence for a boundary must request the same transition")
-        pairs[item.boundary_index] = pair
-        if item.outcome == "completed":
-            grouped[item.boundary_index].append((item, next(completed_pairs)))
-    allowed_stages = (
-        [("broad", "completed"), ("dense", "completed")],
-        [("broad", "completed"), ("dense", "model_oom")],
-        [("broad", "completed")],
-        [("broad", "model_oom"), ("broad_retry", "completed"), ("dense", "completed")],
-        [("broad", "model_oom"), ("broad_retry", "completed"), ("dense", "model_oom")],
-        [("broad", "model_oom"), ("broad_retry", "model_oom")],
-        [("broad", "model_oom")],
-    )
-    for values in stages.values():
-        if values not in allowed_stages:
-            raise ValueError("provenance stages are not a finite broad/retry/dense sequence")
-
+    provenance_index = 0
+    attempt_index = 0
+    degraded = False
+    terminal: Literal["review", "failed"] | None = None
     selected: list[int] = []
-    for index in unique_indices:
-        completed = grouped[index]
-        if len(completed) != 2:
-            if decision.status != "failed":
-                found.add("refine_transition_mismatch")
-            continue
-        requested = pairs[index]
-        results = [entry[1] for entry in completed]
-        if not all(_matches(result, *requested, decision.frame_count) for result in results):
+    for boundary_index, pair in enumerate(expected_pairs):
+        if provenance_index >= len(decision.provenance):
+            raise ValueError("provenance must cover every expected boundary in execution order")
+        broad = decision.provenance[provenance_index]
+        broad_cameras = (decision.camera_order[0],) if degraded else decision.camera_order
+        broad_stride = decision.base_broad_stride * 2 if degraded else decision.base_broad_stride
+        _validate_provenance_entry(
+            decision, broad, boundary_index, pair, "broad", boundary_index * 3,
+            decision.coarse_boundary_centers[boundary_index], decision.broad_radius_frames,
+            broad_stride, broad_cameras,
+        )
+        provenance_index += 1
+
+        if broad.outcome == "model_oom":
+            if degraded or len(decision.camera_order) == 1:
+                terminal = "failed"
+                break
+            degraded = True
+            if provenance_index >= len(decision.provenance):
+                raise ValueError("multi-camera broad OOM must be followed by one retry")
+            retry = decision.provenance[provenance_index]
+            _validate_provenance_entry(
+                decision, retry, boundary_index, pair, "broad_retry", boundary_index * 3 + 1,
+                decision.coarse_boundary_centers[boundary_index], decision.broad_radius_frames,
+                decision.base_broad_stride * 2, (decision.camera_order[0],),
+            )
+            provenance_index += 1
+            if retry.outcome == "model_oom":
+                terminal = "failed"
+                break
+            broad_result = decision.attempts[attempt_index]
+            attempt_index += 1
+        else:
+            broad_result = decision.attempts[attempt_index]
+            attempt_index += 1
+
+        if not 1 <= broad_result.boundary_frame < decision.frame_count:
+            found.add("refine_transition_mismatch")
+            terminal = "review"
+            break
+
+        if provenance_index >= len(decision.provenance):
+            raise ValueError("completed broad evidence must be followed by dense evidence")
+        dense = decision.provenance[provenance_index]
+        dense_cameras = (decision.camera_order[0],) if degraded else decision.camera_order
+        _validate_provenance_entry(
+            decision, dense, boundary_index, pair, "dense", boundary_index * 3 + 2,
+            broad_result.boundary_frame, decision.dense_radius_frames, 1, dense_cameras,
+        )
+        provenance_index += 1
+        if dense.outcome == "model_oom":
+            terminal = "failed"
+            break
+        dense_result = decision.attempts[attempt_index]
+        attempt_index += 1
+        if not (
+            _matches(broad_result, *pair, decision.frame_count)
+            and _matches(dense_result, *pair, decision.frame_count)
+        ):
             found.add("refine_transition_mismatch")
             continue
-        agreed = choose_agreed_boundary(results, decision.agreement_tolerance_frames)
+        agreed = choose_agreed_boundary(
+            [broad_result, dense_result], decision.agreement_tolerance_frames
+        )
         if agreed is None:
             found.add("refine_boundary_disagreement")
-            if any(len(item.cameras) > 1 for item, _ in completed):
-                # The schema has no per-camera judgment. Conservatively flag a
-                # camera conflict only when disagreement used actual multi-camera evidence.
-                found.add("camera_evidence_conflict")
             continue
         selected.append(agreed)
+
+    if provenance_index != len(decision.provenance) or attempt_index != len(decision.attempts):
+        raise ValueError("provenance and attempts must end at the semantic terminal stage")
+    if terminal == "failed":
+        if decision.status != "failed":
+            raise ValueError("terminal OOM provenance requires failed status")
+        found.add("model_oom")
+    elif decision.status == "failed":
+        raise ValueError("failed status requires one terminal OOM stage")
+    if terminal == "review" and decision.status != "needs_review":
+        raise ValueError("invalid broad result requires needs_review status")
+    if terminal is None and len(expected_pairs) and provenance_index == 0:
+        raise ValueError("provenance must cover every expected boundary")
     if decision.status == "accepted" and len(selected) != len(expected_pairs):
         raise ValueError("accepted refinement must agree on every observed transition")
     return found, tuple(selected)
+
+
+def _validate_provenance_entry(
+    decision: RefineDecision,
+    item: SamplingProvenance,
+    boundary_index: int,
+    pair: tuple[int, int],
+    stage: str,
+    pass_id: int,
+    center: int,
+    radius: int,
+    stride: int,
+    cameras: tuple[str, ...],
+) -> None:
+    if item.boundary_index != boundary_index:
+        raise ValueError("provenance boundary order must be chronological and contiguous")
+    if (item.from_subtask_index, item.to_subtask_index) != pair:
+        raise ValueError("provenance transition must match the exact observed pair")
+    if item.stage != stage or item.pass_id != pass_id:
+        raise ValueError("provenance stages and pass IDs must match execution order")
+    if item.request_center != center:
+        raise ValueError("provenance request center does not match its semantic stage")
+    if item.radius_frames != radius:
+        raise ValueError("provenance radius does not match decision sampling context")
+    if item.stride != stride:
+        raise ValueError("provenance stride does not match degradation state")
+    if item.cameras != cameras:
+        raise ValueError("provenance cameras do not match degradation state")
+    expected_grid = tuple(_evidence_indices(center, radius, stride, decision.frame_count))
+    if tuple(sample.camera_key for sample in item.samples) != cameras or any(
+        sample.frame_indices != expected_grid for sample in item.samples
+    ):
+        raise ValueError("provenance camera sampling grid is not recomputable")
 
 
 def _ordered(found):
     return tuple(reason for reason in _REASON_ORDER if reason in found)
 
 
-def _oom_failure(common, attempts, provenance):
+def _oom_failure(common, attempts, provenance, found):
+    reasons = _ordered(set(found) | {"model_oom"})
     return RefineDecision(
         status="failed", attempts=tuple(attempts), provenance=tuple(provenance),
-        reasons=("model_oom",), annotation=None, candidate_annotation=None,
+        reasons=reasons, annotation=None, candidate_annotation=None,
         failure_category="model_oom", **common,
     )
