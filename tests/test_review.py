@@ -91,6 +91,7 @@ def _workspace(tmp_path: Path, *, mode: str = "dagger_patch", reasons=None, issu
 
 def test_human_decision_is_strict_and_rejects_extra_or_coercion() -> None:
     good = {"episode_index": 0, "source_fingerprint": "a" * 64,
+            "run_fingerprint": "b" * 64, "mode": "dagger_patch",
             "start_subtask_index": 1, "boundaries": [100]}
     assert HumanDecision.model_validate(good).episode_index == 0
     with pytest.raises(ValidationError):
@@ -112,6 +113,14 @@ def test_review_renders_safe_evidence_json_and_exact_aliases(tmp_path: Path) -> 
     payload = json.loads((page.parent / "episode_000000.json").read_text())
     assert "NESTED-SECRET" not in json.dumps(payload)
     assert payload["source_fingerprint"] == record.source_fingerprint
+    assert payload["run_fingerprint"] == record.run_fingerprint and payload["mode"] == "dagger_patch"
+    assert f'data-run-fingerprint="{record.run_fingerprint}"' in html
+    assert 'data-mode="dagger_patch"' in html
+    assert "Content-Security-Policy" in html and "default-src 'none'" in html
+    assert '<script src="review.js"></script>' in html
+    javascript = (page.parent / "review.js").read_text()
+    assert "run_fingerprint" in javascript and "mode:" in javascript
+    assert "fetch(" not in javascript and "eval(" not in javascript and "innerHTML" not in javascript
     assert len(payload["coarse_attempts"]) == 2 and len(payload["refine_attempts"]) == 1
     assert payload["candidates"] == [183, 184]
     assert (page.parent / "episode_000000" / "boundary-184-before.jpg").read_bytes() == b"jpeg:cam.eye:183"
@@ -145,6 +154,7 @@ def test_invalid_human_decision_preserves_authoritative_bytes(tmp_path: Path, an
 def test_valid_human_decision_accepts_and_audits_without_losing_attempts(tmp_path: Path) -> None:
     work, _, _, record, services, _ = _workspace(tmp_path)
     decision = HumanDecision(episode_index=0, source_fingerprint=record.source_fingerprint,
+                             run_fingerprint=record.run_fingerprint, mode="dagger_patch",
                              start_subtask_index=1, boundaries=[184])
     accepted = apply_human_decision(work, 0, decision, services=services)
     assert accepted.status == "accepted" and accepted.decision_source == "human"
@@ -155,10 +165,29 @@ def test_valid_human_decision_accepts_and_audits_without_losing_attempts(tmp_pat
     assert audit["prior_reasons"] == ["coarse_sequence_disagreement"]
     assert audit["prior_candidate"] == {"start_subtask_index": 1, "boundaries": [184]}
     assert audit["accepted_annotation"] == {"start_subtask_index": 1, "boundaries": [184]}
+    assert audit["run_fingerprint"] == record.run_fingerprint and audit["mode"] == "dagger_patch"
     assert accepted.updated_at > record.updated_at
     assert [item["to_status"] for item in accepted.sampling_details["_pipeline_transition_events"]] == ["needs_review", "accepted"]
     with pytest.raises(ValueError, match="needs_review"):
         apply_human_decision(work, 0, decision, services=services)
+
+
+@pytest.mark.parametrize("field,value,message", [
+    ("mode", "complete", "mode"),
+    ("run_fingerprint", "f" * 64, "run fingerprint"),
+])
+def test_human_decision_replay_context_mismatch_preserves_bytes(tmp_path: Path, field, value, message) -> None:
+    work, _, _, record, services, _ = _workspace(tmp_path)
+    payload = {"episode_index": 0, "source_fingerprint": record.source_fingerprint,
+               "run_fingerprint": record.run_fingerprint, "mode": "dagger_patch",
+               "start_subtask_index": 1, "boundaries": [184]}
+    payload[field] = value
+    decision = HumanDecision.model_validate(payload)
+    path = work / "episodes/episode_000000.json"
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match=message):
+        apply_human_decision(work, 0, decision, services=services)
+    assert path.read_bytes() == before
 
 
 def test_stale_source_or_symlink_output_aborts_without_writes(tmp_path: Path) -> None:
@@ -243,3 +272,126 @@ def test_human_save_failure_restores_authoritative_episode_bytes(tmp_path: Path,
         apply_human_decision(work, 0, FinalAnnotation(start_subtask_index=1, boundaries=[184]),
                              source_fingerprint=record.source_fingerprint, services=services)
     assert episode_path.read_bytes() == before
+
+
+def test_publish_recovers_owned_backup_left_between_renames(tmp_path: Path) -> None:
+    work, _, _, _, services, _ = _workspace(tmp_path)
+    page = render_review_site(work, services=services)
+    destination = page.parent
+    backup = destination.parent / ".needs_review.backup"
+    destination.replace(backup)
+    assert not destination.exists() and (backup / ".qwen-annotate-review-v1").is_file()
+    recovered = render_review_site(work, services=services)
+    assert recovered.is_file() and not backup.exists()
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink"])
+def test_publish_never_touches_unowned_or_symlink_backup(tmp_path: Path, kind: str) -> None:
+    work, _, _, _, services, _ = _workspace(tmp_path)
+    backup = work / "previews/.needs_review.backup"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if kind == "directory":
+        backup.mkdir()
+        (backup / "user.txt").write_text("keep")
+    else:
+        backup.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="backup"):
+        render_review_site(work, services=services)
+    assert (backup / "user.txt").read_text() == "keep" if kind == "directory" else backup.is_symlink()
+
+
+def test_publish_staging_rename_failure_rolls_back_live_bundle(tmp_path: Path, monkeypatch) -> None:
+    work, _, _, _, services, _ = _workspace(tmp_path)
+    page = render_review_site(work, services=services)
+    before = page.read_bytes()
+    import qwen_annotate.review as review_module
+    real_replace = review_module.os.replace
+
+    def fail_staging(source, destination, *args, **kwargs):
+        if Path(source).name.startswith(".needs_review.staging-") and Path(destination).name == "needs_review":
+            raise OSError("staging rename failed")
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(review_module.os, "replace", fail_staging)
+    with pytest.raises(OSError, match="staging rename failed"):
+        render_review_site(work, services=services)
+    assert page.read_bytes() == before
+    assert not (work / "previews/.needs_review.backup").exists()
+
+
+def test_postcommit_backup_cleanup_failure_still_succeeds_then_recovers(tmp_path: Path, monkeypatch) -> None:
+    work, _, _, _, services, _ = _workspace(tmp_path)
+    render_review_site(work, services=services)
+    import qwen_annotate.review as review_module
+    real_rmtree = review_module.shutil.rmtree
+    failed = False
+
+    def fail_backup_once(path, *args, **kwargs):
+        nonlocal failed
+        if Path(path).name == ".needs_review.backup" and not failed:
+            failed = True
+            raise OSError("cleanup failed")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(review_module.shutil, "rmtree", fail_backup_once)
+    page = render_review_site(work, services=services)
+    assert page.is_file() and (work / "previews/.needs_review.backup").is_dir()
+    monkeypatch.setattr(review_module.shutil, "rmtree", real_rmtree)
+    assert render_review_site(work, services=services).is_file()
+    assert not (work / "previews/.needs_review.backup").exists()
+
+
+def test_two_concurrent_renderers_are_serialized(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    work, _, _, _, services, _ = _workspace(tmp_path)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pages = list(pool.map(lambda _: render_review_site(work, services=services), range(2)))
+    assert pages[0] == pages[1] and all(page.is_file() for page in pages)
+    assert not list((work / "previews").glob(".needs_review.staging-*"))
+    assert not (work / "previews/.needs_review.backup").exists()
+
+
+def test_parent_directory_fsync_failure_rolls_back_existing_live_bundle(tmp_path: Path, monkeypatch) -> None:
+    work, _, _, _, services, _ = _workspace(tmp_path)
+    page = render_review_site(work, services=services)
+    before = page.read_bytes()
+    previews = work / "previews"
+    import qwen_annotate.review as review_module
+    real_fsync_directory = review_module._fsync_directory
+    failed = False
+
+    def fail_publish_fsync(path):
+        nonlocal failed
+        if Path(path) == previews and not failed:
+            failed = True
+            raise OSError("parent fsync failed")
+        return real_fsync_directory(path)
+
+    monkeypatch.setattr(review_module, "_fsync_directory", fail_publish_fsync)
+    with pytest.raises(OSError, match="parent fsync failed"):
+        render_review_site(work, services=services)
+    assert page.read_bytes() == before
+    assert not (previews / ".needs_review.backup").exists()
+
+
+def test_publish_lock_symlink_and_stale_stage_safety(tmp_path: Path) -> None:
+    work, _, _, _, services, _ = _workspace(tmp_path)
+    previews = work / "previews"
+    outside = tmp_path / "outside-lock"
+    outside.write_text("keep")
+    lock = previews / ".review-publish.lock"
+    lock.symlink_to(outside)
+    with pytest.raises(ValueError, match="lock"):
+        render_review_site(work, services=services)
+    assert outside.read_text() == "keep"
+    lock.unlink()
+
+    owned = previews / ".needs_review.staging-owned"
+    owned.mkdir()
+    (owned / ".qwen-annotate-review-v1").write_text("owned\n")
+    unowned = previews / ".needs_review.staging-user"
+    unowned.mkdir()
+    (unowned / "keep.txt").write_text("keep")
+    assert render_review_site(work, services=services).is_file()
+    assert not owned.exists() and (unowned / "keep.txt").read_text() == "keep"

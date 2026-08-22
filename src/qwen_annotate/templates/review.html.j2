@@ -1,13 +1,13 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><title>Qwen annotation review</title></head>
+<head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; img-src 'self' data:; style-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; navigate-to 'self' blob:"><title>Qwen annotation review</title></head>
 <body>
   <h1>Qwen annotation review</h1>
   <p>Task: {{ high_level_instruction }}</p>
   <ol>{% for subtask in subtasks %}<li>{{ subtask.skill }} — {{ subtask.text }}</li>{% endfor %}</ol>
   {% if not episodes %}<p>No episodes need review.</p>{% endif %}
   {% for episode in episodes %}
-  <article data-episode="{{ episode.episode_index }}" data-fingerprint="{{ episode.source_fingerprint }}">
+  <article data-episode="{{ episode.episode_index }}" data-fingerprint="{{ episode.source_fingerprint }}" data-run-fingerprint="{{ episode.run_fingerprint }}" data-mode="{{ episode.mode }}">
     <h2>{{ episode.episode }}</h2>
     <p>Source fingerprint: <code>{{ episode.source_fingerprint }}</code></p>
     <ul>{% for reason in episode.review_reasons %}<li>{{ reason }}</li>{% endfor %}

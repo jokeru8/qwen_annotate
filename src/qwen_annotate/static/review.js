@@ -11,6 +11,8 @@ document.querySelectorAll(".decision-form").forEach((form) => {
     const decision = {
       episode_index: Number(article.dataset.episode),
       source_fingerprint: article.dataset.fingerprint,
+      run_fingerprint: article.dataset.runFingerprint,
+      mode: article.dataset.mode,
       start_subtask_index: Number(startText),
       boundaries: parts.map(Number),
     };

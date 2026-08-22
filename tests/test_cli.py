@@ -118,6 +118,7 @@ def test_review_apply_strictly_loads_and_delegates(monkeypatch, tmp_path: Path) 
     fingerprint = "a" * 64
     decision_path = tmp_path / "decision.json"
     decision_path.write_text(json.dumps({"episode_index": 3, "source_fingerprint": fingerprint,
+                                         "run_fingerprint": "b" * 64, "mode": "dagger_patch",
                                          "start_subtask_index": 1, "boundaries": [50]}))
     calls = []
 
@@ -134,9 +135,10 @@ def test_review_apply_strictly_loads_and_delegates(monkeypatch, tmp_path: Path) 
 
 
 @pytest.mark.parametrize("payload", [
-    '{"episode_index":0,"episode_index":1,"source_fingerprint":"' + "a" * 64 + '","start_subtask_index":0,"boundaries":[]}',
-    '{"episode_index":0,"source_fingerprint":"' + "a" * 64 + '","start_subtask_index":0,"boundaries":[NaN]}',
-    '{"episode_index":"0","source_fingerprint":"' + "a" * 64 + '","start_subtask_index":0,"boundaries":[]}',
+    '{"episode_index":0,"episode_index":1,"source_fingerprint":"' + "a" * 64 + '","run_fingerprint":"' + "b" * 64 + '","mode":"dagger_patch","start_subtask_index":0,"boundaries":[]}',
+    '{"episode_index":0,"source_fingerprint":"' + "a" * 64 + '","run_fingerprint":"' + "b" * 64 + '","mode":"dagger_patch","start_subtask_index":0,"boundaries":[NaN]}',
+    '{"episode_index":"0","source_fingerprint":"' + "a" * 64 + '","run_fingerprint":"' + "b" * 64 + '","mode":"dagger_patch","start_subtask_index":0,"boundaries":[]}',
+    '{"episode_index":0,"source_fingerprint":"' + "a" * 64 + '","run_fingerprint":"' + "b" * 64 + '","start_subtask_index":0,"boundaries":[]}',
 ])
 def test_review_apply_invalid_decision_is_usage_exit_two(tmp_path: Path, payload: str) -> None:
     decision = tmp_path / "decision.json"
@@ -148,6 +150,7 @@ def test_review_apply_invalid_decision_is_usage_exit_two(tmp_path: Path, payload
 def test_review_apply_operational_rejection_is_exit_one(monkeypatch, tmp_path: Path) -> None:
     decision = tmp_path / "decision.json"
     decision.write_text(json.dumps({"episode_index": 0, "source_fingerprint": "a" * 64,
+                                    "run_fingerprint": "b" * 64, "mode": "dagger_patch",
                                     "start_subtask_index": 0, "boundaries": []}))
     monkeypatch.setattr("qwen_annotate.cli.apply_human_decision",
                         lambda *args: (_ for _ in ()).throw(ValueError("stale fingerprint")))

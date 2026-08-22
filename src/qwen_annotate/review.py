@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import math
 import os
@@ -11,10 +12,11 @@ import secrets
 import shutil
 import stat
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -42,10 +44,12 @@ class HumanDecision(BaseModel):
 
     episode_index: int = Field(ge=0)
     source_fingerprint: str
+    run_fingerprint: str
+    mode: Literal["complete", "dagger_patch"]
     start_subtask_index: int = Field(ge=0)
     boundaries: list[int]
 
-    @field_validator("source_fingerprint")
+    @field_validator("source_fingerprint", "run_fingerprint")
     @classmethod
     def exact_fingerprint(cls, value: str) -> str:
         if not _SHA256.fullmatch(value):
@@ -77,6 +81,14 @@ def render_review_site(work_dir: Path, *, services: ReviewServices | None = None
     """Render a self-contained static review bundle without modifying source data."""
     service = services or ReviewServices()
     root = _workspace_root(work_dir)
+    previews = root / "previews"
+    _assert_directory(previews, "workspace previews")
+    with _review_publish_lock(previews):
+        _recover_review_publication(previews)
+        return _render_review_site_locked(root, previews, service)
+
+
+def _render_review_site_locked(root: Path, previews: Path, service: ReviewServices) -> Path:
     store = WorkspaceStore(root)
     manifest = _load_manifest(root)
     config = _effective_config(manifest, root)
@@ -89,14 +101,13 @@ def render_review_site(work_dir: Path, *, services: ReviewServices | None = None
     for record in review_records:
         _assert_current_source(manifest, dataset, record)
 
-    previews = root / "previews"
     destination = previews / "needs_review"
-    _assert_directory(previews, "workspace previews")
     _assert_replaceable_destination(destination)
+    _cleanup_owned_stages(previews)
     staging = previews / f".needs_review.staging-{secrets.token_hex(12)}"
     staging.mkdir(mode=0o700)
     try:
-        (staging / _OWNER).write_text("owned\n", encoding="ascii")
+        _write_file(staging / _OWNER, b"owned\n")
         shutil.copyfile(Path(__file__).parent / "static" / "review.js", staging / "review.js")
         episodes = []
         for record in review_records:
@@ -113,7 +124,8 @@ def render_review_site(work_dir: Path, *, services: ReviewServices | None = None
             subtasks=[item.model_dump() for item in manifest.subtasks],
         )
         _write_file(staging / "index.html", html.encode("utf-8"))
-        _publish_directory(staging, destination)
+        _sync_tree(staging)
+        _publish_directory(staging, destination, previews)
     except BaseException:
         if staging.exists() and not staging.is_symlink():
             shutil.rmtree(staging)
@@ -146,6 +158,10 @@ def apply_human_decision(
         if annotation.episode_index != episode_index:
             raise ValueError("decision episode identity does not match requested episode")
         supplied_fingerprint = annotation.source_fingerprint
+        if annotation.mode != manifest.mode:
+            raise ValueError("decision mode does not match workspace manifest")
+        if annotation.run_fingerprint != manifest.run_fingerprint:
+            raise ValueError("decision run fingerprint does not match workspace manifest")
         final = FinalAnnotation(
             start_subtask_index=annotation.start_subtask_index,
             boundaries=list(annotation.boundaries),
@@ -188,6 +204,8 @@ def apply_human_decision(
         "accepted_annotation": final.model_dump(mode="json"),
         "supplied_source_fingerprint": supplied_fingerprint,
         "current_source_fingerprint": current_fingerprint,
+        "run_fingerprint": manifest.run_fingerprint,
+        "mode": manifest.mode,
         "timestamp": updated_at.isoformat(),
     }
     previous_audits = details.get("human_decisions", [])
@@ -268,6 +286,8 @@ def _render_episode(staging, config, manifest, episode, record, service):
         "episode": episode_name,
         "episode_index": record.episode_index,
         "source_fingerprint": record.source_fingerprint,
+        "run_fingerprint": record.run_fingerprint,
+        "mode": manifest.mode,
         "review_reasons": list(record.review_reasons),
         "validation_issues": [item.model_dump(mode="json") for item in record.validation_issues],
         "candidate_annotation": _candidate_annotation(record),
@@ -496,7 +516,7 @@ def _assert_replaceable_destination(path):
     if not path.is_dir():
         raise ValueError("review destination must be a directory")
     entries = list(path.iterdir())
-    if entries and not (path / _OWNER).is_file():
+    if entries and not _owned_review_directory(path):
         raise ValueError("nonempty review destination is not owned by this renderer")
     allowed_root = {_OWNER, "review.js", "index.html"}
     for item in entries:
@@ -520,15 +540,143 @@ def _assert_replaceable_destination(path):
         raise ValueError("review destination contains an unowned entry")
 
 
-def _publish_directory(staging, destination):
-    backup = destination.parent / f".needs_review.backup-{secrets.token_hex(12)}"
-    os.replace(destination, backup)
+@contextmanager
+def _review_publish_lock(previews: Path):
+    path = previews / ".review-publish.lock"
+    if path.is_symlink():
+        raise ValueError("review publish lock must not be a symlink")
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("review publish lock must be a regular file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _recover_review_publication(previews: Path) -> None:
+    destination = previews / "needs_review"
+    backup = previews / ".needs_review.backup"
+    if backup.is_symlink():
+        raise ValueError("review backup must not be a symlink")
+    if backup.exists():
+        if not _owned_review_directory(backup):
+            raise ValueError("review backup is not owned by this renderer")
+        if not destination.exists() and not destination.is_symlink():
+            os.replace(backup, destination)
+            _fsync_directory(previews)
+        else:
+            _assert_replaceable_destination(destination)
+            try:
+                shutil.rmtree(backup)
+                _fsync_directory(previews)
+            except OSError:
+                pass
+            if backup.exists():
+                raise ValueError("owned stale review backup could not be cleaned")
+    if not destination.exists():
+        raise ValueError("review destination and recoverable backup are both missing")
+
+
+def _cleanup_owned_stages(previews: Path) -> None:
+    for path in previews.glob(".needs_review.staging-*"):
+        if path.is_symlink() or not _owned_review_directory(path):
+            continue
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            pass
+
+
+def _owned_review_directory(path: Path) -> bool:
+    if path.is_symlink() or not path.is_dir():
+        return False
+    marker = path / _OWNER
+    if marker.is_symlink() or not marker.is_file():
+        return False
+    try:
+        return marker.read_bytes() == b"owned\n"
+    except OSError:
+        return False
+
+
+def _sync_tree(root: Path) -> None:
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path.is_symlink():
+            raise ValueError("generated review staging tree contains a symlink")
+        if path.is_file():
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        elif path.is_dir():
+            _fsync_directory(path)
+        else:
+            raise ValueError("generated review staging tree contains an unsafe entry")
+    _fsync_directory(root)
+
+
+def _publish_directory(staging: Path, destination: Path, previews: Path) -> None:
+    backup = previews / ".needs_review.backup"
+    if backup.exists() or backup.is_symlink():
+        raise ValueError("review backup path must be absent before commit")
+    initial_empty = not any(destination.iterdir())
+    if initial_empty:
         os.replace(staging, destination)
+        try:
+            _fsync_directory(previews)
+        except BaseException:
+            if destination.exists() and _owned_review_directory(destination):
+                os.replace(destination, staging)
+            destination.mkdir()
+            try:
+                _fsync_directory(previews)
+            except OSError:
+                pass
+            raise
+        return
+    old_moved = False
+    new_moved = False
+    try:
+        os.replace(destination, backup)
+        old_moved = True
+        _fsync_directory(previews)
+        os.replace(staging, destination)
+        new_moved = True
+        _fsync_directory(previews)
     except BaseException:
-        os.replace(backup, destination)
+        if new_moved and destination.exists() and _owned_review_directory(destination):
+            try:
+                os.replace(destination, staging)
+            except OSError:
+                pass
+        if old_moved and backup.exists() and not destination.exists():
+            os.replace(backup, destination)
+            old_moved = False
+            try:
+                _fsync_directory(previews)
+            except OSError:
+                pass
         raise
-    shutil.rmtree(backup)
+    try:
+        shutil.rmtree(backup)
+        _fsync_directory(previews)
+    except OSError:
+        # The new live tree is already committed. Recovery cleans this owned backup later.
+        pass
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _write_file(path, payload):
