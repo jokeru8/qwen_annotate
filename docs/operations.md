@@ -188,6 +188,26 @@ uv run qwen-annotate review WORK_DIR --apply decision_episode_000003.json
 
 decision 文件必须只含 `episode_index`、`source_fingerprint`、`run_fingerprint`、`mode`、`start_subtask_index` 和 `boundaries`。导入时会重新检查指纹、边界范围/顺序、最短 segment 和 complete/DAgger 约束；通过后记录 `decision_source: human`。
 
+更适合逐帧判断边界的是本地可视化服务：
+
+```bash
+UV_PROJECT_ENVIRONMENT=/tmp/qwen-annotate-latest-env \
+  uv run qwen-annotate review WORK_DIR --serve
+# 浏览器打开 http://127.0.0.1:8765
+```
+
+界面会列出全部状态，并同时显示主相机和同步辅相机；点击辅相机可将其提升为主画面。Space 播放/暂停，左右方向键逐帧，Shift+方向键跳 10 帧，`B` 在当前帧添加边界，Delete/Backspace 删除最近边界；时间线边界手柄可直接拖动，也可聚焦后用方向键微调。时间线中的边界帧属于后一个 subtask。未提交的边界、起始任务、说明和接管状态会按 episode 保存在当前页面内存中，切换 episode 不会丢失；刷新/关闭页面仍会清空草稿。
+
+`needs_review` 会载入模型候选，可调整后直接提交。`pending` 和 `failed` 默认只读，只有点击“人工接管”并再次确认后才能完整手工标注；`accepted` 的修正也采用同样门禁。后端会检查页面打开时的 status/`updated_at`、source/run fingerprint 和全部硬约束，状态已被其他进程更新时会拒绝陈旧提交。原失败类别、模型 attempts、原候选和最终人工结果保存在 `sampling_details.human_decisions` 审计中。
+
+服务默认只监听 `127.0.0.1`。远程机器建议使用 SSH 端口转发：
+
+```bash
+ssh -L 8765:127.0.0.1:8765 USER@HOST
+```
+
+需要显式暴露给受信网络时可使用 `--host 0.0.0.0 --port PORT`，但首版没有登录认证，不应直接暴露到公网。可视化界面只更新 workspace，不负责发布；确认结果后仍按下一节执行 `convert` 和 `validate`。
+
 ## 7. 转换与独立验证
 
 完整发布保留源 payload 字节和编号，要求每个 episode 都已接受：

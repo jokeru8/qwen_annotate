@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Qwen 自动标注复核</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header>
+    <div><span class="eyebrow">QWEN · LEROBOT</span><h1>自动标注复核台</h1></div>
+    <div id="workspace-summary" class="summary">正在读取 workspace…</div>
+  </header>
+  <main>
+    <aside class="episodes-panel">
+      <div class="panel-title"><h2>Episodes</h2><span id="episode-count"></span></div>
+      <div id="status-filters" class="filters"></div>
+      <div id="episode-list" class="episode-list" aria-live="polite"></div>
+    </aside>
+
+    <section class="viewer-panel">
+      <div class="viewer-heading">
+        <div><span id="episode-label" class="eyebrow">未选择</span><h2 id="task-title">选择一个 episode</h2></div>
+        <span id="status-badge" class="status-badge">—</span>
+      </div>
+      <div id="video-grid" class="video-grid empty"><p>从左侧选择 episode</p></div>
+      <div class="transport">
+        <button id="play-button" type="button" aria-label="播放或暂停">▶</button>
+        <button id="prev-frame" type="button">−1 帧</button>
+        <button id="next-frame" type="button">+1 帧</button>
+        <input id="frame-slider" type="range" min="0" max="0" value="0">
+        <output id="frame-output">帧 0 · 0.000s</output>
+      </div>
+      <div id="timeline" class="timeline" aria-label="subtask 时间线"></div>
+      <div class="boundary-tools">
+        <button id="add-boundary" type="button">在当前帧添加边界</button>
+        <button id="remove-boundary" type="button">删除最近边界</button>
+        <span>边界帧属于后一个任务</span>
+      </div>
+      <div id="boundary-list" class="boundary-list"></div>
+    </section>
+
+    <aside class="review-panel">
+      <section><span class="eyebrow">任务模板 · 只读</span><h2 id="instruction">—</h2><ol id="subtask-list" class="subtasks"></ol></section>
+      <section class="evidence"><h3>自动标注依据</h3><div id="evidence-content" class="muted">选择 episode 后显示</div></section>
+      <section class="decision">
+        <label>起始 subtask<select id="start-subtask"></select></label>
+        <label>人工说明<textarea id="decision-note" maxlength="2000" placeholder="可选：记录接管或修正原因"></textarea></label>
+        <div id="takeover-warning" class="warning hidden"></div>
+        <button id="takeover-button" class="danger hidden" type="button">人工接管</button>
+        <button id="save-button" class="primary" type="button" disabled>提交为 accepted</button>
+        <div id="validation-message" class="validation"></div>
+        <p id="decision-message" class="message" aria-live="polite"></p>
+      </section>
+      <details><summary>快捷键</summary><p>Space 播放/暂停；←/→ 逐帧；Shift + ←/→ 跳 10 帧；B 添加边界；Delete 删除最近边界。</p></details>
+    </aside>
+  </main>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

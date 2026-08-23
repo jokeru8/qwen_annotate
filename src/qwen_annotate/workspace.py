@@ -45,6 +45,10 @@ class LegacyWorkspaceError(ValueError):
     """A pre-layered workspace is intentionally read-only under the current schema."""
 
 
+class ConcurrentWorkspaceUpdate(ValueError):
+    """Authoritative episode state changed after a caller prepared its update."""
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -206,7 +210,10 @@ def _validate_pipeline_transition_outbox(record: EpisodeRecord) -> None:
         raise ValueError("pipeline transition outbox must be a list")
     fields = {"event_id", "timestamp", "episode", "from_status", "to_status", "event", "category", "reasons"}
     statuses = {"pending", "coarse_done", "refine_done", "accepted", "needs_review", "failed"}
-    event_names = {"coarse_review", "coarse_completed", "refine_completed", "accepted", "refine_review", "error"}
+    event_names = {
+        "coarse_review", "coarse_completed", "refine_completed", "accepted",
+        "refine_review", "error", "human_takeover", "human_corrected",
+    }
     categories = {None, "invalid_model_response", "model_oom", "model_call", "source_or_video", "unexpected_error", "workspace_state"}
     parsed: list[tuple[dict[str, Any], datetime]] = []
     for item in raw:
@@ -570,7 +577,12 @@ class WorkspaceStore:
             _atomic_json_write(path, record.model_dump(mode="json"))
             self._write_summary_unlocked()
 
-    def save_episode_transactional(self, record: EpisodeRecord) -> None:
+    def save_episode_transactional(
+        self,
+        record: EpisodeRecord,
+        *,
+        expected_prior: EpisodeRecord | None = None,
+    ) -> None:
         """Save a transition and roll its authoritative file back if summary refresh fails.
 
         Human decisions use this stronger all-or-error contract because an operator must
@@ -585,6 +597,8 @@ class WorkspaceStore:
             if not _safe_entry_exists(path):
                 raise ValueError("transactional save requires an existing episode record")
             prior = self._load_episode_unlocked(record.episode_index)
+            if expected_prior is not None and prior != expected_prior:
+                raise ConcurrentWorkspaceUpdate("episode changed during transactional save")
             self._validate_transition(prior, record)
             self._validate_final_annotation(record)
             if prior == record:
@@ -605,8 +619,31 @@ class WorkspaceStore:
                 raise
             backup = f".{path.name}.{secrets.token_hex(12)}.rollback"
             try:
-                os.link(path.name, backup, src_dir_fd=directory_fd, dst_dir_fd=rollback_fd,
-                        follow_symlinks=False)
+                source_fd = os.open(
+                    path.name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+                try:
+                    backup_fd = os.open(
+                        backup,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=rollback_fd,
+                    )
+                    try:
+                        while chunk := os.read(source_fd, 1024 * 1024):
+                            view = memoryview(chunk)
+                            while view:
+                                written = os.write(backup_fd, view)
+                                if written <= 0:
+                                    raise OSError("rollback backup write made no progress")
+                                view = view[written:]
+                        os.fsync(backup_fd)
+                    finally:
+                        os.close(backup_fd)
+                finally:
+                    os.close(source_fd)
                 try:
                     _atomic_json_write(path, record.model_dump(mode="json"))
                     self._write_summary_unlocked()
@@ -782,6 +819,13 @@ class WorkspaceStore:
         if prior.created_at != current.created_at:
             raise ValueError("episode creation time cannot change")
         if prior.status == current.status:
+            if (
+                prior.status == "accepted"
+                and current.updated_at > prior.updated_at
+                and current.decision_source == "human"
+                and WorkspaceStore._has_current_human_audit(current, prior.status)
+            ):
+                return
             if prior != current:
                 raise ValueError(f"non-identical same-status update is forbidden for {prior.status}")
             return
@@ -790,15 +834,36 @@ class WorkspaceStore:
         if prior.status == "needs_review" and current.status == "accepted" and current.decision_source != "human":
             raise ValueError("needs_review may only transition to a human decision")
         allowed: dict[str, set[str]] = {
-            "pending": {"coarse_done", "needs_review", "failed"},
+            "pending": {"coarse_done", "needs_review", "failed", "accepted"},
             "coarse_done": {"refine_done", "needs_review", "failed"},
             "refine_done": {"accepted", "needs_review", "failed"},
             "needs_review": {"accepted", "failed"},
             "accepted": set(),
-            "failed": set(),
+            "failed": {"accepted"},
         }
         if current.status not in allowed[prior.status]:
             raise ValueError(f"illegal transition {prior.status} -> {current.status}")
+        if prior.status in {"pending", "failed"} and current.status == "accepted":
+            if current.decision_source != "human" or not WorkspaceStore._has_current_human_audit(
+                current, prior.status
+            ):
+                raise ValueError(
+                    "direct accepted transition requires a current human takeover audit"
+                )
+
+    @staticmethod
+    def _has_current_human_audit(record: EpisodeRecord, prior_status: str) -> bool:
+        audits = record.sampling_details.get("human_decisions")
+        if not isinstance(audits, list) or not audits or record.final_annotation is None:
+            return False
+        latest = audits[-1]
+        return bool(
+            isinstance(latest, dict)
+            and latest.get("prior_status") == prior_status
+            and latest.get("takeover_confirmed") is True
+            and latest.get("accepted_annotation") == record.final_annotation.model_dump(mode="json")
+            and latest.get("timestamp") == record.updated_at.isoformat()
+        )
 
     def _validate_final_annotation(self, record: EpisodeRecord) -> None:
         validate_zero_transition = (

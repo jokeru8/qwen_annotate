@@ -26,7 +26,13 @@ from .constraints import validate_annotation
 from .lerobot import DatasetIndex, inspect_dataset
 from .models import FinalAnnotation
 from .video import FrameSample, extract_frames, uniform_indices, window_indices
-from .workspace import EpisodeRecord, RunManifest, WorkspaceStore, compute_source_fingerprint
+from .workspace import (
+    ConcurrentWorkspaceUpdate,
+    EpisodeRecord,
+    RunManifest,
+    WorkspaceStore,
+    compute_source_fingerprint,
+)
 
 
 _MAX_DECISION_BYTES = 64 * 1024
@@ -35,6 +41,28 @@ _MAX_CANDIDATES = 64
 _MAX_IMAGES_PER_EPISODE = 512
 _OWNER = ".qwen-annotate-review-v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class ManualDecisionConflict(ValueError):
+    """The browser decision no longer matches authoritative workspace state."""
+
+    code = "workspace_conflict"
+
+
+class StaleEpisodeError(ManualDecisionConflict):
+    code = "stale_episode"
+
+
+class TakeoverRequiredError(ManualDecisionConflict):
+    code = "takeover_required"
+
+
+class InvalidManualAnnotation(ValueError):
+    code = "invalid_annotation"
+
+    def __init__(self, issues: list[str]) -> None:
+        self.issues = issues
+        super().__init__(", ".join(issues))
 
 
 class HumanDecision(BaseModel):
@@ -63,6 +91,35 @@ class HumanDecision(BaseModel):
             raise ValueError("boundaries must contain strict integers")
         return value
 
+
+class ManualDecision(HumanDecision):
+    """Optimistic browser decision with explicit high-risk takeover consent."""
+
+    expected_status: Literal["pending", "coarse_done", "refine_done", "accepted", "needs_review", "failed"]
+    expected_updated_at: datetime
+    takeover_confirmed: bool
+    note: str = Field(default="", max_length=2000)
+
+    @field_validator("expected_updated_at", mode="before")
+    @classmethod
+    def expected_time_is_aware(cls, value: object) -> datetime:
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                raise ValueError("expected_updated_at must be an ISO 8601 datetime") from None
+        if not isinstance(value, datetime):
+            raise ValueError("expected_updated_at must be a datetime")
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("expected_updated_at must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @field_validator("note")
+    @classmethod
+    def note_has_no_nul(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("note must not contain NUL")
+        return value.strip()
 
 @dataclass(frozen=True, slots=True)
 class ReviewServices:
@@ -226,7 +283,96 @@ def apply_human_decision(
         "updated_at": updated_at,
     })
     accepted = EpisodeRecord.model_validate(accepted.model_dump())
-    store.save_episode_transactional(accepted)
+    store.save_episode_transactional(accepted, expected_prior=record)
+    return accepted
+
+
+def apply_manual_decision(
+    work_dir: Path,
+    decision: ManualDecision,
+    *,
+    services: ReviewServices | None = None,
+) -> EpisodeRecord:
+    """Apply one optimistic visual-review decision to the authoritative workspace."""
+    if not isinstance(decision, ManualDecision):
+        raise TypeError("decision must be a ManualDecision")
+    service = services or ReviewServices()
+    root = _workspace_root(work_dir)
+    manifest = _load_manifest(root)
+    if decision.episode_index >= manifest.total_episodes:
+        raise ValueError("episode identity is outside the workspace manifest")
+    store = WorkspaceStore(root, clock=service.clock)
+    record = store.load_episode(decision.episode_index)
+    if record.status != decision.expected_status:
+        raise StaleEpisodeError("episode status changed; refresh before saving")
+    if record.updated_at != decision.expected_updated_at:
+        raise StaleEpisodeError("episode updated timestamp changed; refresh before saving")
+    if record.status in {"pending", "failed", "accepted"} and not decision.takeover_confirmed:
+        raise TakeoverRequiredError("explicit manual takeover confirmation is required")
+    if record.status not in {"pending", "failed", "accepted", "needs_review"}:
+        raise ValueError(f"manual decisions are not allowed from {record.status}")
+    _validate_record_run_context(record, manifest)
+    if decision.mode != manifest.mode:
+        raise ManualDecisionConflict("decision mode does not match workspace manifest")
+    if decision.run_fingerprint != manifest.run_fingerprint:
+        raise ManualDecisionConflict("decision run fingerprint does not match workspace manifest")
+    if decision.source_fingerprint != record.source_fingerprint:
+        raise ManualDecisionConflict("decision source fingerprint does not match episode record")
+
+    config = _effective_config(manifest, root)
+    dataset = service.inspect_dataset(config)
+    _validate_dataset(manifest, dataset)
+    episode = dataset.episodes[decision.episode_index]
+    _assert_current_source(manifest, dataset, record)
+    final = FinalAnnotation(
+        start_subtask_index=decision.start_subtask_index,
+        boundaries=list(decision.boundaries),
+    )
+    issues = validate_annotation(
+        final, manifest.mode, len(manifest.subtasks), episode.length, manifest.min_segment_frames,
+    )
+    if issues:
+        raise InvalidManualAnnotation([issue.code for issue in issues])
+    current_fingerprint = compute_source_fingerprint(manifest.dataset_root, episode)
+    if current_fingerprint != decision.source_fingerprint:
+        raise ManualDecisionConflict("source fingerprint changed before manual decision save")
+
+    updated_at = _strict_time(service.clock(), record.updated_at)
+    details = dict(record.sampling_details)
+    previous_audits = details.get("human_decisions", [])
+    if not isinstance(previous_audits, list):
+        raise ValueError("existing human decision audit is invalid")
+    audit = {
+        "prior_status": record.status,
+        "prior_failure_category": record.failure_category,
+        "prior_reasons": list(record.review_reasons),
+        "prior_validation_issues": [item.model_dump(mode="json") for item in record.validation_issues],
+        "prior_candidate": _candidate_annotation(record),
+        "accepted_annotation": final.model_dump(mode="json"),
+        "takeover_confirmed": decision.takeover_confirmed,
+        "note": decision.note,
+        "supplied_source_fingerprint": decision.source_fingerprint,
+        "current_source_fingerprint": current_fingerprint,
+        "run_fingerprint": manifest.run_fingerprint,
+        "mode": manifest.mode,
+        "timestamp": updated_at.isoformat(),
+    }
+    details["human_decisions"] = [*previous_audits, audit]
+    _append_manual_outbox(details, record, updated_at)
+    accepted = EpisodeRecord.model_validate(record.model_copy(update={
+        "status": "accepted",
+        "final_annotation": final,
+        "validation_issues": [],
+        "review_reasons": [],
+        "failure_category": None,
+        "decision_source": "human",
+        "sampling_details": details,
+        "updated_at": updated_at,
+    }).model_dump())
+    try:
+        store.save_episode_transactional(accepted, expected_prior=record)
+    except ConcurrentWorkspaceUpdate:
+        raise StaleEpisodeError("episode changed concurrently; refresh before saving") from None
     return accepted
 
 
@@ -745,4 +891,35 @@ def _append_human_outbox(details, record, updated_at):
              "timestamp": updated_at.isoformat(), "episode": record.episode_index,
              "from_status": "needs_review", "to_status": "accepted", "event": "accepted",
              "category": None, "reasons": []}
+    details[key] = [*events, event]
+
+
+def _append_manual_outbox(details, record, updated_at):
+    key = "_pipeline_transition_events"
+    if key not in details:
+        return
+    events = details[key]
+    if not isinstance(events, list):
+        raise ValueError("pipeline transition outbox is invalid")
+    event_name = "human_corrected" if record.status == "accepted" else "human_takeover"
+    payload = {
+        "run_fingerprint": record.run_fingerprint,
+        "episode": record.episode_index,
+        "from_status": record.status,
+        "to_status": "accepted",
+        "updated_at": updated_at.isoformat(),
+        "event": event_name,
+        "category": None,
+        "reasons": [],
+    }
+    event = {
+        "event_id": hashlib.sha256(_canonical_json(payload).encode()).hexdigest(),
+        "timestamp": updated_at.isoformat(),
+        "episode": record.episode_index,
+        "from_status": record.status,
+        "to_status": "accepted",
+        "event": event_name,
+        "category": None,
+        "reasons": [],
+    }
     details[key] = [*events, event]

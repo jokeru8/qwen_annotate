@@ -23,6 +23,14 @@ model_app = typer.Typer(no_args_is_help=True, pretty_exceptions_enable=False)
 app.add_typer(model_app, name="model")
 
 
+def serve_review_app(work_dir: Path, host: str, port: int) -> None:
+    """Lazily import the optional HTTP stack and run one workspace-bound app."""
+    import uvicorn
+    from .review_server import create_review_app
+
+    uvicorn.run(create_review_app(work_dir), host=host, port=port)
+
+
 def parse_episode_indices(value: str) -> list[int]:
     """Parse a deliberately whitespace-free comma-separated index list."""
     if not isinstance(value, str) or not value or any(char.isspace() for char in value):
@@ -107,7 +115,20 @@ def status_command(work_dir: Path, as_json: bool = typer.Option(False, "--json")
 def review_command(
     work_dir: Path,
     decision_path: Path | None = typer.Option(None, "--apply"),
+    serve: bool = typer.Option(False, "--serve"),
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8765, "--port", min=1, max=65535),
 ) -> None:
+    if serve and decision_path is not None:
+        typer.echo("--serve and --apply cannot be used together.", err=True)
+        raise typer.Exit(2)
+    if serve:
+        try:
+            serve_review_app(work_dir, host, port)
+        except Exception:
+            typer.echo("Visual review server failed.", err=True)
+            raise typer.Exit(1)
+        return
     if decision_path is None:
         try:
             page = render_review_site(work_dir)

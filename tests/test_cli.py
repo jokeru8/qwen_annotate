@@ -157,6 +157,26 @@ def test_review_render_delegates_and_prints_page(monkeypatch, tmp_path: Path) ->
     assert str(page) in result.stdout
 
 
+def test_review_serve_delegates_host_port_and_rejects_apply(monkeypatch, tmp_path: Path) -> None:
+    calls = []
+    monkeypatch.setattr(
+        "qwen_annotate.cli.serve_review_app",
+        lambda work, host, port: calls.append((work, host, port)),
+    )
+    work = tmp_path / "work"
+    result = runner.invoke(app, [
+        "review", str(work), "--serve", "--host", "0.0.0.0", "--port", "9001",
+    ])
+    assert result.exit_code == 0
+    assert calls == [(work, "0.0.0.0", 9001)]
+
+    contradictory = runner.invoke(app, [
+        "review", str(work), "--serve", "--apply", str(tmp_path / "decision.json"),
+    ])
+    assert contradictory.exit_code == 2
+    assert "cannot be used together" in contradictory.output
+
+
 def test_review_apply_strictly_loads_and_delegates(monkeypatch, tmp_path: Path) -> None:
     fingerprint = "a" * 64
     decision_path = tmp_path / "decision.json"

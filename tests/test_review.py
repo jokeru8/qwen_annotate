@@ -12,7 +12,15 @@ from qwen_annotate.config import AnnotationConfig
 from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo
 from qwen_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
 from qwen_annotate.prompts import PROMPT_VERSION
-from qwen_annotate.review import HumanDecision, ReviewServices, apply_human_decision, render_review_site
+from qwen_annotate.review import (
+    HumanDecision,
+    ManualDecision,
+    ReviewServices,
+    StaleEpisodeError,
+    apply_human_decision,
+    apply_manual_decision,
+    render_review_site,
+)
 from qwen_annotate.video import FrameSample
 from qwen_annotate.workspace import EpisodeRecord, WorkspaceStore
 
@@ -184,6 +192,135 @@ def test_valid_human_decision_accepts_and_audits_without_losing_attempts(tmp_pat
         apply_human_decision(work, 0, decision, services=services)
 
 
+def _manual_decision(record, *, takeover: bool, boundaries=(184,), note="checked video"):
+    return ManualDecision(
+        episode_index=record.episode_index,
+        source_fingerprint=record.source_fingerprint,
+        run_fingerprint=record.run_fingerprint,
+        mode="dagger_patch",
+        expected_status=record.status,
+        expected_updated_at=record.updated_at,
+        takeover_confirmed=takeover,
+        start_subtask_index=1,
+        boundaries=list(boundaries),
+        note=note,
+    )
+
+
+def test_pending_manual_annotation_requires_explicit_takeover(tmp_path: Path) -> None:
+    work, _, store, _, services, _ = _workspace(tmp_path)
+    episode = services.inspect_dataset(None).episodes[0]
+    pending = store.invalidate_episode(0, episode=episode)
+    before = (work / "episodes/episode_000000.json").read_bytes()
+
+    with pytest.raises(ValueError, match="takeover"):
+        apply_manual_decision(work, _manual_decision(pending, takeover=False), services=services)
+
+    assert (work / "episodes/episode_000000.json").read_bytes() == before
+    accepted = apply_manual_decision(work, _manual_decision(pending, takeover=True), services=services)
+    assert accepted.status == "accepted" and accepted.decision_source == "human"
+    assert accepted.sampling_details["human_decisions"][-1]["prior_status"] == "pending"
+
+
+def test_failed_takeover_preserves_failure_diagnostics_in_audit(tmp_path: Path) -> None:
+    work, _, store, record, services, _ = _workspace(tmp_path)
+    failed = record.model_copy(update={
+        "status": "failed",
+        "failure_category": "video_corrupt",
+        "review_reasons": [],
+        "sampling_details": {
+            key: value for key, value in record.sampling_details.items()
+            if key != "_pipeline_transition_events"
+        },
+        "updated_at": record.updated_at.replace(microsecond=2),
+    })
+    store.save_episode(failed)
+
+    accepted = apply_manual_decision(
+        work, _manual_decision(failed, takeover=True, note="manually segmented"), services=services,
+    )
+
+    audit = accepted.sampling_details["human_decisions"][-1]
+    assert audit["prior_status"] == "failed"
+    assert audit["prior_failure_category"] == "video_corrupt"
+    assert audit["note"] == "manually segmented"
+    assert accepted.failure_category is None
+    assert accepted.coarse_attempts == record.coarse_attempts
+
+
+def test_manual_decision_rejects_stale_status_and_timestamp(tmp_path: Path) -> None:
+    work, _, _, record, services, _ = _workspace(tmp_path)
+    stale_status = _manual_decision(record, takeover=False).model_copy(
+        update={"expected_status": "pending"}
+    )
+    with pytest.raises(ValueError, match="status changed"):
+        apply_manual_decision(work, stale_status, services=services)
+
+    stale_time = _manual_decision(record, takeover=False).model_copy(
+        update={"expected_updated_at": NOW}
+    )
+    with pytest.raises(ValueError, match="updated"):
+        apply_manual_decision(work, stale_time, services=services)
+
+
+def test_manual_decision_rejects_concurrent_change_after_source_validation(tmp_path: Path) -> None:
+    work, _, store, record, services, _ = _workspace(tmp_path)
+    changed = False
+
+    def inspect_and_advance(config):
+        nonlocal changed
+        if not changed:
+            changed = True
+            failed = record.model_copy(update={
+                "status": "failed",
+                "failure_category": "model_call",
+                "review_reasons": [],
+                "sampling_details": {
+                    key: value for key, value in record.sampling_details.items()
+                    if key != "_pipeline_transition_events"
+                },
+                "updated_at": record.updated_at.replace(microsecond=2),
+            })
+            store.save_episode(failed)
+        return services.inspect_dataset(config)
+
+    racing_services = ReviewServices(
+        inspect_dataset=inspect_and_advance,
+        sampler=services.sampler,
+        clock=lambda: NOW.replace(microsecond=3),
+    )
+    with pytest.raises(StaleEpisodeError, match="concurrent"):
+        apply_manual_decision(
+            work, _manual_decision(record, takeover=False), services=racing_services,
+        )
+    assert store.load_episode(0).status == "failed"
+
+
+def test_accepted_annotation_correction_requires_takeover_and_is_audited(tmp_path: Path) -> None:
+    work, _, _, record, services, _ = _workspace(tmp_path)
+    accepted = apply_human_decision(
+        work,
+        0,
+        FinalAnnotation(start_subtask_index=1, boundaries=[184]),
+        source_fingerprint=record.source_fingerprint,
+        services=services,
+    )
+    before = (work / "episodes/episode_000000.json").read_bytes()
+    with pytest.raises(ValueError, match="takeover"):
+        apply_manual_decision(
+            work, _manual_decision(accepted, takeover=False, boundaries=(190,)), services=services,
+        )
+    assert (work / "episodes/episode_000000.json").read_bytes() == before
+
+    corrected = apply_manual_decision(
+        work, _manual_decision(accepted, takeover=True, boundaries=(190,)), services=services,
+    )
+    assert corrected.final_annotation == FinalAnnotation(start_subtask_index=1, boundaries=[190])
+    audit = corrected.sampling_details["human_decisions"][-1]
+    assert audit["prior_status"] == "accepted"
+    assert audit["prior_candidate"] == {"start_subtask_index": 1, "boundaries": [184]}
+
+
 @pytest.mark.parametrize("field,value,message", [
     ("mode", "complete", "mode"),
     ("run_fingerprint", "f" * 64, "run fingerprint"),
@@ -283,6 +420,50 @@ def test_human_save_failure_restores_authoritative_episode_bytes(tmp_path: Path,
     with pytest.raises(OSError, match="summary disk failure"):
         apply_human_decision(work, 0, FinalAnnotation(start_subtask_index=1, boundaries=[184]),
                              source_fingerprint=record.source_fingerprint, services=services)
+    assert episode_path.read_bytes() == before
+
+
+def test_manual_save_works_when_filesystem_rejects_hardlinks(tmp_path: Path, monkeypatch) -> None:
+    work, _, _, record, services, _ = _workspace(tmp_path)
+    import qwen_annotate.workspace as workspace_module
+
+    monkeypatch.setattr(
+        workspace_module.os,
+        "link",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError(95, "Operation not supported")),
+    )
+    accepted = apply_manual_decision(
+        work, _manual_decision(record, takeover=False), services=services,
+    )
+    assert accepted.status == "accepted"
+
+
+def test_manual_fuse_fallback_rolls_back_when_summary_write_fails(tmp_path: Path, monkeypatch) -> None:
+    work, _, _, record, services, _ = _workspace(tmp_path)
+    episode_path = work / "episodes/episode_000000.json"
+    before = episode_path.read_bytes()
+    import qwen_annotate.workspace as workspace_module
+    real_write = workspace_module._atomic_json_write
+    failed = False
+
+    monkeypatch.setattr(
+        workspace_module.os,
+        "link",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError(95, "Operation not supported")),
+    )
+
+    def fail_summary_once(path, value):
+        nonlocal failed
+        if path.name == "summary.json" and not failed:
+            failed = True
+            raise OSError("summary disk failure")
+        return real_write(path, value)
+
+    monkeypatch.setattr(workspace_module, "_atomic_json_write", fail_summary_once)
+    with pytest.raises(OSError, match="summary disk failure"):
+        apply_manual_decision(
+            work, _manual_decision(record, takeover=False), services=services,
+        )
     assert episode_path.read_bytes() == before
 
 

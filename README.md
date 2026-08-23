@@ -42,6 +42,8 @@ inspect → annotate (coarse → refine) → status/review → convert → valid
 ```bash
 uv run qwen-annotate annotate CONFIG.yaml --episodes 0,3,8 --max-concurrency 2
 uv run qwen-annotate status WORK_DIR --json
+# 本地多相机可视化复核（默认仅监听本机）
+uv run qwen-annotate review WORK_DIR --serve
 uv run qwen-annotate review WORK_DIR
 uv run qwen-annotate review WORK_DIR --apply decision_episode_000003.json
 uv run qwen-annotate convert WORK_DIR --output DATASET_ANNOTATED
@@ -91,7 +93,9 @@ src/qwen_annotate/
   refine.py              broad/dense 多相机边界精修
   pipeline.py            episode/批处理编排与状态流转
   workspace.py           指纹、原子持久化、恢复与审计
-  review.py              静态复核页面和人工 decision 导入
+  review.py              静态复核、严格人工 decision 与审计写入
+  review_server.py       本地可视化复核 API、视频 Range 响应
+  review_web/            多相机同步播放和人工标注前端
   converter.py           完整/accepted-only 数据集转换
   stats.py               parquet 和视频统计量重算
   release_validator.py   独立发布一致性验证
@@ -105,7 +109,7 @@ src/qwen_annotate/
 ### Workspace 与兼容性
 
 - `episodes/*.json` 是权威状态，`summary.json` 可恢复，`logs/run.jsonl` 是派生审计链。
-- `accepted`、`needs_review` 和 `failed` 是当前运行的终态；重复 annotate 会跳过它们。
+- `accepted`、`needs_review` 和 `failed` 是自动流程的终态；重复 annotate 会跳过它们。可视化复核允许显式人工接管 `pending`/`failed`，也允许显式修正 `accepted`，并保留审计。
 - source、work_dir、模式、subtask、模型 endpoint/revision、sampling 或 prompt 变化都会影响 provenance；不同配置不得复用同一 workspace。
 - prompt、配置、模型 revision 或 source 指纹不匹配时必须 fail closed。
 - 旧 schema workspace 只用于审计。重跑时创建新的空 `work_dir`，不要编辑旧 episode JSON、删除 manifest 或伪造指纹继续运行。
