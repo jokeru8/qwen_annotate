@@ -10,7 +10,7 @@ from tests.test_review import _workspace
 
 def _run_js(expression: str) -> object:
     module = Path("src/qwen_annotate/review_web/app.js").resolve().as_uri()
-    script = f"import({json.dumps(module)}).then(m => console.log(JSON.stringify({expression})))"
+    script = f"import({json.dumps(module)}).then(async m => console.log(JSON.stringify(await ({expression}))))"
     completed = subprocess.run(
         ["node", "--input-type=module", "-e", script],
         check=True,
@@ -64,11 +64,29 @@ def test_draft_validation_reports_mode_count_order_and_short_segments() -> None:
     assert result["valid"] == []
 
 
-def test_pointer_and_camera_helpers_drive_drag_and_promotion_behavior() -> None:
+def test_pointer_and_camera_helpers_drive_drag_without_resizing_cameras() -> None:
     result = _run_js("({"
         "frames:[m.frameFromPointer(100,300,200,101),m.frameFromPointer(499,300,200,101)],"
         "actions:[m.cameraClickAction('wrist','eye'),m.cameraClickAction('eye','eye')]})")
-    assert result == {"frames": [0, 100], "actions": ["promote", "toggle_play"]}
+    assert result == {"frames": [0, 100], "actions": ["toggle_play", "toggle_play"]}
+
+
+def test_playback_sync_corrects_at_half_frame_not_multi_frame_drift() -> None:
+    result = _run_js("({"
+        "within:m.needsFrameCorrection(1.0,1.0+0.49/28,28),"
+        "half:m.needsFrameCorrection(1.0,1.0+0.5/28,28),"
+        "twoFrames:m.needsFrameCorrection(1.0,1.0+2/28,28)})")
+    assert result == {"within": False, "half": True, "twoFrames": True}
+
+
+def test_shared_seek_waits_for_every_camera_and_uses_one_frame_time() -> None:
+    result = _run_js("(async()=>{class Video{constructor(delay){this.readyState=1;this.seeking=false;this._time=0;this.delay=delay;this.listeners={};}"
+        "addEventListener(name,fn){this.listeners[name]=fn;}removeEventListener(name){delete this.listeners[name];}"
+        "get currentTime(){return this._time;}set currentTime(value){this._time=value;this.seeking=true;setTimeout(()=>{this.seeking=false;this.listeners.seeked?.();},this.delay);}}"
+        "const videos=[new Video(1),new Video(3),new Video(5),new Video(7)];let resolved=false;"
+        "const pending=m.seekVideosToFrame(videos,28,28).then(()=>{resolved=true;});"
+        "const before=resolved;await pending;return {before,after:resolved,times:videos.map(v=>v.currentTime)};})()")
+    assert result == {"before": False, "after": True, "times": [1, 1, 1, 1]}
 
 
 def test_episode_drafts_are_copied_and_restored_independently() -> None:
@@ -111,6 +129,8 @@ def test_web_assets_are_served_with_csp_and_no_directory_listing(tmp_path: Path)
     assert page.status_code == 200
     assert page.headers["content-security-policy"].startswith("default-src 'self'")
     assert "Qwen 自动标注复核" in page.text
+    assert 'class="transport-row"' in page.text
+    assert 'class="frame-slider"' in page.text
     assert client.get("/assets/app.js").status_code == 200
     assert client.get("/assets/style.css").status_code == 200
     assert client.get("/assets/../review_server.py").status_code == 404

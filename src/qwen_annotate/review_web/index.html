@@ -25,11 +25,13 @@
       </div>
       <div id="video-grid" class="video-grid empty"><p>从左侧选择 episode</p></div>
       <div class="transport">
-        <button id="play-button" type="button" aria-label="播放或暂停">▶</button>
-        <button id="prev-frame" type="button">−1 帧</button>
-        <button id="next-frame" type="button">+1 帧</button>
-        <input id="frame-slider" type="range" min="0" max="0" value="0">
-        <output id="frame-output">帧 0 · 0.000s</output>
+        <div class="transport-row">
+          <button id="play-button" type="button" aria-label="播放或暂停">▶</button>
+          <button id="prev-frame" type="button">−1 帧</button>
+          <button id="next-frame" type="button">+1 帧</button>
+          <output id="frame-output">帧 0 · 0.000s</output>
+        </div>
+        <input id="frame-slider" class="frame-slider" type="range" min="0" max="0" value="0">
       </div>
       <div id="timeline" class="timeline" aria-label="subtask 时间线"></div>
       <div class="boundary-tools">

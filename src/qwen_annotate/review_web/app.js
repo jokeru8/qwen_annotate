@@ -49,7 +49,39 @@ export function frameFromPointer(clientX, left, width, length) {
 }
 
 export function cameraClickAction(camera, primary) {
-  return camera === primary ? "toggle_play" : "promote";
+  return "toggle_play";
+}
+
+export function needsFrameCorrection(actualTime, targetTime, fps) {
+  return Math.abs(actualTime - targetTime) * fps >= 0.5 - 1e-9;
+}
+
+function seekOneVideo(video, targetTime) {
+  return new Promise((resolve, reject) => {
+    const begin = () => {
+      if (Math.abs(video.currentTime - targetTime) < 1e-9 && !video.seeking) {
+        resolve();
+        return;
+      }
+      const cleanup = () => {
+        video.removeEventListener("seeked", complete);
+        video.removeEventListener("error", fail);
+      };
+      const complete = () => { cleanup(); resolve(); };
+      const fail = () => { cleanup(); reject(new Error("video_seek_failed")); };
+      video.addEventListener("seeked", complete, {once: true});
+      video.addEventListener("error", fail, {once: true});
+      try { video.currentTime = targetTime; }
+      catch (error) { cleanup(); reject(error); }
+    };
+    if (video.readyState === 0) video.addEventListener("loadedmetadata", begin, {once: true});
+    else begin();
+  });
+}
+
+export function seekVideosToFrame(videos, frame, fps) {
+  const targetTime = frame / fps;
+  return Promise.all([...videos].map(video => seekOneVideo(video, targetTime)));
 }
 
 export function validateDraft(context, startSubtask, boundaries) {
@@ -100,7 +132,7 @@ export function finishSelection(view, generation) {
 const palette = ["#45c4a0", "#56a8e8", "#a98aef", "#ef9f62", "#df6f8f", "#8dbb54"];
 const state = {session: null, episodes: [], detail: null, frame: 0, boundaries: [], start: 0,
   filter: "all", takeover: false, primary: null, videos: new Map(), syncing: false, drafts: new Map(),
-  loading: false, saving: false, selectionGeneration: 0};
+  loading: false, saving: false, selectionGeneration: 0, seekGeneration: 0, syncLoopId: null};
 
 const $ = id => document.getElementById(id);
 const api = async (url, options) => {
@@ -182,51 +214,64 @@ async function selectEpisode(index) {
 
 function renderVideos() {
   state.videos.clear(); const root = $("video-grid"); root.replaceChildren(); root.className = "video-grid";
-  const cameras = Object.keys(state.detail.video_urls).sort(camera => camera === state.primary ? -1 : 1);
+  const cameras = Object.keys(state.detail.video_urls);
   for (const camera of cameras) {
-    const card = document.createElement("button"); card.type = "button"; card.dataset.camera = camera; card.className = `video-card ${camera === state.primary ? "primary-video" : ""}`;
+    const card = document.createElement("button"); card.type = "button"; card.dataset.camera = camera; card.className = "video-card";
     const video = document.createElement("video"); video.src = state.detail.video_urls[camera]; video.preload = "metadata"; video.muted = true; video.playsInline = true;
-    const label = document.createElement("span"); label.textContent = camera;
-    card.append(video, label); card.onclick = () => promoteCamera(camera);
-    video.addEventListener("timeupdate", () => { if (camera === state.primary && !state.syncing) syncFromMaster(video); });
-    video.addEventListener("click", event => { event.preventDefault(); event.stopPropagation(); cameraClickAction(camera, state.primary) === "promote" ? promoteCamera(camera) : togglePlay(); });
+    const label = document.createElement("span"); label.className = "camera-label"; label.textContent = camera;
+    const frame = document.createElement("span"); frame.className = "camera-frame"; frame.textContent = "帧 0";
+    card.append(video, label, frame); card.onclick = togglePlay;
+    video.addEventListener("click", event => { event.preventDefault(); event.stopPropagation(); togglePlay(); });
     state.videos.set(camera, video); root.append(card);
   }
 }
 
-function promoteCamera(camera) {
-  if (camera === state.primary) return;
-  state.primary = camera;
-  for (const card of $("video-grid").querySelectorAll(".video-card")) {
-    card.classList.toggle("primary-video", card.dataset.camera === camera);
-  }
-  seek(state.frame);
-}
 function primaryVideo() { return state.videos.get(state.primary); }
 function syncFromMaster(master) {
   state.frame = frameFromTime(master.currentTime, state.session.fps, state.detail.episode_length);
-  for (const video of state.videos.values()) if (video !== master && Math.abs(video.currentTime - master.currentTime) > .08) video.currentTime = master.currentTime;
+  const targetTime = state.frame / state.session.fps;
+  for (const video of state.videos.values()) {
+    if (video !== master && !video.seeking && needsFrameCorrection(video.currentTime, targetTime, state.session.fps)) {
+      video.currentTime = targetTime;
+    }
+  }
   updateFrameUI();
 }
-function seek(frame) {
-  if (!state.detail) return; state.frame = Math.max(0, Math.min(state.detail.episode_length - 1, frame));
-  state.syncing = true; const time = state.frame / state.session.fps;
-  for (const video of state.videos.values()) video.currentTime = time;
-  state.syncing = false; updateFrameUI();
+function stopSyncLoop() {
+  if (state.syncLoopId !== null) cancelAnimationFrame(state.syncLoopId);
+  state.syncLoopId = null;
 }
-function pauseAll() { for (const video of state.videos.values()) video.pause(); }
+function startSyncLoop() {
+  stopSyncLoop();
+  const tick = () => {
+    const master = primaryVideo();
+    if (!master || master.paused) { state.syncLoopId = null; return; }
+    if (!state.syncing) syncFromMaster(master);
+    state.syncLoopId = requestAnimationFrame(tick);
+  };
+  state.syncLoopId = requestAnimationFrame(tick);
+}
+async function seek(frame) {
+  if (!state.detail) return; state.frame = Math.max(0, Math.min(state.detail.episode_length - 1, frame));
+  const generation = ++state.seekGeneration; state.syncing = true; updateFrameUI();
+  try { await seekVideosToFrame(state.videos.values(), state.frame, state.session.fps); }
+  finally { if (generation === state.seekGeneration) { state.syncing = false; updateFrameUI(); } }
+}
+function pauseAll() { stopSyncLoop(); for (const video of state.videos.values()) video.pause(); }
 async function togglePlay() {
   const master = primaryVideo(); if (!master) return;
-  if (master.paused) { await Promise.all([...state.videos.values()].map(video => video.play().catch(() => {}))); $("play-button").textContent = "❚❚"; }
+  if (master.paused) { await seek(state.frame); await Promise.all([...state.videos.values()].map(video => video.play().catch(() => {}))); $("play-button").textContent = "❚❚"; startSyncLoop(); }
   else { pauseAll(); $("play-button").textContent = "▶"; }
 }
-function step(delta) { pauseAll(); $("play-button").textContent = "▶"; seek(state.frame + delta); }
+function step(delta) { pauseAll(); $("play-button").textContent = "▶"; void seek(state.frame + delta); }
+function manualSeek(frame) { pauseAll(); $("play-button").textContent = "▶"; void seek(frame); }
 
 function updateFrameUI() {
   $("frame-slider").value = String(state.frame);
   setText("frame-output", `帧 ${state.frame} · ${(state.frame/state.session.fps).toFixed(3)}s`);
   const active = segmentAt(state.frame, state.start, state.boundaries, state.session.subtasks.length);
   [...$("subtask-list").children].forEach((item,index) => item.classList.toggle("current", index === active));
+  for (const badge of $("video-grid").querySelectorAll(".camera-frame")) badge.textContent = `帧 ${state.frame}`;
   renderBoundaryList();
 }
 
@@ -247,7 +292,7 @@ function renderTimeline() {
     handle.onkeydown=event=>{if(!["ArrowLeft","ArrowRight"].includes(event.key))return;event.preventDefault();moveBoundary(index,frame+(event.key==="ArrowLeft"?-1:1)*(event.shiftKey?10:1));};
     root.append(handle);
   });
-  root.onclick = event => { const box=root.getBoundingClientRect(); seek(Math.round((event.clientX-box.left)/box.width*(state.detail.episode_length-1))); };
+  root.onclick = event => { const box=root.getBoundingClientRect(); manualSeek(Math.round((event.clientX-box.left)/box.width*(state.detail.episode_length-1))); };
   const tasks = $("subtask-list"); tasks.replaceChildren();
   state.session.subtasks.forEach((task,index) => { const li=document.createElement("li"); const skill=document.createElement("span"); skill.textContent=task.skill; const text=document.createElement("p"); text.textContent=task.text; li.append(skill,text); tasks.append(li); });
   updateFrameUI();
@@ -255,7 +300,7 @@ function renderTimeline() {
 
 function beginBoundaryDrag(event,index,handle) {
   if (!canEdit()) return;
-  event.preventDefault(); event.stopPropagation(); handle.setPointerCapture(event.pointerId);
+  event.preventDefault(); event.stopPropagation(); pauseAll(); $("play-button").textContent = "▶"; handle.setPointerCapture(event.pointerId);
   handle.onpointermove=pointer=>{
     const box=$("timeline").getBoundingClientRect();
     moveBoundary(index,frameFromPointer(pointer.clientX,box.left,box.width,state.detail.episode_length),false);
@@ -267,13 +312,13 @@ function beginBoundaryDrag(event,index,handle) {
 function moveBoundary(index,frame,rerender=true) {
   const low=index===0?1:state.boundaries[index-1]+1;
   const high=index===state.boundaries.length-1?state.detail.episode_length-1:state.boundaries[index+1]-1;
-  state.boundaries[index]=Math.max(low,Math.min(high,frame)); seek(state.boundaries[index]);
+  state.boundaries[index]=Math.max(low,Math.min(high,frame)); manualSeek(state.boundaries[index]);
   if(rerender){renderTimeline();renderDecision();rememberCurrentDraft();}
 }
 
 function renderBoundaryList() {
   const root = $("boundary-list"); root.replaceChildren();
-  state.boundaries.forEach((frame,index) => { const button=document.createElement("button"); button.textContent=`${index+1}: 帧 ${frame}`; button.onclick=()=>seek(frame); root.append(button); });
+  state.boundaries.forEach((frame,index) => { const button=document.createElement("button"); button.textContent=`${index+1}: 帧 ${frame}`; button.onclick=()=>manualSeek(frame); root.append(button); });
 }
 
 function renderEvidence() {
@@ -309,7 +354,7 @@ function rememberCurrentDraft(){if(state.detail)rememberDraft(state.drafts,state
 
 function bindControls() {
   $("play-button").onclick = togglePlay; $("prev-frame").onclick=()=>step(-1); $("next-frame").onclick=()=>step(1);
-  $("frame-slider").oninput = event => seek(Number(event.target.value));
+  $("frame-slider").oninput = event => manualSeek(Number(event.target.value));
   $("start-subtask").onchange = event => { state.start=Number(event.target.value); renderTimeline();rememberCurrentDraft(); };
   $("decision-note").oninput=rememberCurrentDraft;
   $("add-boundary").onclick = () => { state.boundaries=insertBoundary(state.boundaries,state.frame,state.detail.episode_length);renderTimeline();renderDecision();rememberCurrentDraft(); };
