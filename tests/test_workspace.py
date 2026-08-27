@@ -7,13 +7,13 @@ from threading import Barrier, Thread
 import pytest
 from pydantic import ValidationError
 
-from qwen_annotate.coarse import CoarseDecision
-from qwen_annotate.config import Subtask
-from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo
-from qwen_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
-from qwen_annotate.prompts import PROMPT_VERSION
-from qwen_annotate.refine import RefineDecision
-from qwen_annotate.workspace import (
+from robo_annotate.coarse import CoarseDecision
+from robo_annotate.config import Subtask
+from robo_annotate.lerobot import DatasetIndex, EpisodeInfo
+from robo_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
+from robo_annotate.prompts import PROMPT_VERSION
+from robo_annotate.refine import RefineDecision
+from robo_annotate.workspace import (
     EpisodeRecord,
     RunManifest,
     WorkspaceStore,
@@ -830,7 +830,7 @@ def test_save_is_atomic_cleans_temp_and_fsyncs_file_and_directory(tmp_path: Path
     store.create_layout()
     calls = []
     real_fsync = os.fsync
-    monkeypatch.setattr("qwen_annotate.workspace.os.fsync", lambda fd: (calls.append(fd), real_fsync(fd))[1])
+    monkeypatch.setattr("robo_annotate.workspace.os.fsync", lambda fd: (calls.append(fd), real_fsync(fd))[1])
     store.save_episode(pending())
     assert len(calls) >= 4
     assert not list(store.root.rglob("*.tmp"))
@@ -839,7 +839,7 @@ def test_save_is_atomic_cleans_temp_and_fsyncs_file_and_directory(tmp_path: Path
 
     def fail_replace(source, target, **kwargs):
         raise OSError("replace failed")
-    monkeypatch.setattr("qwen_annotate.workspace.os.replace", fail_replace)
+    monkeypatch.setattr("robo_annotate.workspace.os.replace", fail_replace)
     with pytest.raises(OSError, match="replace failed"):
         store.save_episode(transition(loaded, "failed", failure_category="test"))
     assert not list(store.root.rglob("*.tmp"))
@@ -900,7 +900,7 @@ def test_workspace_rejects_symlink_file_targets_without_touching_outside(
 
 
 def test_episode_commit_survives_summary_failure_and_summary_is_recoverable(tmp_path: Path, monkeypatch) -> None:
-    import qwen_annotate.workspace as workspace
+    import robo_annotate.workspace as workspace
 
     store = WorkspaceStore(tmp_path / "work")
     store.create_layout()
@@ -929,7 +929,7 @@ def _fd_count() -> int:
 
 
 def test_lock_fdopen_failure_closes_fd_and_releases_thread_lock(tmp_path: Path, monkeypatch) -> None:
-    import qwen_annotate.workspace as workspace
+    import robo_annotate.workspace as workspace
 
     store = WorkspaceStore(tmp_path / "work")
     store.create_layout()
@@ -943,7 +943,7 @@ def test_lock_fdopen_failure_closes_fd_and_releases_thread_lock(tmp_path: Path, 
 
 
 def test_atomic_fdopen_failure_closes_raw_fd_and_cleans_temp(tmp_path: Path, monkeypatch) -> None:
-    import qwen_annotate.workspace as workspace
+    import robo_annotate.workspace as workspace
 
     target = tmp_path / "value.json"
     before = _fd_count()
@@ -956,7 +956,7 @@ def test_atomic_fdopen_failure_closes_raw_fd_and_cleans_temp(tmp_path: Path, mon
 
 
 def test_json_fstat_failure_closes_raw_fd(tmp_path: Path, monkeypatch) -> None:
-    import qwen_annotate.workspace as workspace
+    import robo_annotate.workspace as workspace
 
     path = tmp_path / "value.json"
     path.write_text('{"value":1}')
@@ -969,7 +969,7 @@ def test_json_fstat_failure_closes_raw_fd(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_unlock_failure_closes_handle_and_releases_thread_lock(tmp_path: Path, monkeypatch) -> None:
-    import qwen_annotate.workspace as workspace
+    import robo_annotate.workspace as workspace
 
     store = WorkspaceStore(tmp_path / "work")
     store.create_layout()

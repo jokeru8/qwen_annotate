@@ -5,14 +5,14 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
-from qwen_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation
-from qwen_annotate.qwen_client import (
+from robo_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation
+from robo_annotate.qwen_client import (
     InvalidModelResponse,
     ModelCallError,
     ModelOutOfMemory,
     QwenClient,
 )
-from qwen_annotate.video import FrameSample, as_data_url
+from robo_annotate.video import FrameSample, as_data_url
 
 
 class SemanticPayload(BaseModel):

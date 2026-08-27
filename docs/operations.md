@@ -1,17 +1,17 @@
-# Qwen3.8 LeRobot 标注操作手册
+# Robo-annotate 操作手册
 
 本文描述当前代码已经实现的可复现流程。所有示例均以官方仓库 `Qwen/Qwen3.8-27B`、固定安装目录 `/mnt/data/user/zhoukr/models/Qwen3.8-27B` 和 LeRobot v2.1 为准。
 
 ## 1. 环境与只读预检
 
 ```bash
-cd /mnt/data/user/zhoukr/qwen_annotate
-python3 -m venv --copies /mnt/data/user/zhoukr/envs/qwen-annotate
-UV_PROJECT_ENVIRONMENT=/mnt/data/user/zhoukr/envs/qwen-annotate uv sync --extra dev
-export UV_PROJECT_ENVIRONMENT=/mnt/data/user/zhoukr/envs/qwen-annotate
+cd /mnt/data/user/zhoukr/Robo-annotate
+python3 -m venv --copies /mnt/data/user/zhoukr/envs/Robo-annotate
+UV_PROJECT_ENVIRONMENT=/mnt/data/user/zhoukr/envs/Robo-annotate uv sync --extra dev
+export UV_PROJECT_ENVIRONMENT=/mnt/data/user/zhoukr/envs/Robo-annotate
 
 uv run pytest -q
-uv run qwen-annotate inspect examples/complete.yaml
+uv run Robo-annotate inspect examples/complete.yaml
 ```
 
 `inspect` 在推理前严格检查 v2.1 版本、连续 episode index、parquet 行数、任务引用、相机集合、每路视频 frame/FPS/尺寸和 metadata 总数。它不创建 workspace。
@@ -67,7 +67,7 @@ DAgger 配置只把 `mode` 改为 `dagger_patch`，并为该批数据使用独�
 下载命令先把可变 revision 解析成 40 字符小写 commit SHA，再用 `hf download` 断点下载，以 `hf cache verify --fail-on-missing-files` 验证所有 repo 文件，最后原子写入 `model-install.json`：
 
 ```bash
-uv run qwen-annotate model download \
+uv run Robo-annotate model download \
   --repo Qwen/Qwen3.8-27B \
   --local-dir /mnt/data/user/zhoukr/models/Qwen3.8-27B \
   --max-workers 8
@@ -112,9 +112,9 @@ CUDA_VISIBLE_DEVICES=0 /mnt/data/user/zhoukr/envs/vllm/bin/vllm serve \
 另一个终端只跑参考 episode 0：
 
 ```bash
-uv run qwen-annotate inspect examples/complete.yaml
-uv run qwen-annotate annotate examples/complete.yaml --episodes 0 --max-concurrency 1
-uv run qwen-annotate status \
+uv run Robo-annotate inspect examples/complete.yaml
+uv run Robo-annotate annotate examples/complete.yaml --episodes 0 --max-concurrency 1
+uv run Robo-annotate status \
   /mnt/data/user/zhoukr/annotations/arrange_orange_juice_and_green_tea_2 --json
 ```
 
@@ -142,10 +142,10 @@ result: FAILED_BOUNDARY_ACCURACY_BASELINE; see section 8
 ## 5. 批量运行、两阶段 prompt 与恢复
 
 ```bash
-uv run qwen-annotate annotate CONFIG.yaml --max-concurrency 1
-uv run qwen-annotate annotate CONFIG.yaml --episodes 0,3,8 --max-concurrency 2
-uv run qwen-annotate status WORK_DIR
-uv run qwen-annotate status WORK_DIR --json
+uv run Robo-annotate annotate CONFIG.yaml --max-concurrency 1
+uv run Robo-annotate annotate CONFIG.yaml --episodes 0,3,8 --max-concurrency 2
+uv run Robo-annotate status WORK_DIR
+uv run Robo-annotate status WORK_DIR --json
 ```
 
 `--episodes` 是无空格、无重复的非负整数列表。筛选只限制本次要推进的 episode，status 仍显示整个 workspace。
@@ -181,9 +181,9 @@ workspace 内 `episodes/*.json` 是权威状态，`summary.json` 可恢复，`lo
 生成离线页面并导入浏览器导出的严格 decision JSON：
 
 ```bash
-uv run qwen-annotate review WORK_DIR
+uv run Robo-annotate review WORK_DIR
 # stdout 是 WORK_DIR/previews/needs_review/index.html
-uv run qwen-annotate review WORK_DIR --apply decision_episode_000003.json
+uv run Robo-annotate review WORK_DIR --apply decision_episode_000003.json
 ```
 
 decision 文件必须只含 `episode_index`、`source_fingerprint`、`run_fingerprint`、`mode`、`start_subtask_index` 和 `boundaries`。导入时会重新检查指纹、边界范围/顺序、最短 segment 和 complete/DAgger 约束；通过后记录 `decision_source: human`。
@@ -191,8 +191,8 @@ decision 文件必须只含 `episode_index`、`source_fingerprint`、`run_finger
 更适合逐帧判断边界的是本地可视化服务：
 
 ```bash
-UV_PROJECT_ENVIRONMENT=/tmp/qwen-annotate-latest-env \
-  uv run qwen-annotate review WORK_DIR --serve
+UV_PROJECT_ENVIRONMENT=/tmp/Robo-annotate-latest-env \
+  uv run Robo-annotate review WORK_DIR --serve
 # 浏览器打开 http://127.0.0.1:8765
 ```
 
@@ -213,8 +213,8 @@ ssh -L 8765:127.0.0.1:8765 USER@HOST
 完整发布保留源 payload 字节和编号，要求每个 episode 都已接受：
 
 ```bash
-uv run qwen-annotate convert WORK_DIR --output /path/to/dataset_annotated
-uv run qwen-annotate validate /path/to/dataset_annotated --source /path/to/source
+uv run Robo-annotate convert WORK_DIR --output /path/to/dataset_annotated
+uv run Robo-annotate validate /path/to/dataset_annotated --source /path/to/source
 ```
 
 输出兼容参考公开格式：`meta/info.json` 增加 `subtask_template`/逐 episode instruction；新增 `meta/lerobot_annotations.json` 和 `meta/task_info/task_0.json`。complete episode 省略 `start_subtask_index`，DAgger episode 明确保存它（包括 0）。不会发布内部 confidence、prompt 或 decision source。
@@ -222,8 +222,8 @@ uv run qwen-annotate validate /path/to/dataset_annotated --source /path/to/sourc
 只发布 accepted 子集：
 
 ```bash
-uv run qwen-annotate convert WORK_DIR --accepted-only --output /path/to/accepted_subset
-uv run qwen-annotate validate /path/to/accepted_subset
+uv run Robo-annotate convert WORK_DIR --accepted-only --output /path/to/accepted_subset
+uv run Robo-annotate validate /path/to/accepted_subset
 ```
 
 accepted-only 会连续重编号 episode、`frame_index`/`episode_index`/全局 `index`，复制选中视频并对 parquet 与全部视频像素重新计算 stats。因此它是新数据集；原 source 不能作为同编号 payload checksum 基准，验证时通常省略 `--source`。
@@ -233,7 +233,7 @@ accepted-only 会连续重编号 episode、`frame_index`/`episode_index`/全局 
 历史参考集的 image stats 是抽样统计，严格 deep 必然拒绝；仅在明确接受较弱保证时使用：
 
 ```bash
-uv run qwen-annotate validate LEGACY_DATASET \
+uv run Robo-annotate validate LEGACY_DATASET \
   --allow-legacy-sampled-image-stats --no-deep-video-stats
 ```
 
@@ -244,7 +244,7 @@ uv run qwen-annotate validate LEGACY_DATASET \
 完成 47 episode workspace 后运行：
 
 ```bash
-uv run qwen-annotate evaluate \
+uv run Robo-annotate evaluate \
   /mnt/data/user/zhoukr/annotations/arrange_orange_juice_and_green_tea_2 \
   --golden /mnt/data/user/zhoukr/datasets/jokeru/arrange_orange_juice_and_green_tea_2_annotated \
   --output /mnt/data/user/zhoukr/annotations/arrange_orange_juice_and_green_tea_2/metrics.json
@@ -277,9 +277,9 @@ refine-v1 的 5 episode（0--4）真实结果仅是 **partial 失败基线**，�
 正确性通过后，对同一固定 8 episode 列表依次测试并发 1、2、4：
 
 ```bash
-uv run qwen-annotate annotate BENCH_C1.yaml --episodes 0,1,2,3,4,5,6,7 --max-concurrency 1
-uv run qwen-annotate annotate BENCH_C2.yaml --episodes 0,1,2,3,4,5,6,7 --max-concurrency 2
-uv run qwen-annotate annotate BENCH_C4.yaml --episodes 0,1,2,3,4,5,6,7 --max-concurrency 4
+uv run Robo-annotate annotate BENCH_C1.yaml --episodes 0,1,2,3,4,5,6,7 --max-concurrency 1
+uv run Robo-annotate annotate BENCH_C2.yaml --episodes 0,1,2,3,4,5,6,7 --max-concurrency 2
+uv run Robo-annotate annotate BENCH_C4.yaml --episodes 0,1,2,3,4,5,6,7 --max-concurrency 4
 ```
 
 每个配置必须使用独立空 workspace，但固定相同模型 SHA、prompt、source、sampling 和 episode 集。记录模板：
@@ -306,11 +306,11 @@ concurrency | model_revision | episodes/hour | peak GPU MiB | decode CPU % | err
 
 ```bash
 uv run pytest -q
-uv run qwen-annotate inspect examples/complete.yaml
-uv run qwen-annotate status WORK_DIR --json
-uv run qwen-annotate convert WORK_DIR --output DATASET_ANNOTATED
-uv run qwen-annotate validate DATASET_ANNOTATED --source SOURCE_DATASET
-uv run qwen-annotate evaluate WORK_DIR --golden GOLDEN_DATASET --output WORK_DIR/metrics.json
+uv run Robo-annotate inspect examples/complete.yaml
+uv run Robo-annotate status WORK_DIR --json
+uv run Robo-annotate convert WORK_DIR --output DATASET_ANNOTATED
+uv run Robo-annotate validate DATASET_ANNOTATED --source SOURCE_DATASET
+uv run Robo-annotate evaluate WORK_DIR --golden GOLDEN_DATASET --output WORK_DIR/metrics.json
 ```
 
 确认所有 episode 已接受（或明确选择 accepted-only）、source tree hash 未变、release 独立验证通过、launch gates 全部 PASS，并把实际模型 SHA、vLLM server version、单 episode smoke 与吞吐数据补回本手册后再发布。

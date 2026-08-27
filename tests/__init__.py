@@ -1,1 +1,1 @@
-"""Test support package for qwen_annotate."""
+"""Test support package for robo_annotate."""

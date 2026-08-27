@@ -39,7 +39,7 @@ _MAX_DECISION_BYTES = 64 * 1024
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _MAX_CANDIDATES = 64
 _MAX_IMAGES_PER_EPISODE = 512
-_OWNER = ".qwen-annotate-review-v1"
+_OWNER = ".Robo-annotate-review-v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 

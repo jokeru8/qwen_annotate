@@ -10,12 +10,12 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from qwen_annotate.coarse import CoarseDecision, coarse_pass_indices, run_coarse
-from qwen_annotate.config import AnnotationConfig
-from qwen_annotate.lerobot import EpisodeInfo
-from qwen_annotate.models import CoarseBoundary, CoarseResult
-from qwen_annotate.video import FrameSample
-from qwen_annotate.workspace import compute_source_fingerprint
+from robo_annotate.coarse import CoarseDecision, coarse_pass_indices, run_coarse
+from robo_annotate.config import AnnotationConfig
+from robo_annotate.lerobot import EpisodeInfo
+from robo_annotate.models import CoarseBoundary, CoarseResult
+from robo_annotate.video import FrameSample
+from robo_annotate.workspace import compute_source_fingerprint
 
 
 def make_config(tmp_path: Path, *, mode: str = "complete", subtask_count: int = 3) -> AnnotationConfig:

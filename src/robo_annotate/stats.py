@@ -115,7 +115,7 @@ def recompute_stats(
 
     if not expected_schema:
         return {}
-    with TemporaryDirectory(prefix="qwen-annotate-stats-") as temporary:
+    with TemporaryDirectory(prefix="Robo-annotate-stats-") as temporary:
         accumulators = {
             name: _Accumulator(width, integral, total_rows, Path(temporary) / f"feature-{index}.bin")
             for index, (name, (width, integral)) in enumerate(expected_schema.items())

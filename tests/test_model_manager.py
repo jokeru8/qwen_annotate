@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
-from qwen_annotate.model_manager import (
+from robo_annotate.model_manager import (
     ModelInstall,
     RevisionResolutionError,
     download_model,
@@ -105,7 +105,7 @@ def test_owned_http_client_disables_environment_proxies(monkeypatch: pytest.Monk
         seen.append(trust_env)
         return OwnedClient(FakeResponse({"sha": SHA}))
 
-    monkeypatch.setattr("qwen_annotate.model_manager.httpx.Client", factory)
+    monkeypatch.setattr("robo_annotate.model_manager.httpx.Client", factory)
     assert resolve_revision("Qwen/Qwen3.8-27B") == SHA
     assert seen == [False]
 
@@ -279,7 +279,7 @@ def test_atomic_metadata_cleanup_when_replace_fails(tmp_path: Path, monkeypatch:
     def fail_replace(source: Path, destination: Path) -> None:
         raise OSError("replace failed")
 
-    monkeypatch.setattr("qwen_annotate.model_manager.os.replace", fail_replace)
+    monkeypatch.setattr("robo_annotate.model_manager.os.replace", fail_replace)
     with pytest.raises(OSError, match="replace failed"):
         download_model("Qwen/Qwen3.8-27B", target, revision=SHA, runner=lambda *_: None)
     assert not (target / "model-install.json").exists()
@@ -300,7 +300,7 @@ def test_metadata_invalidation_and_commit_fsync_directory(
             fsynced_directory += 1
         original_fsync(descriptor)
 
-    monkeypatch.setattr("qwen_annotate.model_manager.os.fsync", recording_fsync)
+    monkeypatch.setattr("robo_annotate.model_manager.os.fsync", recording_fsync)
     download_model("Qwen/Qwen3.8-27B", target, revision=SHA, runner=lambda *_: None)
     assert fsynced_directory == 2
 
@@ -316,7 +316,7 @@ def test_directory_fsync_failure_removes_uncommitted_metadata(
             raise OSError("directory fsync failed")
         original_fsync(descriptor)
 
-    monkeypatch.setattr("qwen_annotate.model_manager.os.fsync", fail_directory_fsync)
+    monkeypatch.setattr("robo_annotate.model_manager.os.fsync", fail_directory_fsync)
     with pytest.raises(OSError, match="directory fsync failed"):
         download_model("Qwen/Qwen3.8-27B", target, revision=SHA, runner=lambda *_: None)
     assert not (target / "model-install.json").exists()
@@ -330,7 +330,7 @@ def test_default_runner_uses_check_env_and_no_shell(monkeypatch: pytest.MonkeyPa
         calls.append((args, kwargs))
         return object()
 
-    monkeypatch.setattr("qwen_annotate.model_manager.subprocess.run", fake_run)
+    monkeypatch.setattr("robo_annotate.model_manager.subprocess.run", fake_run)
     verify_model("Qwen/Qwen3.8-27B", SHA, tmp_path)
     assert calls[0][1]["check"] is True
     assert isinstance(calls[0][1]["env"], dict)

@@ -3,9 +3,9 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [project]
-name = "qwen-lerobot-annotate"
+name = "Robo-annotate"
 version = "0.1.0"
-description = "Annotate LeRobot datasets with Qwen3.8"
+description = "The open annotation engine for embodied AI"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -23,15 +23,20 @@ dependencies = [
   "uvicorn>=0.35,<1",
 ]
 
+[project.urls]
+Homepage = "https://github.com/jokeru8/Robo-annotate"
+Repository = "https://github.com/jokeru8/Robo-annotate"
+Issues = "https://github.com/jokeru8/Robo-annotate/issues"
+
 [project.optional-dependencies]
 dev = ["pytest>=8.4,<9", "pytest-asyncio>=1,<2"]
 
 [project.scripts]
-qwen-annotate = "qwen_annotate.cli:app"
+Robo-annotate = "robo_annotate.cli:app"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/qwen_annotate"]
+packages = ["src/robo_annotate"]

@@ -11,7 +11,7 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
-from qwen_annotate.video import FrameSample, as_data_url, extract_frames, uniform_indices, window_indices
+from robo_annotate.video import FrameSample, as_data_url, extract_frames, uniform_indices, window_indices
 
 
 def test_uniform_indices_are_even_capped_and_keep_both_endpoints() -> None:

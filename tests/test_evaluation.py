@@ -6,26 +6,26 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from qwen_annotate.cli import app
-from qwen_annotate.config import AnnotationConfig
-from qwen_annotate.constraints import DETERMINISTIC_REJECTION_REASONS
-from qwen_annotate.evaluation import (
+from robo_annotate.cli import app
+from robo_annotate.config import AnnotationConfig
+from robo_annotate.constraints import DETERMINISTIC_REJECTION_REASONS
+from robo_annotate.evaluation import (
     DaggerPrediction,
     DaggerView,
     evaluate_boundaries,
     evaluate_dagger,
     make_dagger_views,
 )
-from qwen_annotate.lerobot import EpisodeInfo, VideoProbe
-from qwen_annotate.prompts import PROMPT_VERSION
-from qwen_annotate.workspace import WorkspaceStore, compute_run_fingerprint, compute_source_fingerprint
+from robo_annotate.lerobot import EpisodeInfo, VideoProbe
+from robo_annotate.prompts import PROMPT_VERSION
+from robo_annotate.workspace import WorkspaceStore, compute_run_fingerprint, compute_source_fingerprint
 from tests.fixtures import make_lerobot_fixture
 
 
 @pytest.fixture(autouse=True)
 def _probe_fixture_videos(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "qwen_annotate.evaluation.probe_video",
+        "robo_annotate.evaluation.probe_video",
         lambda _: VideoProbe(frames=300, fps=20, width=16, height=16),
         raising=False,
     )
@@ -334,7 +334,7 @@ def test_complete_evaluation_counts_recorded_pre_final_constraint_failures(
     record["review_reasons"] = [reason]
     path.write_text(json.dumps(record), encoding="utf-8")
 
-    from qwen_annotate.evaluation import evaluate_complete
+    from robo_annotate.evaluation import evaluate_complete
 
     metrics = evaluate_complete(work, golden)
     assert metrics.constraint_violation_count == 1
@@ -349,7 +349,7 @@ def test_complete_evaluation_rejects_cross_run_episode_and_cli_writes_no_report(
     record["run_fingerprint"] = "c" * 64
     path.write_text(json.dumps(record), encoding="utf-8")
 
-    from qwen_annotate.evaluation import evaluate_complete
+    from robo_annotate.evaluation import evaluate_complete
 
     with pytest.raises(ValueError, match="run fingerprint"):
         evaluate_complete(work, golden)
@@ -368,7 +368,7 @@ def test_complete_evaluation_rejects_stale_source_episode(tmp_path: Path) -> Non
     )
     source_video.write_bytes(b"changed after annotation")
 
-    from qwen_annotate.evaluation import evaluate_complete
+    from robo_annotate.evaluation import evaluate_complete
 
     with pytest.raises(ValueError, match="source fingerprint"):
         evaluate_complete(work, golden)
@@ -397,7 +397,7 @@ def test_source_provenance_preserves_hashed_lexical_config_paths(tmp_path: Path)
     episode["run_fingerprint"] = run_sha
     episode_path.write_text(json.dumps(episode), encoding="utf-8")
 
-    from qwen_annotate.evaluation import evaluate_complete
+    from robo_annotate.evaluation import evaluate_complete
 
     assert evaluate_complete(work, golden).false_accept_count == 0
 
@@ -425,7 +425,7 @@ def test_relative_hashed_paths_evaluate_from_a_different_cwd(
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
 
-    from qwen_annotate.evaluation import evaluate_complete
+    from robo_annotate.evaluation import evaluate_complete
 
     assert evaluate_complete(work, golden).false_accept_count == 0
 
@@ -451,7 +451,7 @@ def test_model_accepted_record_provenance_tampering_creates_no_report(
     episode_path.write_text(json.dumps(episode), encoding="utf-8")
     output = tmp_path / f"tampered-{field}.json"
 
-    from qwen_annotate.evaluation import evaluate_complete
+    from robo_annotate.evaluation import evaluate_complete
 
     with pytest.raises(ValueError, match=field.replace("_", " ")):
         evaluate_complete(work, golden)
@@ -470,7 +470,7 @@ def test_manifest_prompt_contract_tampering_creates_no_report(tmp_path: Path) ->
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     output = tmp_path / "tampered-manifest-prompt.json"
 
-    from qwen_annotate.evaluation import evaluate_complete
+    from robo_annotate.evaluation import evaluate_complete
 
     with pytest.raises(ValueError, match="prompt version"):
         evaluate_complete(work, golden)
@@ -488,7 +488,7 @@ def test_safe_local_endpoint_round_trips_workspace_and_evaluation_provenance(tmp
     assert manifest.effective_config["model"]["endpoint"] == "http://127.0.0.1:8000/v1"
     assert str(runtime.model.endpoint) == "http://127.0.0.1:8000/v1"
 
-    from qwen_annotate.evaluation import evaluate_complete
+    from robo_annotate.evaluation import evaluate_complete
 
     assert evaluate_complete(work, golden).false_accept_count == 0
 
@@ -500,7 +500,7 @@ def test_complete_evaluation_rejects_dagger_workspace(tmp_path: Path) -> None:
     manifest["mode"] = "dagger_patch"
     path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    from qwen_annotate.evaluation import evaluate_complete
+    from robo_annotate.evaluation import evaluate_complete
 
     with pytest.raises(ValueError, match="complete workspace"):
         evaluate_complete(work, golden)
@@ -513,7 +513,7 @@ def test_complete_evaluation_rejects_golden_dagger_extension(tmp_path: Path) -> 
     annotations["episodes"]["0"]["start_subtask_index"] = 0
     path.write_text(json.dumps(annotations), encoding="utf-8")
 
-    from qwen_annotate.evaluation import evaluate_complete
+    from robo_annotate.evaluation import evaluate_complete
 
     with pytest.raises(ValueError, match="complete golden"):
         evaluate_complete(work, golden)

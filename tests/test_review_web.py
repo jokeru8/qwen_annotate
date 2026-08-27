@@ -4,12 +4,12 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from qwen_annotate.review_server import create_review_app
+from robo_annotate.review_server import create_review_app
 from tests.test_review import _workspace
 
 
 def _run_js(expression: str) -> object:
-    module = Path("src/qwen_annotate/review_web/app.js").resolve().as_uri()
+    module = Path("src/robo_annotate/review_web/app.js").resolve().as_uri()
     script = f"import({json.dumps(module)}).then(async m => console.log(JSON.stringify(await ({expression}))))"
     completed = subprocess.run(
         ["node", "--input-type=module", "-e", script],
@@ -128,7 +128,7 @@ def test_web_assets_are_served_with_csp_and_no_directory_listing(tmp_path: Path)
     page = client.get("/")
     assert page.status_code == 200
     assert page.headers["content-security-policy"].startswith("default-src 'self'")
-    assert "Qwen 自动标注复核" in page.text
+    assert "Robo-annotate Studio" in page.text
     assert 'class="transport-row"' in page.text
     assert 'class="frame-slider"' in page.text
     assert client.get("/assets/app.js").status_code == 200

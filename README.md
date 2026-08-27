@@ -1,8 +1,10 @@
 <div align="center">
 
-# Qwen × LeRobot 自动标注
+# Robo-annotate
 
-**用 Qwen3.8 把机器人长视频切分成可审计、可复核、可发布的子任务标注。**
+**面向具身智能的开放式半自动标注引擎。**
+
+*The open annotation engine for embodied AI.*
 
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![LeRobot v2.1](https://img.shields.io/badge/LeRobot-v2.1-7C3AED)](https://github.com/huggingface/lerobot)
@@ -11,13 +13,13 @@
 
 [快速开始](#快速开始) · [界面预览](#可视化复核) · [标注效果](#标注效果) · [完整操作手册](docs/operations.md)
 
-<img src="docs/assets/review-console.webp" alt="Qwen LeRobot 多相机自动标注复核台" width="100%">
+<img src="docs/assets/review-console.webp" alt="Robo-annotate 多相机自动标注复核台" width="100%">
 
 </div>
 
 ---
 
-Qwen × LeRobot 自动标注是一个面向 **LeRobot v2.1** 数据集的批量视频标注工具。你只需要提供高层任务、按顺序排列的子任务模板和相机名称，系统就会调用本地 Qwen3.8-27B 服务完成整段理解、边界精修、约束检查和结果持久化。
+Robo-annotate 是一个面向具身智能数据的半自动标注引擎。当前内置的首个工作流支持 **LeRobot v2.1** 数据集，并通过 OpenAI-compatible API 接入 Qwen3.8-27B：你只需要提供高层任务、按顺序排列的子任务模板和相机名称，系统就会完成整段理解、边界精修、约束检查和结果持久化。
 
 它不是“模型给出一个答案就直接写回数据集”的一次性脚本。每个自动结果都有采样来源、模型版本、配置指纹和状态记录；低置信度、结果冲突或违反硬约束的 episode 会进入人工复核，而不会被静默发布。
 
@@ -86,7 +88,7 @@ flowchart LR
 启动本地复核台：
 
 ```bash
-uv run qwen-annotate review ./runs/drink-arrangement --serve
+uv run Robo-annotate review ./runs/drink-arrangement --serve
 ```
 
 浏览器访问 `http://127.0.0.1:8765` 后，可以：
@@ -102,28 +104,29 @@ uv run qwen-annotate review ./runs/drink-arrangement --serve
 
 ## 快速开始
 
-### 1. 准备环境
+### 1. 安装引擎
 
 运行要求：
 
 - Python `3.12`
 - [uv](https://docs.astral.sh/uv/)
-- Node.js（仅运行复核前端单元测试时需要）
 - 可读取的 LeRobot `v2.1` 数据集
 - 能提供 OpenAI-compatible 接口的 Qwen3.8-27B 推理服务
 - 下载模型时需要可用的 `hf` 命令行工具
 
 ```bash
-uv sync --extra dev
-NODE_OPTIONS=--experimental-default-type=module uv run pytest -q
+uv tool install git+https://github.com/jokeru8/Robo-annotate.git
+Robo-annotate --help
 ```
+
+安装只包含 Robo-annotate 引擎和 Web 复核台，不会下载模型或启动推理服务。你可以填写已有的 OpenAI-compatible API/vLLM 地址。
 
 ### 2. 下载并固定模型版本
 
 ```bash
 export QWEN_MODEL_DIR=/path/to/models/Qwen3.8-27B
 
-uv run qwen-annotate model download \
+uv run Robo-annotate model download \
   --repo Qwen/Qwen3.8-27B \
   --local-dir "$QWEN_MODEL_DIR" \
   --max-workers 8
@@ -196,24 +199,24 @@ sampling:
 
 ```bash
 # 推理前只读检查
-uv run qwen-annotate inspect config.yaml
+uv run Robo-annotate inspect config.yaml
 
 # 先用单个 episode 做 smoke test
-uv run qwen-annotate annotate config.yaml \
+uv run Robo-annotate annotate config.yaml \
   --episodes 0 \
   --max-concurrency 1
 
 # 确认无误后再批量运行
-uv run qwen-annotate annotate config.yaml --max-concurrency 2
+uv run Robo-annotate annotate config.yaml --max-concurrency 2
 
 # 查看状态与人工复核
-uv run qwen-annotate status ./runs/drink-arrangement
-uv run qwen-annotate review ./runs/drink-arrangement --serve
+uv run Robo-annotate status ./runs/drink-arrangement
+uv run Robo-annotate review ./runs/drink-arrangement --serve
 
 # 创建新的已标注数据集并做独立校验
-uv run qwen-annotate convert ./runs/drink-arrangement \
+uv run Robo-annotate convert ./runs/drink-arrangement \
   --output ./data/lerobot-annotated
-uv run qwen-annotate validate ./data/lerobot-annotated \
+uv run Robo-annotate validate ./data/lerobot-annotated \
   --source ./data/lerobot-source
 ```
 
@@ -276,7 +279,7 @@ lerobot-annotated/
 准备人工标注的完整任务数据集作为 golden set 后运行：
 
 ```bash
-uv run qwen-annotate evaluate ./runs/drink-arrangement \
+uv run Robo-annotate evaluate ./runs/drink-arrangement \
   --golden ./data/lerobot-golden \
   --output ./evaluation-report.json
 ```
@@ -296,20 +299,20 @@ uv run qwen-annotate evaluate ./runs/drink-arrangement \
 
 | 命令 | 用途 |
 | --- | --- |
-| `qwen-annotate inspect CONFIG` | 推理前只读检查 LeRobot 数据集 |
-| `qwen-annotate annotate CONFIG` | 执行 coarse + refine 批量标注 |
-| `qwen-annotate status WORK_DIR` | 查看 workspace 状态 |
-| `qwen-annotate review WORK_DIR --serve` | 启动多相机可视化复核台 |
-| `qwen-annotate review WORK_DIR` | 生成离线静态复核页面 |
-| `qwen-annotate convert WORK_DIR --output PATH` | 创建新的已标注数据集 |
-| `qwen-annotate validate PATH --source SOURCE` | 独立验证发布结果 |
-| `qwen-annotate evaluate WORK_DIR --golden PATH --output FILE` | 运行 golden set 评测 |
-| `qwen-annotate model download` | 下载并固定模型 revision |
+| `Robo-annotate inspect CONFIG` | 推理前只读检查 LeRobot 数据集 |
+| `Robo-annotate annotate CONFIG` | 执行 coarse + refine 批量标注 |
+| `Robo-annotate status WORK_DIR` | 查看 workspace 状态 |
+| `Robo-annotate review WORK_DIR --serve` | 启动多相机可视化复核台 |
+| `Robo-annotate review WORK_DIR` | 生成离线静态复核页面 |
+| `Robo-annotate convert WORK_DIR --output PATH` | 创建新的已标注数据集 |
+| `Robo-annotate validate PATH --source SOURCE` | 独立验证发布结果 |
+| `Robo-annotate evaluate WORK_DIR --golden PATH --output FILE` | 运行 golden set 评测 |
+| `Robo-annotate model download` | 下载并固定模型 revision |
 
 ## 项目结构
 
 ```text
-src/qwen_annotate/
+src/robo_annotate/
 ├── pipeline.py          # episode 与批处理编排
 ├── coarse.py            # 整集稀疏粗标
 ├── refine.py            # 多相机边界精修
@@ -325,12 +328,15 @@ src/qwen_annotate/
 ## 开发与测试
 
 ```bash
+# 克隆仓库后安装开发依赖
+uv sync --extra dev
+
 # 全量测试
 NODE_OPTIONS=--experimental-default-type=module uv run pytest -q
 
 # 命令行 smoke test
-uv run qwen-annotate --help
-uv run qwen-annotate inspect examples/complete.yaml
+uv run Robo-annotate --help
+uv run Robo-annotate inspect examples/complete.yaml
 ```
 
 `tests/test_*.py` 基本与源码模块一一对应，跨模块完整流程见 `tests/test_end_to_end.py`。

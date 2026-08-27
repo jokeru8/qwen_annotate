@@ -1,4 +1,4 @@
-# Qwen3.8 LeRobot Annotation Implementation Plan
+# Robo-annotate Qwen/LeRobot Annotation Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -34,23 +34,23 @@ uv.lock                                reproducible dependency lock
 README.md                              install and operator workflow
 examples/complete.yaml                 complete-mode example
 examples/dagger_patch.yaml             patch-mode example
-src/qwen_annotate/config.py            YAML schema and stable configuration hash
-src/qwen_annotate/models.py            domain and workspace Pydantic models
-src/qwen_annotate/constraints.py       deterministic annotation validation
-src/qwen_annotate/lerobot.py           v2.1 metadata indexing and dataset validation
-src/qwen_annotate/video.py             exact frame extraction and visual labeling
-src/qwen_annotate/prompts.py           versioned coarse/refine prompts and schemas
-src/qwen_annotate/qwen_client.py       async structured-output model client
-src/qwen_annotate/model_manager.py     immutable model download and verification
-src/qwen_annotate/workspace.py         fingerprints, atomic state, resume logic
-src/qwen_annotate/coarse.py            whole-episode inference and agreement
-src/qwen_annotate/refine.py            adaptive boundary refinement and agreement
-src/qwen_annotate/pipeline.py          per-episode and batch orchestration
-src/qwen_annotate/review.py            static review page and human decisions
-src/qwen_annotate/converter.py         full and accepted-only dataset conversion
-src/qwen_annotate/release_validator.py independent release consistency checks
-src/qwen_annotate/evaluation.py        golden and synthetic-DAgger metrics
-src/qwen_annotate/cli.py               Typer commands and exit behavior
+src/robo_annotate/config.py            YAML schema and stable configuration hash
+src/robo_annotate/models.py            domain and workspace Pydantic models
+src/robo_annotate/constraints.py       deterministic annotation validation
+src/robo_annotate/lerobot.py           v2.1 metadata indexing and dataset validation
+src/robo_annotate/video.py             exact frame extraction and visual labeling
+src/robo_annotate/prompts.py           versioned coarse/refine prompts and schemas
+src/robo_annotate/qwen_client.py       async structured-output model client
+src/robo_annotate/model_manager.py     immutable model download and verification
+src/robo_annotate/workspace.py         fingerprints, atomic state, resume logic
+src/robo_annotate/coarse.py            whole-episode inference and agreement
+src/robo_annotate/refine.py            adaptive boundary refinement and agreement
+src/robo_annotate/pipeline.py          per-episode and batch orchestration
+src/robo_annotate/review.py            static review page and human decisions
+src/robo_annotate/converter.py         full and accepted-only dataset conversion
+src/robo_annotate/release_validator.py independent release consistency checks
+src/robo_annotate/evaluation.py        golden and synthetic-DAgger metrics
+src/robo_annotate/cli.py               Typer commands and exit behavior
 tests/                                 unit and integration tests mirroring modules
 ```
 
@@ -59,8 +59,8 @@ tests/                                 unit and integration tests mirroring modu
 **Files:**
 - Create: `pyproject.toml`
 - Create: `README.md`
-- Create: `src/qwen_annotate/__init__.py`
-- Create: `src/qwen_annotate/config.py`
+- Create: `src/robo_annotate/__init__.py`
+- Create: `src/robo_annotate/config.py`
 - Create: `examples/complete.yaml`
 - Create: `examples/dagger_patch.yaml`
 - Create: `tests/test_config.py`
@@ -76,7 +76,7 @@ tests/                                 unit and integration tests mirroring modu
 from pathlib import Path
 import pytest
 from pydantic import ValidationError
-from qwen_annotate.config import AnnotationConfig, load_config
+from robo_annotate.config import AnnotationConfig, load_config
 
 def test_complete_config_loads_and_hash_is_stable(tmp_path: Path) -> None:
     source = tmp_path / "source"
@@ -114,13 +114,13 @@ def test_unknown_config_key_is_rejected(tmp_path: Path) -> None:
 
 Run: `uv run pytest tests/test_config.py -v`
 
-Expected: collection fails with `ModuleNotFoundError: No module named 'qwen_annotate'`.
+Expected: collection fails with `ModuleNotFoundError: No module named 'robo_annotate'`.
 
 - [ ] **Step 3: Create `pyproject.toml` with the application and test dependencies**
 
 ```toml
 [project]
-name = "qwen-lerobot-annotate"
+name = "Robo-annotate"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -133,14 +133,14 @@ dependencies = [
 dev = ["pytest>=8.4,<9", "pytest-asyncio>=1,<2"]
 
 [project.scripts]
-qwen-annotate = "qwen_annotate.cli:app"
+Robo-annotate = "robo_annotate.cli:app"
 
 [build-system]
 requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/qwen_annotate"]
+packages = ["src/robo_annotate"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -150,7 +150,7 @@ asyncio_mode = "auto"
 - [ ] **Step 4: Implement the strict configuration models and canonical hash**
 
 ```python
-# src/qwen_annotate/config.py
+# src/robo_annotate/config.py
 import hashlib, json
 from pathlib import Path
 from typing import Literal
@@ -212,27 +212,27 @@ Expected: both tests pass and `uv.lock` is created.
 - [ ] **Step 7: Commit the package foundation**
 
 ```bash
-git add pyproject.toml uv.lock README.md examples src/qwen_annotate/__init__.py src/qwen_annotate/config.py tests/test_config.py
+git add pyproject.toml uv.lock README.md examples src/robo_annotate/__init__.py src/robo_annotate/config.py tests/test_config.py
 git commit -m "feat: add typed annotation configuration"
 ```
 
 ### Task 2: Annotation Domain Models and Hard Constraints
 
 **Files:**
-- Create: `src/qwen_annotate/models.py`
-- Create: `src/qwen_annotate/constraints.py`
+- Create: `src/robo_annotate/models.py`
+- Create: `src/robo_annotate/constraints.py`
 - Create: `tests/test_constraints.py`
 
 **Interfaces:**
-- Consumes: `Subtask` from `qwen_annotate.config`.
+- Consumes: `Subtask` from `robo_annotate.config`.
 - Produces: `CoarseBoundary`, `CoarseResult`, `RefineResult`, `FinalAnnotation`, `ValidationIssue`, `validate_annotation(...) -> list[ValidationIssue]`, and `coarse_sequence_is_legal(...) -> bool`.
 
 - [ ] **Step 1: Write failing complete and DAgger constraint tests**
 
 ```python
 # tests/test_constraints.py
-from qwen_annotate.constraints import validate_annotation
-from qwen_annotate.models import FinalAnnotation
+from robo_annotate.constraints import validate_annotation
+from robo_annotate.models import FinalAnnotation
 
 def test_complete_requires_all_segments() -> None:
     ann = FinalAnnotation(start_subtask_index=0, boundaries=[100, 220])
@@ -253,12 +253,12 @@ def test_boundary_range_order_and_minimum_segment_are_checked() -> None:
 
 Run: `uv run pytest tests/test_constraints.py -v`
 
-Expected: import fails because `qwen_annotate.constraints` does not exist.
+Expected: import fails because `robo_annotate.constraints` does not exist.
 
 - [ ] **Step 3: Implement immutable typed inference results**
 
 ```python
-# src/qwen_annotate/models.py
+# src/robo_annotate/models.py
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -309,14 +309,14 @@ Expected: all three tests pass.
 - [ ] **Step 6: Commit the domain layer**
 
 ```bash
-git add src/qwen_annotate/models.py src/qwen_annotate/constraints.py tests/test_constraints.py
+git add src/robo_annotate/models.py src/robo_annotate/constraints.py tests/test_constraints.py
 git commit -m "feat: validate ordered subtask annotations"
 ```
 
 ### Task 3: Read-Only LeRobot v2.1 Inspection
 
 **Files:**
-- Create: `src/qwen_annotate/lerobot.py`
+- Create: `src/robo_annotate/lerobot.py`
 - Create: `tests/__init__.py`
 - Create: `tests/fixtures.py`
 - Create: `tests/test_lerobot.py`
@@ -329,7 +329,7 @@ git commit -m "feat: validate ordered subtask annotations"
 
 ```python
 # tests/test_lerobot.py
-from qwen_annotate.lerobot import VideoProbe, inspect_dataset
+from robo_annotate.lerobot import VideoProbe, inspect_dataset
 from tests.fixtures import make_lerobot_fixture, make_config
 
 def test_inspect_builds_episode_video_index(tmp_path) -> None:
@@ -355,12 +355,12 @@ def test_inspect_rejects_missing_refine_camera(tmp_path) -> None:
 
 Run: `uv run pytest tests/test_lerobot.py -v`
 
-Expected: import fails because `qwen_annotate.lerobot` does not exist.
+Expected: import fails because `robo_annotate.lerobot` does not exist.
 
 - [ ] **Step 3: Implement typed metadata indexing and validation**
 
 ```python
-# src/qwen_annotate/lerobot.py
+# src/robo_annotate/lerobot.py
 class VideoProbe(BaseModel):
     frames: int
     fps: float
@@ -392,21 +392,21 @@ Use `av.open(path)` and the first video stream. Prefer `stream.frames`; if zero,
 
 Run: `uv run pytest tests/test_lerobot.py -v`
 
-Run: `uv run python -c "from pathlib import Path; from qwen_annotate.config import load_config; from qwen_annotate.lerobot import inspect_dataset; print(len(inspect_dataset(load_config(Path('examples/complete.yaml'))).episodes))"`
+Run: `uv run python -c "from pathlib import Path; from robo_annotate.config import load_config; from robo_annotate.lerobot import inspect_dataset; print(len(inspect_dataset(load_config(Path('examples/complete.yaml'))).episodes))"`
 
 Expected: unit tests pass; `examples/complete.yaml` uses the confirmed local reference source and the command prints `47`.
 
 - [ ] **Step 6: Commit the dataset reader**
 
 ```bash
-git add src/qwen_annotate/lerobot.py tests/__init__.py tests/fixtures.py tests/test_lerobot.py
+git add src/robo_annotate/lerobot.py tests/__init__.py tests/fixtures.py tests/test_lerobot.py
 git commit -m "feat: inspect LeRobot v2.1 datasets"
 ```
 
 ### Task 4: Exact Frame Sampling and Camera-Labeled Evidence
 
 **Files:**
-- Create: `src/qwen_annotate/video.py`
+- Create: `src/robo_annotate/video.py`
 - Create: `tests/test_video.py`
 
 **Interfaces:**
@@ -417,7 +417,7 @@ git commit -m "feat: inspect LeRobot v2.1 datasets"
 
 ```python
 # tests/test_video.py
-from qwen_annotate.video import uniform_indices, window_indices
+from robo_annotate.video import uniform_indices, window_indices
 
 def test_uniform_indices_cover_full_episode_and_respect_cap() -> None:
     values = uniform_indices(frame_count=1000, source_fps=25, target_fps=1, max_frames=10)
@@ -437,7 +437,7 @@ def test_window_indices_are_clipped_and_include_center() -> None:
 
 Run: `uv run pytest tests/test_video.py -v`
 
-Expected: import fails because `qwen_annotate.video` does not exist.
+Expected: import fails because `robo_annotate.video` does not exist.
 
 - [ ] **Step 3: Implement deterministic sample-index functions**
 
@@ -467,14 +467,14 @@ Run: `uv run pytest tests/test_video.py -v`
 Expected: all sampler tests pass.
 
 ```bash
-git add src/qwen_annotate/video.py tests/test_video.py
+git add src/robo_annotate/video.py tests/test_video.py
 git commit -m "feat: sample frame-indexed video evidence"
 ```
 
 ### Task 5: Versioned Prompts and Strict Response Schemas
 
 **Files:**
-- Create: `src/qwen_annotate/prompts.py`
+- Create: `src/robo_annotate/prompts.py`
 - Create: `tests/test_prompts.py`
 
 **Interfaces:**
@@ -485,7 +485,7 @@ git commit -m "feat: sample frame-indexed video evidence"
 
 ```python
 # tests/test_prompts.py
-from qwen_annotate.prompts import build_coarse_prompt
+from robo_annotate.prompts import build_coarse_prompt
 from tests.fixtures import make_config
 
 def test_dagger_prompt_contains_template_and_legal_sequences(tmp_path) -> None:
@@ -501,7 +501,7 @@ def test_dagger_prompt_contains_template_and_legal_sequences(tmp_path) -> None:
 
 Run: `uv run pytest tests/test_prompts.py -v`
 
-Expected: import fails because `qwen_annotate.prompts` does not exist.
+Expected: import fails because `robo_annotate.prompts` does not exist.
 
 - [ ] **Step 3: Implement prompts as pure functions**
 
@@ -518,14 +518,14 @@ Run: `uv run pytest tests/test_prompts.py -v`
 Expected: prompt and schema tests pass.
 
 ```bash
-git add src/qwen_annotate/prompts.py tests/test_prompts.py
+git add src/robo_annotate/prompts.py tests/test_prompts.py
 git commit -m "feat: constrain Qwen annotation prompts"
 ```
 
 ### Task 6: Async Qwen Client with Structured Output and Bounded Retries
 
 **Files:**
-- Create: `src/qwen_annotate/qwen_client.py`
+- Create: `src/robo_annotate/qwen_client.py`
 - Create: `tests/test_qwen_client.py`
 
 **Interfaces:**
@@ -537,8 +537,8 @@ git commit -m "feat: constrain Qwen annotation prompts"
 ```python
 # tests/test_qwen_client.py
 import pytest
-from qwen_annotate.models import FinalAnnotation
-from qwen_annotate.qwen_client import QwenClient
+from robo_annotate.models import FinalAnnotation
+from robo_annotate.qwen_client import QwenClient
 
 @pytest.mark.asyncio
 async def test_client_retries_transient_error_then_parses() -> None:
@@ -559,7 +559,7 @@ async def test_client_retries_transient_error_then_parses() -> None:
 
 Run: `uv run pytest tests/test_qwen_client.py -v`
 
-Expected: import fails because `qwen_annotate.qwen_client` does not exist.
+Expected: import fails because `robo_annotate.qwen_client` does not exist.
 
 - [ ] **Step 3: Implement the OpenAI-compatible request adapter**
 
@@ -576,14 +576,14 @@ Run: `uv run pytest tests/test_qwen_client.py -v`
 Expected: transient retry, invalid JSON, and exhausted retry tests pass.
 
 ```bash
-git add src/qwen_annotate/qwen_client.py tests/test_qwen_client.py
+git add src/robo_annotate/qwen_client.py tests/test_qwen_client.py
 git commit -m "feat: call Qwen with structured multimodal output"
 ```
 
 ### Task 7: Immutable Qwen3.8 Model Download and Verification
 
 **Files:**
-- Create: `src/qwen_annotate/model_manager.py`
+- Create: `src/robo_annotate/model_manager.py`
 - Create: `tests/test_model_manager.py`
 
 **Interfaces:**
@@ -595,7 +595,7 @@ git commit -m "feat: call Qwen with structured multimodal output"
 ```python
 # tests/test_model_manager.py
 from pathlib import Path
-from qwen_annotate.model_manager import download_model
+from robo_annotate.model_manager import download_model
 
 def test_download_pins_sha_and_clears_proxy_only_for_child(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("ALL_PROXY", "socks5://proxy:1080")
@@ -616,7 +616,7 @@ def test_download_pins_sha_and_clears_proxy_only_for_child(tmp_path: Path, monke
 
 Run: `uv run pytest tests/test_model_manager.py -v`
 
-Expected: import fails because `qwen_annotate.model_manager` does not exist.
+Expected: import fails because `robo_annotate.model_manager` does not exist.
 
 - [ ] **Step 3: Implement immutable revision resolution**
 
@@ -640,14 +640,14 @@ Run: `uv run pytest tests/test_model_manager.py -v`
 Expected: all tests pass and no network request occurs in tests.
 
 ```bash
-git add src/qwen_annotate/model_manager.py tests/test_model_manager.py
+git add src/robo_annotate/model_manager.py tests/test_model_manager.py
 git commit -m "feat: download immutable Qwen3.8 weights"
 ```
 
 ### Task 8: Atomic Workspace, Fingerprints, and Resume State
 
 **Files:**
-- Create: `src/qwen_annotate/workspace.py`
+- Create: `src/robo_annotate/workspace.py`
 - Create: `tests/test_workspace.py`
 
 **Interfaces:**
@@ -658,7 +658,7 @@ git commit -m "feat: download immutable Qwen3.8 weights"
 
 ```python
 # tests/test_workspace.py
-from qwen_annotate.workspace import EpisodeRecord, WorkspaceStore
+from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
 
 def test_save_is_atomic_and_round_trips(tmp_path) -> None:
     store = WorkspaceStore(tmp_path / "work")
@@ -679,7 +679,7 @@ def test_cache_invalidates_on_config_or_source_change(tmp_path) -> None:
 
 Run: `uv run pytest tests/test_workspace.py -v`
 
-Expected: import fails because `qwen_annotate.workspace` does not exist.
+Expected: import fails because `robo_annotate.workspace` does not exist.
 
 - [ ] **Step 3: Implement state models and legal transitions**
 
@@ -700,14 +700,14 @@ Run: `uv run pytest tests/test_workspace.py -v`
 Expected: transition, atomicity, summary, and invalidation tests pass.
 
 ```bash
-git add src/qwen_annotate/workspace.py tests/test_workspace.py
+git add src/robo_annotate/workspace.py tests/test_workspace.py
 git commit -m "feat: persist resumable annotation state"
 ```
 
 ### Task 9: Coarse Whole-Episode Annotation
 
 **Files:**
-- Create: `src/qwen_annotate/coarse.py`
+- Create: `src/robo_annotate/coarse.py`
 - Create: `tests/test_coarse.py`
 
 **Interfaces:**
@@ -719,8 +719,8 @@ git commit -m "feat: persist resumable annotation state"
 ```python
 # tests/test_coarse.py
 import pytest
-from qwen_annotate.coarse import run_coarse
-from qwen_annotate.models import CoarseBoundary, CoarseResult
+from robo_annotate.coarse import run_coarse
+from robo_annotate.models import CoarseBoundary, CoarseResult
 
 def result(start, observed, boundary):
     return CoarseResult(
@@ -742,7 +742,7 @@ async def test_disagreeing_sequences_require_review(config, episode, sampler) ->
 
 Run: `uv run pytest tests/test_coarse.py -v`
 
-Expected: import fails because `qwen_annotate.coarse` does not exist.
+Expected: import fails because `robo_annotate.coarse` does not exist.
 
 - [ ] **Step 3: Implement two independent coarse passes**
 
@@ -759,14 +759,14 @@ Run: `uv run pytest tests/test_coarse.py -v`
 Expected: success, complete violation, DAgger violation, and disagreement tests pass.
 
 ```bash
-git add src/qwen_annotate/coarse.py tests/test_coarse.py
+git add src/robo_annotate/coarse.py tests/test_coarse.py
 git commit -m "feat: infer coarse ordered subtasks"
 ```
 
 ### Task 10: Adaptive Boundary Refinement and Acceptance
 
 **Files:**
-- Create: `src/qwen_annotate/refine.py`
+- Create: `src/robo_annotate/refine.py`
 - Create: `tests/test_refine.py`
 
 **Interfaces:**
@@ -778,8 +778,8 @@ git commit -m "feat: infer coarse ordered subtasks"
 ```python
 # tests/test_refine.py
 import pytest
-from qwen_annotate.refine import choose_agreed_boundary
-from qwen_annotate.models import RefineResult
+from robo_annotate.refine import choose_agreed_boundary
+from robo_annotate.models import RefineResult
 
 def refined(frame: int) -> RefineResult:
     return RefineResult(from_subtask_index=1, to_subtask_index=2,
@@ -797,7 +797,7 @@ def test_disagreement_has_no_boundary() -> None:
 
 Run: `uv run pytest tests/test_refine.py -v`
 
-Expected: import fails because `qwen_annotate.refine` does not exist.
+Expected: import fails because `robo_annotate.refine` does not exist.
 
 - [ ] **Step 3: Implement adaptive broad and dense evidence sampling**
 
@@ -818,15 +818,15 @@ Run: `uv run pytest tests/test_refine.py -v`
 Expected: agreement, mismatch, validation, and OOM tests pass.
 
 ```bash
-git add src/qwen_annotate/refine.py tests/test_refine.py
+git add src/robo_annotate/refine.py tests/test_refine.py
 git commit -m "feat: refine and validate subtask boundaries"
 ```
 
 ### Task 11: Resumable Batch Pipeline and Operational CLI
 
 **Files:**
-- Create: `src/qwen_annotate/pipeline.py`
-- Create: `src/qwen_annotate/cli.py`
+- Create: `src/robo_annotate/pipeline.py`
+- Create: `src/robo_annotate/cli.py`
 - Create: `tests/test_pipeline.py`
 - Create: `tests/test_cli.py`
 
@@ -839,7 +839,7 @@ git commit -m "feat: refine and validate subtask boundaries"
 ```python
 # tests/test_pipeline.py
 import pytest
-from qwen_annotate.pipeline import annotate_dataset
+from robo_annotate.pipeline import annotate_dataset
 
 @pytest.mark.asyncio
 async def test_resume_skips_accepted_episode(tmp_path, pipeline_fixture) -> None:
@@ -877,18 +877,18 @@ Expected: all orchestration and command tests pass.
 - [ ] **Step 6: Commit the runnable annotation pipeline**
 
 ```bash
-git add src/qwen_annotate/pipeline.py src/qwen_annotate/cli.py tests/test_pipeline.py tests/test_cli.py
+git add src/robo_annotate/pipeline.py src/robo_annotate/cli.py tests/test_pipeline.py tests/test_cli.py
 git commit -m "feat: run resumable annotation batches"
 ```
 
 ### Task 12: Static Review UI and Validated Human Decisions
 
 **Files:**
-- Create: `src/qwen_annotate/review.py`
-- Create: `src/qwen_annotate/templates/review.html.j2`
-- Create: `src/qwen_annotate/static/review.js`
+- Create: `src/robo_annotate/review.py`
+- Create: `src/robo_annotate/templates/review.html.j2`
+- Create: `src/robo_annotate/static/review.js`
 - Create: `tests/test_review.py`
-- Modify: `src/qwen_annotate/cli.py`
+- Modify: `src/robo_annotate/cli.py`
 
 **Interfaces:**
 - Consumes: workspace records, source videos, sampler, annotation constraints.
@@ -915,7 +915,7 @@ def test_invalid_human_boundary_is_not_accepted(review_workspace) -> None:
 
 Run: `uv run pytest tests/test_review.py -v`
 
-Expected: import fails because `qwen_annotate.review` does not exist.
+Expected: import fails because `robo_annotate.review` does not exist.
 
 - [ ] **Step 3: Implement self-contained static review output**
 
@@ -923,7 +923,7 @@ Render one index page and per-episode JSON under `previews/needs_review`. Genera
 
 - [ ] **Step 4: Implement decision import and validation**
 
-`qwen-annotate review WORK_DIR --apply decision.json` validates episode identity, start index, boundaries, mode, segment lengths, and source fingerprint. On success set status `accepted`, `decision_source="human"`, store the previous candidates, and atomically save. On failure leave the record unchanged and exit nonzero.
+`Robo-annotate review WORK_DIR --apply decision.json` validates episode identity, start index, boundaries, mode, segment lengths, and source fingerprint. On success set status `accepted`, `decision_source="human"`, store the previous candidates, and atomically save. On failure leave the record unchanged and exit nonzero.
 
 - [ ] **Step 5: Run tests and commit**
 
@@ -932,18 +932,18 @@ Run: `uv run pytest tests/test_review.py tests/test_cli.py -v`
 Expected: rendering, invalid decision, valid decision, and CLI tests pass.
 
 ```bash
-git add src/qwen_annotate/review.py src/qwen_annotate/templates src/qwen_annotate/static tests/test_review.py src/qwen_annotate/cli.py
+git add src/robo_annotate/review.py src/robo_annotate/templates src/robo_annotate/static tests/test_review.py src/robo_annotate/cli.py
 git commit -m "feat: review uncertain episode annotations"
 ```
 
 ### Task 13: Full Dataset Conversion and Independent Release Validation
 
 **Files:**
-- Create: `src/qwen_annotate/converter.py`
-- Create: `src/qwen_annotate/release_validator.py`
+- Create: `src/robo_annotate/converter.py`
+- Create: `src/robo_annotate/release_validator.py`
 - Create: `tests/test_converter.py`
 - Create: `tests/test_release_validator.py`
-- Modify: `src/qwen_annotate/cli.py`
+- Modify: `src/robo_annotate/cli.py`
 
 **Interfaces:**
 - Consumes: source dataset, workspace manifest and accepted records.
@@ -992,15 +992,15 @@ Run: `uv run pytest tests/test_converter.py tests/test_release_validator.py test
 Expected: all tests pass.
 
 ```bash
-git add src/qwen_annotate/converter.py src/qwen_annotate/release_validator.py src/qwen_annotate/cli.py tests/test_converter.py tests/test_release_validator.py
+git add src/robo_annotate/converter.py src/robo_annotate/release_validator.py src/robo_annotate/cli.py tests/test_converter.py tests/test_release_validator.py
 git commit -m "feat: convert and validate annotated datasets"
 ```
 
 ### Task 14: Accepted-Only Reindexing and Statistics Integrity
 
 **Files:**
-- Modify: `src/qwen_annotate/converter.py`
-- Create: `src/qwen_annotate/stats.py`
+- Modify: `src/robo_annotate/converter.py`
+- Create: `src/robo_annotate/stats.py`
 - Create: `tests/test_accepted_only.py`
 - Create: `tests/test_stats.py`
 
@@ -1050,16 +1050,16 @@ Expected: reindexing and statistics tests pass, and the independent validator ac
 - [ ] **Step 7: Commit accepted-only support**
 
 ```bash
-git add src/qwen_annotate/converter.py src/qwen_annotate/stats.py tests/test_accepted_only.py tests/test_stats.py
+git add src/robo_annotate/converter.py src/robo_annotate/stats.py tests/test_accepted_only.py tests/test_stats.py
 git commit -m "feat: convert accepted episode subsets"
 ```
 
 ### Task 15: Golden-Set and Synthetic DAgger Evaluation
 
 **Files:**
-- Create: `src/qwen_annotate/evaluation.py`
+- Create: `src/robo_annotate/evaluation.py`
 - Create: `tests/test_evaluation.py`
-- Modify: `src/qwen_annotate/cli.py`
+- Modify: `src/robo_annotate/cli.py`
 
 **Interfaces:**
 - Consumes: workspace results, golden `lerobot_annotations.json`, source episode lengths and FPS.
@@ -1083,7 +1083,7 @@ def test_boundary_metrics_and_coverage_are_exact() -> None:
 
 Run: `uv run pytest tests/test_evaluation.py -v`
 
-Expected: import fails because `qwen_annotate.evaluation` does not exist.
+Expected: import fails because `robo_annotate.evaluation` does not exist.
 
 - [ ] **Step 3: Implement complete-dataset metrics**
 
@@ -1104,7 +1104,7 @@ Run: `uv run pytest tests/test_evaluation.py tests/test_cli.py -v`
 Expected: complete and synthetic-DAgger metric tests pass.
 
 ```bash
-git add src/qwen_annotate/evaluation.py src/qwen_annotate/cli.py tests/test_evaluation.py
+git add src/robo_annotate/evaluation.py src/robo_annotate/cli.py tests/test_evaluation.py
 git commit -m "feat: evaluate annotation quality"
 ```
 
@@ -1144,7 +1144,7 @@ CUDA_VISIBLE_DEVICES=0 /mnt/data/user/zhoukr/envs/vllm/bin/vllm serve \
 
 - [ ] **Step 4: Download and verify the official model**
 
-Run: `uv run qwen-annotate model download --repo Qwen/Qwen3.8-27B --local-dir /mnt/data/user/zhoukr/models/Qwen3.8-27B`
+Run: `uv run Robo-annotate model download --repo Qwen/Qwen3.8-27B --local-dir /mnt/data/user/zhoukr/models/Qwen3.8-27B`
 
 Expected: command prints a 40-character revision SHA, `model-install.json` records it, and verification succeeds. If direct access is unavailable, retain the resumable partial directory and report the network error; do not mark this step complete.
 
@@ -1157,7 +1157,7 @@ Start vLLM with the documented command. Create a config targeting only reference
 Annotate the full reference source, then run:
 
 ```bash
-uv run qwen-annotate evaluate \
+uv run Robo-annotate evaluate \
   /mnt/data/user/zhoukr/annotations/arrange_orange_juice_and_green_tea_2 \
   --golden /mnt/data/user/zhoukr/datasets/jokeru/arrange_orange_juice_and_green_tea_2_annotated \
   --output /mnt/data/user/zhoukr/annotations/arrange_orange_juice_and_green_tea_2/metrics.json
@@ -1171,7 +1171,7 @@ Run the same fixed 8-episode subset at concurrency 1, 2, and 4 against available
 
 - [ ] **Step 8: Run final verification and commit documentation**
 
-Run: `uv run pytest -q && uv run qwen-annotate inspect examples/complete.yaml`
+Run: `uv run pytest -q && uv run Robo-annotate inspect examples/complete.yaml`
 
 Expected: full suite passes and the real reference dataset inspection reports 47 valid episodes.
 

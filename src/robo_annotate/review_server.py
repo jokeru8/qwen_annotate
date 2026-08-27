@@ -180,7 +180,7 @@ def create_review_app(
     work_dir: Path, *, services: ReviewServices | None = None
 ) -> FastAPI:
     runtime = ReviewRuntime(work_dir, services=services)
-    app = FastAPI(title="Qwen LeRobot Visual Review", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Robo-annotate Studio", docs_url=None, redoc_url=None)
     app.state.review_runtime = runtime
     web_root = Path(__file__).parent / "review_web"
     csp = "default-src 'self'; img-src 'self'; media-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'"

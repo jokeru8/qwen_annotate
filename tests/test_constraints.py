@@ -1,8 +1,8 @@
 import pytest
 from pydantic import ValidationError
 
-from qwen_annotate.constraints import coarse_sequence_is_legal, validate_annotation
-from qwen_annotate.models import (
+from robo_annotate.constraints import coarse_sequence_is_legal, validate_annotation
+from robo_annotate.models import (
     CoarseBoundary,
     CoarseResult,
     FinalAnnotation,

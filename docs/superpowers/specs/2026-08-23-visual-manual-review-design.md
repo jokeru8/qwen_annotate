@@ -2,11 +2,11 @@
 
 ## 目标
 
-在 `qwen_annotate` 内提供一个只绑定单个 workspace 的本地 Web 界面，让标注员同步查看 episode 的多路视频、当前 subtask 和边界帧，复核或修正自动标注；`pending`、`failed` 只能经过显式“人工接管”确认后完整手工标注并转为 `accepted`。
+在 `robo_annotate` 内提供一个只绑定单个 workspace 的本地 Web 界面，让标注员同步查看 episode 的多路视频、当前 subtask 和边界帧，复核或修正自动标注；`pending`、`failed` 只能经过显式“人工接管”确认后完整手工标注并转为 `accepted`。
 
 ## 方案
 
-保留现有静态 `qwen-annotate review WORK_DIR` 和离线 decision 导入兼容性，新增 `qwen-annotate review WORK_DIR --serve`。服务采用 FastAPI/Uvicorn，但所有状态仍通过现有 `WorkspaceStore`、source/run fingerprint、硬约束和事务保存进入同一份 workspace，不引入第二套标注数据库，也不复用旧工具的 exporter。
+保留现有静态 `Robo-annotate review WORK_DIR` 和离线 decision 导入兼容性，新增 `Robo-annotate review WORK_DIR --serve`。服务采用 FastAPI/Uvicorn，但所有状态仍通过现有 `WorkspaceStore`、source/run fingerprint、硬约束和事务保存进入同一份 workspace，不引入第二套标注数据库，也不复用旧工具的 exporter。
 
 浏览器不能提交任意文件路径。服务启动时固定唯一 `WORK_DIR`，默认仅监听 `127.0.0.1`。视频接口只能返回 manifest 中当前 episode 的已知 camera 文件，并支持 HTTP Range 以便浏览器拖动。
 

@@ -12,7 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from qwen_annotate.video import FrameSample, as_data_url
+from robo_annotate.video import FrameSample, as_data_url
 
 
 Send = Callable[..., Awaitable[Any]]

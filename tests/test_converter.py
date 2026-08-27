@@ -10,12 +10,12 @@ import pyarrow.parquet as pq
 import numpy as np
 import pytest
 
-from qwen_annotate.config import AnnotationConfig
-from qwen_annotate.converter import ConversionReport, convert_dataset
-from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo, VideoProbe
-from qwen_annotate.models import FinalAnnotation
-from qwen_annotate.release_validator import validate_release
-from qwen_annotate.workspace import EpisodeRecord, WorkspaceStore
+from robo_annotate.config import AnnotationConfig
+from robo_annotate.converter import ConversionReport, convert_dataset
+from robo_annotate.lerobot import DatasetIndex, EpisodeInfo, VideoProbe
+from robo_annotate.models import FinalAnnotation
+from robo_annotate.release_validator import validate_release
+from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
 
 
 NOW = datetime(2026, 8, 22, 12, tzinfo=UTC)
@@ -62,7 +62,7 @@ def _fixture(
         video.write_bytes((f"video-{i}").encode())
         episodes.append(EpisodeInfo(episode_index=i, length=length, task="Arrange.", parquet=parquet, videos={"cam.eye": video}))
     (source / "meta/episodes.jsonl").write_text("\n".join(rows) + "\n")
-    from qwen_annotate.stats import recompute_stats
+    from robo_annotate.stats import recompute_stats
     aggregate_stats = recompute_stats([episode.parquet for episode in episodes])
     image_values = (
         {"min": 0.0, "max": 1.0, "mean": 0.5, "std": 0.1,

@@ -4,7 +4,7 @@ import pytest
 import yaml
 from pydantic import BaseModel, ValidationError
 
-from qwen_annotate.config import (
+from robo_annotate.config import (
     AnnotationConfig,
     ModelConfig,
     SamplingConfig,

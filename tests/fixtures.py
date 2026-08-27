@@ -7,7 +7,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from qwen_annotate.config import AnnotationConfig
+from robo_annotate.config import AnnotationConfig
 
 
 def make_legacy_v4_workspace(tmp_path: Path) -> Path:

@@ -14,12 +14,12 @@ import pyarrow.parquet as pq
 import yaml
 from typer.testing import CliRunner
 
-from qwen_annotate.cli import app
-from qwen_annotate.lerobot import inspect_dataset
-from qwen_annotate.model_manager import ModelInstall
-from qwen_annotate.models import CoarseBoundary, CoarseResult, RefineResult
-from qwen_annotate.pipeline import PipelineServices, annotate_dataset
-from qwen_annotate.stats import recompute_stats, recompute_video_stats
+from robo_annotate.cli import app
+from robo_annotate.lerobot import inspect_dataset
+from robo_annotate.model_manager import ModelInstall
+from robo_annotate.models import CoarseBoundary, CoarseResult, RefineResult
+from robo_annotate.pipeline import PipelineServices, annotate_dataset
+from robo_annotate.stats import recompute_stats, recompute_video_stats
 
 
 def _write_video(path: Path, camera_value: int, episode_index: int) -> None:
@@ -202,7 +202,7 @@ def test_two_episode_two_camera_cli_workflow_is_non_destructive(monkeypatch, tmp
             config, max_concurrency, episode_indices, services=services,
         )
 
-    monkeypatch.setattr("qwen_annotate.cli.annotate_dataset", annotate_with_fake)
+    monkeypatch.setattr("robo_annotate.cli.annotate_dataset", annotate_with_fake)
     runner = CliRunner()
     before = _tree_hash(source)
 

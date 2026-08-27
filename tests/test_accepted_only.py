@@ -8,12 +8,12 @@ import pyarrow.parquet as pq
 import numpy as np
 import pytest
 
-from qwen_annotate.config import AnnotationConfig
-from qwen_annotate.converter import convert_dataset
-from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo, VideoProbe
-from qwen_annotate.models import FinalAnnotation
-from qwen_annotate.release_validator import validate_release
-from qwen_annotate.workspace import EpisodeRecord, WorkspaceStore
+from robo_annotate.config import AnnotationConfig
+from robo_annotate.converter import convert_dataset
+from robo_annotate.lerobot import DatasetIndex, EpisodeInfo, VideoProbe
+from robo_annotate.models import FinalAnnotation
+from robo_annotate.release_validator import validate_release
+from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
 
 
 NOW = datetime(2026, 8, 22, 12, tzinfo=UTC)
@@ -276,7 +276,7 @@ def test_release_validator_rejects_stats_corruption(tmp_path: Path, mutation: st
 def test_accepted_only_never_copies_unselected_payloads(monkeypatch, tmp_path: Path) -> None:
     """Catches full-tree copying followed by deletion of rejected episode payloads."""
     _, work, services = _mixed_workspace(tmp_path)
-    import qwen_annotate.converter as converter
+    import robo_annotate.converter as converter
     real_copy = converter.shutil.copy2
 
     def guarded_copy(source, destination, *args, **kwargs):

@@ -3,7 +3,7 @@ from urllib.parse import quote
 
 from fastapi.testclient import TestClient
 
-from qwen_annotate.review_server import create_review_app
+from robo_annotate.review_server import create_review_app
 from tests.test_review import _workspace
 
 
@@ -168,7 +168,7 @@ def test_open_video_descriptor_keeps_verified_bytes_after_path_replacement(tmp_p
     replacement.write_bytes(b"other")
     replacement.replace(path)
     try:
-        assert b"".join(__import__("qwen_annotate.review_server", fromlist=["_fd_chunks"])._fd_chunks(descriptor, 0, size)) == b"video"
+        assert b"".join(__import__("robo_annotate.review_server", fromlist=["_fd_chunks"])._fd_chunks(descriptor, 0, size)) == b"video"
     finally:
         try:
             __import__("os").close(descriptor)

@@ -10,7 +10,7 @@ from typing import Any
 import pyarrow.parquet as pq
 from pydantic import BaseModel, Field, field_validator
 
-from qwen_annotate.config import AnnotationConfig
+from robo_annotate.config import AnnotationConfig
 
 
 VIDEO_FPS_TOLERANCE = 0.01

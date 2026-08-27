@@ -24,8 +24,8 @@
 ### Task 1: Human takeover state contract
 
 **Files:**
-- Modify: `src/qwen_annotate/review.py`
-- Modify: `src/qwen_annotate/workspace.py`
+- Modify: `src/robo_annotate/review.py`
+- Modify: `src/robo_annotate/workspace.py`
 - Modify: `tests/test_review.py`
 - Modify: `tests/test_workspace.py`
 
@@ -44,7 +44,7 @@
 ### Task 2: Workspace transaction portability
 
 **Files:**
-- Modify: `src/qwen_annotate/workspace.py`
+- Modify: `src/robo_annotate/workspace.py`
 - Modify: `tests/test_workspace.py`
 
 **Interfaces:**
@@ -60,7 +60,7 @@
 ### Task 3: Review read model and video responses
 
 **Files:**
-- Create: `src/qwen_annotate/review_server.py`
+- Create: `src/robo_annotate/review_server.py`
 - Create: `tests/test_review_server.py`
 - Modify: `pyproject.toml`
 - Modify: `uv.lock`
@@ -79,7 +79,7 @@
 ### Task 4: Decision endpoint and conflict mapping
 
 **Files:**
-- Modify: `src/qwen_annotate/review_server.py`
+- Modify: `src/robo_annotate/review_server.py`
 - Modify: `tests/test_review_server.py`
 
 **Interfaces:**
@@ -95,11 +95,11 @@
 ### Task 5: Synchronized multi-camera browser UI
 
 **Files:**
-- Create: `src/qwen_annotate/review_web/index.html`
-- Create: `src/qwen_annotate/review_web/app.js`
-- Create: `src/qwen_annotate/review_web/style.css`
+- Create: `src/robo_annotate/review_web/index.html`
+- Create: `src/robo_annotate/review_web/app.js`
+- Create: `src/robo_annotate/review_web/style.css`
 - Create: `tests/test_review_web.py`
-- Modify: `src/qwen_annotate/review_server.py`
+- Modify: `src/robo_annotate/review_server.py`
 
 **Interfaces:**
 - Consumes: `/api/session`, `/api/episodes`, episode detail/video URLs, decision endpoint
@@ -116,13 +116,13 @@
 ### Task 6: CLI and operator documentation
 
 **Files:**
-- Modify: `src/qwen_annotate/cli.py`
+- Modify: `src/robo_annotate/cli.py`
 - Modify: `tests/test_cli.py`
 - Modify: `README.md`
 - Modify: `docs/operations.md`
 
 **Interfaces:**
-- Produces: `qwen-annotate review WORK_DIR --serve --host 127.0.0.1 --port 8765`
+- Produces: `Robo-annotate review WORK_DIR --serve --host 127.0.0.1 --port 8765`
 
 - [x] Write failing CLI tests proving `--serve` delegates to Uvicorn, rejects incompatible `--apply`, and keeps default static generation.
 - [x] Run `uv run pytest tests/test_cli.py -q` and verify failures.
@@ -141,7 +141,7 @@
 
 - [x] Run `uv run pytest tests/test_review.py tests/test_workspace.py tests/test_review_server.py tests/test_review_web.py tests/test_cli.py -q`.
 - [x] Run `uv run pytest -q` and resolve each defect through a new failing regression test before changing production code.
-- [x] Run `uv run qwen-annotate --help` and `uv run qwen-annotate review --help` as CLI smoke tests.
+- [x] Run `uv run Robo-annotate --help` and `uv run Robo-annotate review --help` as CLI smoke tests.
 - [x] Start the server against a disposable fixture, request `/`, `/api/session`, one episode, and a byte range, then stop it cleanly.
 - [x] Inspect `git diff --check`, `git status --short`, and the final diff for secrets, source writes, unrelated changes, or generated artifacts.
 - [x] Commit verification fixes, if any, with a narrowly scoped message.

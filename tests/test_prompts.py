@@ -1,10 +1,10 @@
 import json
 import pytest
 
-import qwen_annotate.prompts as prompt_module
-from qwen_annotate.config import AnnotationConfig
-from qwen_annotate.models import CoarseResult, RefineResult
-from qwen_annotate.prompts import (
+import robo_annotate.prompts as prompt_module
+from robo_annotate.config import AnnotationConfig
+from robo_annotate.models import CoarseResult, RefineResult
+from robo_annotate.prompts import (
     PROMPT_VERSION,
     build_coarse_prompt,
     build_refine_prompt,

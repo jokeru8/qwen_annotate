@@ -7,12 +7,12 @@ import pytest
 from pydantic import ValidationError
 from typer.testing import CliRunner
 
-from qwen_annotate.cli import app
-from qwen_annotate.config import AnnotationConfig
-from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo
-from qwen_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
-from qwen_annotate.prompts import PROMPT_VERSION
-from qwen_annotate.review import (
+from robo_annotate.cli import app
+from robo_annotate.config import AnnotationConfig
+from robo_annotate.lerobot import DatasetIndex, EpisodeInfo
+from robo_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
+from robo_annotate.prompts import PROMPT_VERSION
+from robo_annotate.review import (
     HumanDecision,
     ManualDecision,
     ReviewServices,
@@ -21,8 +21,8 @@ from qwen_annotate.review import (
     apply_manual_decision,
     render_review_site,
 )
-from qwen_annotate.video import FrameSample
-from qwen_annotate.workspace import EpisodeRecord, WorkspaceStore
+from robo_annotate.video import FrameSample
+from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
 
 
 NOW = datetime(2026, 8, 22, tzinfo=UTC)
@@ -405,7 +405,7 @@ def test_human_save_failure_restores_authoritative_episode_bytes(tmp_path: Path,
     work, _, _, record, services, _ = _workspace(tmp_path)
     episode_path = work / "episodes/episode_000000.json"
     before = episode_path.read_bytes()
-    import qwen_annotate.workspace as workspace_module
+    import robo_annotate.workspace as workspace_module
     real_write = workspace_module._atomic_json_write
     failed = False
 
@@ -425,7 +425,7 @@ def test_human_save_failure_restores_authoritative_episode_bytes(tmp_path: Path,
 
 def test_manual_save_works_when_filesystem_rejects_hardlinks(tmp_path: Path, monkeypatch) -> None:
     work, _, _, record, services, _ = _workspace(tmp_path)
-    import qwen_annotate.workspace as workspace_module
+    import robo_annotate.workspace as workspace_module
 
     monkeypatch.setattr(
         workspace_module.os,
@@ -442,7 +442,7 @@ def test_manual_fuse_fallback_rolls_back_when_summary_write_fails(tmp_path: Path
     work, _, _, record, services, _ = _workspace(tmp_path)
     episode_path = work / "episodes/episode_000000.json"
     before = episode_path.read_bytes()
-    import qwen_annotate.workspace as workspace_module
+    import robo_annotate.workspace as workspace_module
     real_write = workspace_module._atomic_json_write
     failed = False
 
@@ -473,7 +473,7 @@ def test_publish_recovers_owned_backup_left_between_renames(tmp_path: Path) -> N
     destination = page.parent
     backup = destination.parent / ".needs_review.backup"
     destination.replace(backup)
-    assert not destination.exists() and (backup / ".qwen-annotate-review-v1").is_file()
+    assert not destination.exists() and (backup / ".Robo-annotate-review-v1").is_file()
     recovered = render_review_site(work, services=services)
     assert recovered.is_file() and not backup.exists()
 
@@ -498,7 +498,7 @@ def test_publish_staging_rename_failure_rolls_back_live_bundle(tmp_path: Path, m
     work, _, _, _, services, _ = _workspace(tmp_path)
     page = render_review_site(work, services=services)
     before = page.read_bytes()
-    import qwen_annotate.review as review_module
+    import robo_annotate.review as review_module
     real_replace = review_module.os.replace
 
     def fail_staging(source, destination, *args, **kwargs):
@@ -516,7 +516,7 @@ def test_publish_staging_rename_failure_rolls_back_live_bundle(tmp_path: Path, m
 def test_postcommit_backup_cleanup_failure_still_succeeds_then_recovers(tmp_path: Path, monkeypatch) -> None:
     work, _, _, _, services, _ = _workspace(tmp_path)
     render_review_site(work, services=services)
-    import qwen_annotate.review as review_module
+    import robo_annotate.review as review_module
     real_rmtree = review_module.shutil.rmtree
     failed = False
 
@@ -550,7 +550,7 @@ def test_parent_directory_fsync_failure_rolls_back_existing_live_bundle(tmp_path
     page = render_review_site(work, services=services)
     before = page.read_bytes()
     previews = work / "previews"
-    import qwen_annotate.review as review_module
+    import robo_annotate.review as review_module
     real_fsync_directory = review_module._fsync_directory
     failed = False
 
@@ -582,7 +582,7 @@ def test_publish_lock_symlink_and_stale_stage_safety(tmp_path: Path) -> None:
 
     owned = previews / ".needs_review.staging-owned"
     owned.mkdir()
-    (owned / ".qwen-annotate-review-v1").write_text("owned\n")
+    (owned / ".Robo-annotate-review-v1").write_text("owned\n")
     unowned = previews / ".needs_review.staging-user"
     unowned.mkdir()
     (unowned / "keep.txt").write_text("keep")

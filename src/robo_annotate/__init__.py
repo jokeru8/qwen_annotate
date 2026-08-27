@@ -1,4 +1,4 @@
-"""Typed configuration and annotation foundations."""
+"""Robo-annotate public Python package."""
 
 from .config import (
     AnnotationConfig,

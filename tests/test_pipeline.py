@@ -7,15 +7,15 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from qwen_annotate.coarse import CoarseDecision
-from qwen_annotate.config import AnnotationConfig, Subtask
-from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo
-from qwen_annotate.model_manager import ModelInstall
-from qwen_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation
-from qwen_annotate.pipeline import AuditPersistenceError, PipelineServices, WorkspaceSummary, _installed_model, annotate_dataset
-from qwen_annotate.refine import CameraSampling, RefineDecision, SamplingProvenance
-from qwen_annotate.qwen_client import InvalidModelResponse, ModelCallError, ModelOutOfMemory
-from qwen_annotate.workspace import EpisodeRecord, WorkspaceStore
+from robo_annotate.coarse import CoarseDecision
+from robo_annotate.config import AnnotationConfig, Subtask
+from robo_annotate.lerobot import DatasetIndex, EpisodeInfo
+from robo_annotate.model_manager import ModelInstall
+from robo_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation
+from robo_annotate.pipeline import AuditPersistenceError, PipelineServices, WorkspaceSummary, _installed_model, annotate_dataset
+from robo_annotate.refine import CameraSampling, RefineDecision, SamplingProvenance
+from robo_annotate.qwen_client import InvalidModelResponse, ModelCallError, ModelOutOfMemory
+from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
 from tests.fixtures import make_config
 
 
@@ -25,8 +25,8 @@ SHA = "a" * 40
 def _sync_log_in_process(work_dir: str, results) -> None:
     import asyncio
     from pathlib import Path
-    from qwen_annotate.pipeline import _RunLog
-    from qwen_annotate.workspace import WorkspaceStore
+    from robo_annotate.pipeline import _RunLog
+    from robo_annotate.workspace import WorkspaceStore
 
     try:
         asyncio.run(_RunLog(Path(work_dir), lambda: datetime.now(UTC)).sync(WorkspaceStore(Path(work_dir))))
@@ -394,7 +394,7 @@ async def test_default_model_resolver_reads_matching_verified_install_metadata(t
 
 def test_model_install_reader_rejects_symlink_oversize_and_path_swap(monkeypatch, tmp_path: Path) -> None:
     import json
-    import qwen_annotate.pipeline as pipeline_module
+    import robo_annotate.pipeline as pipeline_module
 
     dataset = _dataset(tmp_path, 1)
     config = _config(tmp_path, dataset)
@@ -507,7 +507,7 @@ async def test_interruption_stops_new_scheduling_but_drains_other_inflight_episo
 @pytest.mark.asyncio
 async def test_outer_cancellation_finishes_current_atomic_transition_only(monkeypatch, tmp_path: Path) -> None:
     import asyncio
-    import qwen_annotate.pipeline as pipeline_module
+    import robo_annotate.pipeline as pipeline_module
 
     dataset = _dataset(tmp_path, 1)
     config = _config(tmp_path, dataset)
@@ -688,7 +688,7 @@ async def test_trailing_partial_legacy_log_is_rebuilt_from_authoritative_outbox(
 async def test_partial_temp_write_never_corrupts_official_log_and_resume_repairs(
     monkeypatch, tmp_path: Path, failure: BaseException,
 ) -> None:
-    import qwen_annotate.pipeline as pipeline_module
+    import robo_annotate.pipeline as pipeline_module
 
     dataset = _dataset(tmp_path, 1)
     config = _config(tmp_path, dataset)
@@ -733,7 +733,7 @@ async def test_partial_temp_write_never_corrupts_official_log_and_resume_repairs
 
 @pytest.mark.asyncio
 async def test_atomic_replace_failure_keeps_prior_log_and_cleans_temp(monkeypatch, tmp_path: Path) -> None:
-    import qwen_annotate.pipeline as pipeline_module
+    import robo_annotate.pipeline as pipeline_module
 
     dataset = _dataset(tmp_path, 1)
     config = _config(tmp_path, dataset)
@@ -791,7 +791,7 @@ async def test_cross_process_log_synchronizers_produce_one_canonical_file(tmp_pa
 
 @pytest.mark.asyncio
 async def test_temp_fsync_failure_preserves_official_log_and_cleans_temp(monkeypatch, tmp_path: Path) -> None:
-    import qwen_annotate.pipeline as pipeline_module
+    import robo_annotate.pipeline as pipeline_module
 
     dataset = _dataset(tmp_path, 1)
     config = _config(tmp_path, dataset)
@@ -828,7 +828,7 @@ async def test_temp_fsync_failure_preserves_official_log_and_cleans_temp(monkeyp
 
 @pytest.mark.asyncio
 async def test_log_failure_after_state_save_aborts_and_resume_repairs(monkeypatch, tmp_path: Path) -> None:
-    import qwen_annotate.pipeline as pipeline_module
+    import robo_annotate.pipeline as pipeline_module
 
     dataset = _dataset(tmp_path, 1)
     config = _config(tmp_path, dataset)

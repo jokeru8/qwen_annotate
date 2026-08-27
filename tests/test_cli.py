@@ -4,12 +4,12 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from qwen_annotate.cli import app, parse_episode_indices
-from qwen_annotate.model_manager import ModelInstall
+from robo_annotate.cli import app, parse_episode_indices
+from robo_annotate.model_manager import ModelInstall
 from datetime import UTC, datetime
-from qwen_annotate.workspace import EpisodeRecord, WorkspaceStore
-from qwen_annotate.pipeline import WorkspaceSummary
-from qwen_annotate.lerobot import DatasetIndex, EpisodeInfo
+from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
+from robo_annotate.pipeline import WorkspaceSummary
+from robo_annotate.lerobot import DatasetIndex, EpisodeInfo
 from tests.fixtures import make_legacy_v4_workspace
 
 
@@ -36,12 +36,12 @@ def test_convert_and_validate_cli_delegate_and_map_failures(monkeypatch, tmp_pat
         "skipped_checks": ("numeric_quantile_payload_equality",),
     })()
     calls = []
-    monkeypatch.setattr("qwen_annotate.cli.convert_dataset", lambda work, output, accepted_only=False: calls.append((work, output, accepted_only)) or report)
+    monkeypatch.setattr("robo_annotate.cli.convert_dataset", lambda work, output, accepted_only=False: calls.append((work, output, accepted_only)) or report)
     converted = runner.invoke(app, ["convert", str(tmp_path / "work"), "--output", str(tmp_path / "out"), "--accepted-only"])
     assert converted.exit_code == 0 and "episodes=2" in converted.stdout and calls
     validate_calls = []
     monkeypatch.setattr(
-        "qwen_annotate.cli.validate_release",
+        "robo_annotate.cli.validate_release",
         lambda path, source=None, allow_legacy_sampled_image_stats=False, deep_video_stats=True:
             validate_calls.append((path, source, allow_legacy_sampled_image_stats, deep_video_stats)) or report,
     )
@@ -56,7 +56,7 @@ def test_convert_and_validate_cli_delegate_and_map_failures(monkeypatch, tmp_pat
         "validate", str(tmp_path / "out"), "--allow-legacy-sampled-image-stats",
     ])
     assert contradictory.exit_code == 2 and "--no-deep-video-stats" in contradictory.output
-    monkeypatch.setattr("qwen_annotate.cli.validate_release", lambda *a, **k: (_ for _ in ()).throw(ValueError("secret details")))
+    monkeypatch.setattr("robo_annotate.cli.validate_release", lambda *a, **k: (_ for _ in ()).throw(ValueError("secret details")))
     failed = runner.invoke(app, ["validate", str(tmp_path / "out")])
     assert failed.exit_code == 1 and "secret details" not in failed.output and "Traceback" not in failed.output
 
@@ -77,7 +77,7 @@ def test_model_download_delegates_and_prints_immutable_install(monkeypatch, tmp_
         calls.append((repo, local_path, revision, max_workers))
         return ModelInstall(repo, "b" * 40, local_path.resolve(), datetime(2026, 8, 22, tzinfo=UTC))
 
-    monkeypatch.setattr("qwen_annotate.cli.download_model", download)
+    monkeypatch.setattr("robo_annotate.cli.download_model", download)
     result = runner.invoke(app, ["model", "download", "--repo", "Qwen/Test", "--local-dir", str(local), "--revision", "release", "--max-workers", "3"])
     assert result.exit_code == 0
     assert calls == [("Qwen/Test", local, "release", 3)]
@@ -110,8 +110,8 @@ def test_inspect_prints_dataset_metadata(monkeypatch, tmp_path: Path) -> None:
     source.mkdir()
     episode = EpisodeInfo(episode_index=0, length=12, task="task", parquet=source / "x", videos={"cam.eye": source / "v"})
     dataset = DatasetIndex(root=source, version="v2.1", fps=28.0, camera_keys=["cam.eye"], episodes=[episode])
-    monkeypatch.setattr("qwen_annotate.cli._config", lambda path: object())
-    monkeypatch.setattr("qwen_annotate.cli.inspect_dataset", lambda config: dataset)
+    monkeypatch.setattr("robo_annotate.cli._config", lambda path: object())
+    monkeypatch.setattr("robo_annotate.cli.inspect_dataset", lambda config: dataset)
     result = runner.invoke(app, ["inspect", str(tmp_path / "config.yaml")])
     assert result.exit_code == 0
     for expected in ("v2.1", "28.0", "cam.eye", "episodes: 1", "frames: 12", "OK"):
@@ -120,13 +120,13 @@ def test_inspect_prints_dataset_metadata(monkeypatch, tmp_path: Path) -> None:
 
 def test_annotate_prints_summary_and_failed_episode_causes_exit_one(monkeypatch, tmp_path: Path) -> None:
     raw = {"total": 1, "counts": {"pending": 0, "coarse_done": 0, "refine_done": 0, "accepted": 0, "needs_review": 0, "failed": 1}, "episode_indices": {"pending": [], "coarse_done": [], "refine_done": [], "needs_review": [], "failed": [0]}}
-    monkeypatch.setattr("qwen_annotate.cli._config", lambda path: object())
+    monkeypatch.setattr("robo_annotate.cli._config", lambda path: object())
 
     async def annotate(config, max_concurrency, episodes):
         assert max_concurrency == 2 and episodes == [0, 3]
         return WorkspaceSummary.from_store_summary(raw)
 
-    monkeypatch.setattr("qwen_annotate.cli.annotate_dataset", annotate)
+    monkeypatch.setattr("robo_annotate.cli.annotate_dataset", annotate)
     result = runner.invoke(app, ["annotate", str(tmp_path / "config.yaml"), "--max-concurrency", "2", "--episodes", "0,3"])
     assert result.exit_code == 1
     assert "failed=1" in result.stdout and "Traceback" not in result.output
@@ -151,7 +151,7 @@ def test_status_rejects_legacy_v4_workspace_with_actionable_safe_message(tmp_pat
 
 def test_review_render_delegates_and_prints_page(monkeypatch, tmp_path: Path) -> None:
     page = tmp_path / "work/previews/needs_review/index.html"
-    monkeypatch.setattr("qwen_annotate.cli.render_review_site", lambda work: page)
+    monkeypatch.setattr("robo_annotate.cli.render_review_site", lambda work: page)
     result = runner.invoke(app, ["review", str(tmp_path / "work")])
     assert result.exit_code == 0
     assert str(page) in result.stdout
@@ -160,7 +160,7 @@ def test_review_render_delegates_and_prints_page(monkeypatch, tmp_path: Path) ->
 def test_review_serve_delegates_host_port_and_rejects_apply(monkeypatch, tmp_path: Path) -> None:
     calls = []
     monkeypatch.setattr(
-        "qwen_annotate.cli.serve_review_app",
+        "robo_annotate.cli.serve_review_app",
         lambda work, host, port: calls.append((work, host, port)),
     )
     work = tmp_path / "work"
@@ -189,7 +189,7 @@ def test_review_apply_strictly_loads_and_delegates(monkeypatch, tmp_path: Path) 
         calls.append((work, episode, decision))
         return type("Accepted", (), {"episode_index": 3})()
 
-    monkeypatch.setattr("qwen_annotate.cli.apply_human_decision", apply)
+    monkeypatch.setattr("robo_annotate.cli.apply_human_decision", apply)
     result = runner.invoke(app, ["review", str(tmp_path / "work"), "--apply", str(decision_path)])
     assert result.exit_code == 0
     assert calls[0][0] == tmp_path / "work" and calls[0][1] == 3
@@ -215,7 +215,7 @@ def test_review_apply_operational_rejection_is_exit_one(monkeypatch, tmp_path: P
     decision.write_text(json.dumps({"episode_index": 0, "source_fingerprint": "a" * 64,
                                     "run_fingerprint": "b" * 64, "mode": "dagger_patch",
                                     "start_subtask_index": 0, "boundaries": []}))
-    monkeypatch.setattr("qwen_annotate.cli.apply_human_decision",
+    monkeypatch.setattr("robo_annotate.cli.apply_human_decision",
                         lambda *args: (_ for _ in ()).throw(ValueError("stale fingerprint")))
     result = runner.invoke(app, ["review", str(tmp_path / "work"), "--apply", str(decision)])
     assert result.exit_code == 1 and "Traceback" not in result.output

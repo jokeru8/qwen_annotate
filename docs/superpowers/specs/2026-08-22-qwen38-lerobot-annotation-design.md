@@ -1,8 +1,8 @@
-# Qwen3.8 LeRobot v2.1 自动标注系统设计
+# Robo-annotate Qwen/LeRobot v2.1 自动标注系统设计
 
 ## 1. 目标
 
-在 `/mnt/data/user/zhoukr/qwen_annotate` 中实现一个可恢复、可审计的批量标注项目，使用官方 `Qwen/Qwen3.8-27B` 多模态模型为 LeRobot v2.1 数据集生成有序 subtask 边界。系统只允许从用户提供的 subtask 模板中选择标签，不让模型自由生成标签；低置信或不满足约束的 episode 标记为 `needs_review`，不会自动进入发布数据。
+在 `/mnt/data/user/zhoukr/Robo-annotate` 中实现一个可恢复、可审计的批量标注项目，使用官方 `Qwen/Qwen3.8-27B` 多模态模型为 LeRobot v2.1 数据集生成有序 subtask 边界。系统只允许从用户提供的 subtask 模板中选择标签，不让模型自由生成标签；低置信或不满足约束的 episode 标记为 `needs_review`，不会自动进入发布数据。
 
 标注阶段不复制或修改原始数据。发布前通过独立的 `convert` 步骤，生成与 ModelScope 示例 `jokeru/arrange_orange_juice_and_green_tea_2_annotated` 兼容的完整数据集。
 
@@ -199,13 +199,13 @@ episode 文件先写临时文件，再在同一文件系统内原子重命名。
 目标命令为：
 
 ```bash
-qwen-annotate model download --repo Qwen/Qwen3.8-27B --local-dir /mnt/data/user/zhoukr/models/Qwen3.8-27B
-qwen-annotate inspect CONFIG.yaml
-qwen-annotate annotate CONFIG.yaml
-qwen-annotate status WORK_DIR
-qwen-annotate review WORK_DIR
-qwen-annotate convert WORK_DIR --output DATASET_ANNOTATED
-qwen-annotate validate DATASET_ANNOTATED
+Robo-annotate model download --repo Qwen/Qwen3.8-27B --local-dir /mnt/data/user/zhoukr/models/Qwen3.8-27B
+Robo-annotate inspect CONFIG.yaml
+Robo-annotate annotate CONFIG.yaml
+Robo-annotate status WORK_DIR
+Robo-annotate review WORK_DIR
+Robo-annotate convert WORK_DIR --output DATASET_ANNOTATED
+Robo-annotate validate DATASET_ANNOTATED
 ```
 
 `inspect` 在调用模型前验证 LeRobot 版本、episode metadata、视频数量、camera keys、FPS 和 frame count。`annotate` 可安全重复执行并恢复中断任务。`status` 汇总 pending、accepted、needs_review 和 failed。`review` 生成或打开静态复核页面。`convert` 生成发布数据。`validate` 独立验证生成结果。

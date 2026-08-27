@@ -7,7 +7,7 @@ import pytest
 
 import numpy as np
 
-from qwen_annotate.stats import iter_video_rgb_frames, recompute_stats, recompute_video_stats
+from robo_annotate.stats import iter_video_rgb_frames, recompute_stats, recompute_video_stats
 
 
 def test_recompute_stats_preserves_scalar_and_fixed_list_shapes(tmp_path: Path) -> None:

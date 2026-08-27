@@ -9,7 +9,7 @@ import pyarrow.parquet as pq
 import pytest
 from pydantic import ValidationError
 
-from qwen_annotate.lerobot import DatasetIndex, VideoProbe, inspect_dataset, probe_video
+from robo_annotate.lerobot import DatasetIndex, VideoProbe, inspect_dataset, probe_video
 from tests.fixtures import make_config, make_lerobot_fixture
 
 
