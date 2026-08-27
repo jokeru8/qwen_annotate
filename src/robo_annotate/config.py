@@ -52,6 +52,18 @@ class SamplingConfig(StrictModel):
     min_segment_frames: int = Field(default=8, ge=1)
 
 
+class AugmentationConfig(StrictModel):
+    enabled: bool = False
+    language: str = Field(default="English", min_length=1)
+
+    @field_validator("language")
+    @classmethod
+    def language_is_trimmed(cls, value: str) -> str:
+        if not value.strip() or value != value.strip():
+            raise ValueError("language must be a trimmed nonempty string")
+        return value
+
+
 class AnnotationConfig(StrictModel):
     source: Path
     work_dir: Path
@@ -62,9 +74,12 @@ class AnnotationConfig(StrictModel):
     subtasks: list[Subtask] = Field(min_length=1)
     model: ModelConfig = Field(default_factory=ModelConfig)
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)
+    augmentation: AugmentationConfig = Field(default_factory=AugmentationConfig)
 
     def stable_hash(self) -> str:
         payload = self.model_dump(mode="json", exclude={"model": {"api_key"}})
+        if not self.augmentation.enabled and self.augmentation.language == "English":
+            payload.pop("augmentation")
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

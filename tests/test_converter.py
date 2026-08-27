@@ -23,6 +23,7 @@ NOW = datetime(2026, 8, 22, 12, tzinfo=UTC)
 
 def _fixture(
     tmp_path: Path, *, mode: str = "complete", legacy_stats: bool = False,
+    augmentation: bool = False,
 ) -> tuple[Path, Path, dict]:
     source, work = tmp_path / "source", tmp_path / "work"
     (source / "meta").mkdir(parents=True)
@@ -87,6 +88,7 @@ def _fixture(
         "high_level_instruction": "Arrange.", "primary_camera": "cam.eye", "refine_cameras": ["cam.eye"],
         "subtasks": [{"skill": "pick", "text": "Pick."}, {"skill": "place", "text": "Place."}],
         "sampling": {"min_segment_frames": 2},
+        "augmentation": {"enabled": augmentation},
     })
     dataset = DatasetIndex(root=source.resolve(), version="v2.1", fps=10, camera_keys=["cam.eye"], episodes=episodes)
     store = WorkspaceStore(work, clock=lambda: NOW)
@@ -145,6 +147,169 @@ def test_full_conversion_preserves_payload_and_writes_reference_schema(tmp_path:
     ]
 
 
+def test_enabled_augmentation_rewrites_each_selected_episode_subtask(tmp_path: Path) -> None:
+    _, work, services = _fixture(tmp_path, augmentation=True)
+    calls = []
+
+    def augment(config, episodes):
+        calls.append((config, episodes))
+        return {
+            0: ["Lift the item.", "Set the item down."],
+            1: ["Raise the object.", "Put the object in place."],
+        }
+
+    services["augment_episodes"] = augment
+    output = tmp_path / "augmented"
+
+    convert_dataset(work, output, services=services)
+
+    task_info = json.loads((output / "meta/task_info/task_0.json").read_text())
+    assert [
+        [action["action_text"] for action in episode["label_info"]["action_config"]]
+        for episode in task_info
+    ] == [
+        ["Lift the item.", "Set the item down."],
+        ["Raise the object.", "Put the object in place."],
+    ]
+    annotations = json.loads((output / "meta/lerobot_annotations.json").read_text())
+    assert annotations["augmentation"] == {
+        "enabled": True,
+        "language": "English",
+        "model_repo": "Qwen/Qwen3.8-27B",
+        "model_revision": "a" * 40,
+        "prompt_version": "subtask-paraphrase-v1",
+    }
+    assert len(calls) == 1
+    requested = calls[0][1]
+    assert [item.episode_index for item in requested] == [0, 1]
+    assert [[subtask.text for subtask in item.subtasks] for item in requested] == [
+        ["Pick.", "Place."],
+        ["Pick.", "Place."],
+    ]
+
+
+def test_enabled_augmentation_uses_recorded_qwen_for_each_episode(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _, work, services = _fixture(tmp_path, augmentation=True)
+    requests = []
+    responses = iter([
+        {
+            "episode_index": 0,
+            "subtasks": [
+                {"subtask_index": 0, "text": "Lift the item."},
+                {"subtask_index": 1, "text": "Set the item down."},
+            ],
+        },
+        {
+            "episode_index": 1,
+            "subtasks": [
+                {"subtask_index": 0, "text": "Raise the object."},
+                {"subtask_index": 1, "text": "Put the object in place."},
+            ],
+        },
+    ])
+
+    class FakeQwenClient:
+        def __init__(self, **kwargs):
+            assert kwargs == {
+                "endpoint": "http://127.0.0.1:8000/v1",
+                "api_key": "local",
+                "model": "Qwen/Qwen3.8-27B",
+            }
+
+        async def complete(self, prompt, frames, response_type):
+            requests.append((prompt, frames))
+            return response_type.model_validate(next(responses))
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(
+        "robo_annotate.augmentation.QwenClient", FakeQwenClient, raising=False
+    )
+    output = tmp_path / "augmented"
+
+    convert_dataset(work, output, services=services)
+
+    task_info = json.loads((output / "meta/task_info/task_0.json").read_text())
+    assert [
+        [action["action_text"] for action in episode["label_info"]["action_config"]]
+        for episode in task_info
+    ] == [
+        ["Lift the item.", "Set the item down."],
+        ["Raise the object.", "Put the object in place."],
+    ]
+    assert len(requests) == 2
+    assert all(frames == [] for _, frames in requests)
+    assert all('"target_language":"English"' in prompt for prompt, _ in requests)
+
+
+def test_english_augmentation_rejects_non_english_text_without_output(
+    tmp_path: Path,
+) -> None:
+    _, work, services = _fixture(tmp_path, augmentation=True)
+    services["augment_episodes"] = lambda config, episodes: {
+        0: ["拿起物品。", "放下物品。"],
+        1: ["抬起物体。", "把物体放好。"],
+    }
+    output = tmp_path / "invalid-augmentation"
+
+    with pytest.raises(ValueError, match="augmentation"):
+        convert_dataset(work, output, services=services)
+
+    assert not output.exists()
+
+
+def test_source_change_during_augmentation_is_rejected(tmp_path: Path) -> None:
+    source, work, services = _fixture(tmp_path, augmentation=True)
+
+    def augment(config, episodes):
+        (source / "videos/chunk-000/cam.eye/episode_000000.mp4").write_bytes(b"video-1")
+        return {
+            0: ["Lift the item.", "Set the item down."],
+            1: ["Raise the object.", "Put the object in place."],
+        }
+
+    services["augment_episodes"] = augment
+    output = tmp_path / "changed-source"
+
+    with pytest.raises(ValueError, match="source dataset changed"):
+        convert_dataset(work, output, services=services)
+
+    assert not output.exists()
+
+
+def test_model_augmentation_rejects_mismatched_episode_identity(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _, work, services = _fixture(tmp_path, augmentation=True)
+
+    class FakeQwenClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def complete(self, prompt, frames, response_type):
+            return response_type.model_validate({
+                "episode_index": 99,
+                "subtasks": [
+                    {"subtask_index": 0, "text": "Lift the item."},
+                    {"subtask_index": 1, "text": "Set the item down."},
+                ],
+            })
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr("robo_annotate.augmentation.QwenClient", FakeQwenClient)
+    output = tmp_path / "mismatched-augmentation"
+
+    with pytest.raises(ValueError, match="indices"):
+        convert_dataset(work, output, services=services)
+
+    assert not output.exists()
+
+
 def test_full_conversion_preserves_legacy_stats_without_pixel_decode(tmp_path: Path) -> None:
     source, work, services = _fixture(tmp_path, legacy_stats=True)
     source_stats = (source / "meta/stats.json").read_bytes()
@@ -171,6 +336,66 @@ def test_dagger_serializes_explicit_start_including_singleton(tmp_path: Path) ->
     assert task_info[0]["label_info"]["action_config"][0]["action_text"] == "Pick."
     assert task_info[1]["label_info"]["action_config"] == [
         {"start_frame": 0, "end_frame": 20, "action_text": "Place.", "skill": "place"}
+    ]
+
+
+def test_dagger_augmentation_only_requests_each_episode_observed_suffix(
+    tmp_path: Path,
+) -> None:
+    _, work, services = _fixture(
+        tmp_path, mode="dagger_patch", augmentation=True
+    )
+
+    def augment(config, episodes):
+        assert [episode.start_subtask_index for episode in episodes] == [0, 1]
+        assert [[subtask.text for subtask in episode.subtasks] for episode in episodes] == [
+            ["Pick.", "Place."],
+            ["Place."],
+        ]
+        return {
+            0: ["Lift the item.", "Set the item down."],
+            1: ["Position the item."],
+        }
+
+    services["augment_episodes"] = augment
+    output = tmp_path / "dagger-augmented"
+
+    convert_dataset(work, output, services=services)
+
+    task_info = json.loads((output / "meta/task_info/task_0.json").read_text())
+    assert task_info[1]["label_info"]["action_config"] == [{
+        "start_frame": 0,
+        "end_frame": 20,
+        "action_text": "Position the item.",
+        "skill": "place",
+    }]
+
+
+def test_accepted_only_augmentation_excludes_unselected_episodes(tmp_path: Path) -> None:
+    _, work, services = _fixture(tmp_path, augmentation=True)
+    record_path = work / "episodes/episode_000000.json"
+    record = json.loads(record_path.read_text())
+    record.update({
+        "status": "needs_review",
+        "final_annotation": None,
+        "decision_source": None,
+        "review_reasons": ["manual_review"],
+    })
+    record_path.write_text(json.dumps(record))
+
+    def augment(config, episodes):
+        assert [episode.episode_index for episode in episodes] == [1]
+        return {1: ["Raise the object.", "Put the object in place."]}
+
+    services["augment_episodes"] = augment
+    output = tmp_path / "selected-augmented"
+
+    convert_dataset(work, output, accepted_only=True, services=services)
+
+    task_info = json.loads((output / "meta/task_info/task_0.json").read_text())
+    assert [action["action_text"] for action in task_info[0]["label_info"]["action_config"]] == [
+        "Raise the object.",
+        "Put the object in place.",
     ]
 
 

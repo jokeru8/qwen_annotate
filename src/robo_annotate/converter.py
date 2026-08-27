@@ -21,6 +21,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .augmentation import (
+    AUGMENTATION_PROMPT_VERSION,
+    EpisodeSubtasks,
+    augment_episodes,
+    valid_augmented_text,
+)
 from .config import AnnotationConfig
 from .constraints import validate_annotation
 from .lerobot import DatasetIndex, inspect_dataset
@@ -126,8 +132,11 @@ def convert_dataset(
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         _reject_existing(out)
-        manifest, dataset, records = _guard_workspace(store, manifest, services, accepted_only)
+        manifest, dataset, records, config = _guard_workspace(
+            store, manifest, services, accepted_only
+        )
         source_before = _tree_digest(source)
+        augmented_texts = _augment_selected(config, manifest, records, services)
         staging = out.parent / f"{out.name}.staging-{secrets.token_hex(16)}"
         os.mkdir(staging, 0o700)
         _copy_tree(source, staging, include_payload=not accepted_only)
@@ -135,11 +144,14 @@ def convert_dataset(
         if accepted_only:
             frame_count = _rewrite_accepted_subset(
                 staging, source, out, manifest, dataset, records, converted_at, services,
+                augmented_texts,
             )
         else:
             frame_count = manifest.total_frames
             _write_payload_sizes(staging)
-            _write_public_metadata(staging, out, manifest, records, converted_at)
+            _write_public_metadata(
+                staging, out, manifest, records, converted_at, augmented_texts
+            )
         validation = validate_release(
             staging,
             source=None if accepted_only else source,
@@ -238,15 +250,70 @@ def _guard_workspace(
         records.append(record)
     if not records:
         raise ValueError("accepted-only conversion requires at least one accepted episode")
-    return manifest, dataset, records
+    return manifest, dataset, records, config
 
 
-def _write_public_metadata(staging: Path, output: Path, manifest: RunManifest, records: list, converted_at: datetime) -> None:
+def _augment_selected(
+    config: AnnotationConfig,
+    manifest: RunManifest,
+    records: list[EpisodeRecord],
+    services: Any,
+) -> dict[int, list[str]] | None:
+    if not config.augmentation.enabled:
+        return None
+    augment = _service(services, "augment_episodes", augment_episodes)
+    if not callable(augment):
+        raise TypeError("augmentation service must be callable")
+    requests = []
+    for record in records:
+        annotation = record.final_annotation
+        count = len(annotation.boundaries) + 1
+        subtasks = manifest.subtasks[
+            annotation.start_subtask_index:annotation.start_subtask_index + count
+        ]
+        requests.append(EpisodeSubtasks(
+            episode_index=record.episode_index,
+            start_subtask_index=annotation.start_subtask_index,
+            subtasks=list(subtasks),
+        ))
+    result = augment(config, requests)
+    if not isinstance(result, dict) or set(result) != {
+        request.episode_index for request in requests
+    }:
+        raise ValueError("augmentation result must exactly cover selected episodes")
+    validated = {}
+    for request in requests:
+        texts = result[request.episode_index]
+        if (
+            not isinstance(texts, list)
+            or len(texts) != len(request.subtasks)
+            or any(
+                not valid_augmented_text(
+                    text, subtask.text, config.augmentation.language
+                )
+                for text, subtask in zip(texts, request.subtasks, strict=True)
+            )
+        ):
+            raise ValueError("augmentation result does not match the requested subtasks")
+        validated[request.episode_index] = list(texts)
+    return validated
+
+
+def _write_public_metadata(
+    staging: Path,
+    output: Path,
+    manifest: RunManifest,
+    records: list,
+    converted_at: datetime,
+    augmented_texts: dict[int, list[str]] | None,
+) -> None:
     selected = [
         (record, record.episode_index, manifest.episode_lengths[record.episode_index])
         for record in records
     ]
-    _write_selection_metadata(staging, output, manifest, selected, converted_at)
+    _write_selection_metadata(
+        staging, output, manifest, selected, converted_at, augmented_texts
+    )
 
 
 def _write_selection_metadata(
@@ -255,6 +322,7 @@ def _write_selection_metadata(
     manifest: RunManifest,
     selected: list[tuple[EpisodeRecord, int, int]],
     converted_at: datetime,
+    augmented_texts: dict[int, list[str]] | None,
 ) -> None:
     info_path = staging / "meta/info.json"
     info = _read_source_json(info_path)
@@ -281,14 +349,20 @@ def _write_selection_metadata(
         selected_subtasks = manifest.subtasks[
             annotation.start_subtask_index:annotation.start_subtask_index + len(starts)
         ]
+        action_texts = (
+            [subtask.text for subtask in selected_subtasks]
+            if augmented_texts is None else augmented_texts[record.episode_index]
+        )
         actions = [
             {
                 "start_frame": start,
                 "end_frame": end,
-                "action_text": subtask.text,
+                "action_text": action_text,
                 "skill": subtask.skill,
             }
-            for start, end, subtask in zip(starts, ends, selected_subtasks, strict=True)
+            for start, end, subtask, action_text in zip(
+                starts, ends, selected_subtasks, action_texts, strict=True
+            )
         ]
         task_info.append({
             "episode_id": output_index,
@@ -304,6 +378,14 @@ def _write_selection_metadata(
         "primary_camera": manifest.effective_config["primary_camera"],
         "updated_at": converted_at.isoformat(),
     }
+    if augmented_texts is not None:
+        annotations["augmentation"] = {
+            "enabled": True,
+            "language": manifest.effective_config["augmentation"]["language"],
+            "model_repo": manifest.model_repo,
+            "model_revision": manifest.model_revision,
+            "prompt_version": AUGMENTATION_PROMPT_VERSION,
+        }
     _atomic_json(staging / "meta/lerobot_annotations.json", annotations, sort_keys=False)
     task_dir = staging / "meta/task_info"
     task_dir.mkdir(exist_ok=True)
@@ -319,6 +401,7 @@ def _rewrite_accepted_subset(
     records: list[EpisodeRecord],
     converted_at: datetime,
     services: Any,
+    augmented_texts: dict[int, list[str]] | None,
 ) -> int:
     info_path = staging / "meta/info.json"
     info = _read_source_json(info_path)
@@ -395,7 +478,9 @@ def _rewrite_accepted_subset(
         (record, remap.output_index, remap.length)
         for record, remap in zip(selected_records, remaps, strict=True)
     ]
-    _write_selection_metadata(staging, output, manifest, selected, converted_at)
+    _write_selection_metadata(
+        staging, output, manifest, selected, converted_at, augmented_texts
+    )
     return offset
 
 

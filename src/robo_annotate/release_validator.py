@@ -17,6 +17,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .augmentation import valid_augmented_text
 from .config import Subtask
 from .constraints import validate_annotation
 from .lerobot import VideoProbe, probe_video, video_fps_matches
@@ -212,8 +213,21 @@ def validate_release(
         raise ValueError("missing or extra episode payload files")
     annotations = _read_object(root / "meta/lerobot_annotations.json")
     top_fields = {"source_root", "work_dir", "subtask_template", "episodes", "primary_camera", "updated_at"}
-    if set(annotations) != top_fields:
+    if set(annotations) not in (top_fields, top_fields | {"augmentation"}):
         raise ValueError("annotation top-level schema mismatch")
+    augmentation_language = None
+    if "augmentation" in annotations:
+        augmentation = annotations["augmentation"]
+        expected_fields = {
+            "enabled", "language", "model_repo", "model_revision", "prompt_version"
+        }
+        if not isinstance(augmentation, dict) or set(augmentation) != expected_fields:
+            raise ValueError("annotation augmentation schema mismatch")
+        if augmentation["enabled"] is not True:
+            raise ValueError("annotation augmentation must be enabled")
+        for field in expected_fields - {"enabled"}:
+            _string(augmentation, field)
+        augmentation_language = augmentation["language"]
     _aware_utc(annotations["updated_at"], "updated_at")
     for field in ("source_root", "work_dir"):
         _string(annotations, field)
@@ -292,7 +306,10 @@ def validate_release(
                 raise ValueError("boundary preview labels do not match requested source frames")
             first_preview = BoundaryPreview(episode_index=index, camera_key=primary, frame_indices=(boundary - 1, boundary))
 
-    _validate_task_info(root, total_episodes, instructions, lengths, template, annotation_facts)
+    _validate_task_info(
+        root, total_episodes, instructions, lengths, template, annotation_facts,
+        augmentation_language,
+    )
 
     digests = {relative: _sha256(root / relative) for relative in sorted(expected_payload)}
     if source_root is not None:
@@ -414,6 +431,7 @@ def _validate_task_info(
     lengths: list[int],
     template: list[Subtask],
     annotations: list[tuple[int, list[int]]],
+    augmentation_language: str | None,
 ) -> None:
     directory = root / "meta/task_info"
     if directory.is_symlink() or not directory.is_dir():
@@ -444,9 +462,15 @@ def _validate_task_info(
         for action, start, end, subtask in zip(actions, expected_starts, expected_ends, expected_subtasks, strict=True):
             if not isinstance(action, dict) or set(action) != {"start_frame", "end_frame", "action_text", "skill"}:
                 raise ValueError("task_info action schema mismatch")
+            action_text = _string(action, "action_text")
+            text_is_valid = (
+                valid_augmented_text(action_text, subtask.text, augmentation_language)
+                if augmentation_language is not None
+                else action_text == subtask.text
+            )
             if (_integer(action, "start_frame", minimum=0) != start or
                     _integer(action, "end_frame", minimum=1) != end or end <= start or
-                    _string(action, "action_text") != subtask.text or
+                    not text_is_valid or
                     _string(action, "skill") != subtask.skill):
                 raise ValueError("task_info action differs from annotation/template")
 

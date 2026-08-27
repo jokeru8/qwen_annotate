@@ -683,6 +683,7 @@ def test_initialize_layout_manifest_redaction_roundtrip_and_exact_records(tmp_pa
     assert manifest.dataset_root == index.root.resolve()
     assert manifest.dataset_version == "v2.1" and manifest.total_episodes == 2 and manifest.total_frames == 22
     assert manifest.prompt_version == PROMPT_VERSION and manifest.model_revision == SHA
+    assert "augmentation" not in manifest.effective_config
     for episode in index.episodes:
         record = store.load_episode(episode.episode_index)
         assert record.status == "pending" and record.run_fingerprint == manifest.run_fingerprint

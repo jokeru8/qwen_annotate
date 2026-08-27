@@ -1,3 +1,5 @@
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -6,11 +8,74 @@ from pydantic import BaseModel, ValidationError
 
 from robo_annotate.config import (
     AnnotationConfig,
+    AugmentationConfig,
     ModelConfig,
     SamplingConfig,
     Subtask,
     load_config,
 )
+
+
+def test_augmentation_defaults_to_disabled_english() -> None:
+    payload = {
+        "source": "/data/source",
+        "work_dir": "/data/work",
+        "mode": "complete",
+        "high_level_instruction": "Arrange the items.",
+        "primary_camera": "camera",
+        "refine_cameras": ["camera"],
+        "subtasks": [{"skill": "pick", "text": "Pick up the item."}],
+    }
+
+    default = AnnotationConfig.model_validate(payload)
+
+    assert default.model_dump()["augmentation"] == {
+        "enabled": False,
+        "language": "English",
+    }
+
+
+def test_enabling_augmentation_is_a_material_run_change() -> None:
+    payload = {
+        "source": "/data/source",
+        "work_dir": "/data/work",
+        "mode": "complete",
+        "high_level_instruction": "Arrange the items.",
+        "primary_camera": "camera",
+        "refine_cameras": ["camera"],
+        "subtasks": [{"skill": "pick", "text": "Pick up the item."}],
+    }
+
+    disabled = AnnotationConfig.model_validate(payload)
+    enabled = AnnotationConfig.model_validate(
+        payload | {"augmentation": {"enabled": True}}
+    )
+
+    assert enabled.augmentation == AugmentationConfig(enabled=True, language="English")
+    assert disabled.stable_hash() != enabled.stable_hash()
+
+
+def test_disabled_augmentation_preserves_pre_feature_config_hash() -> None:
+    config = AnnotationConfig.model_validate({
+        "source": "/data/source",
+        "work_dir": "/data/work",
+        "mode": "complete",
+        "high_level_instruction": "Arrange the items.",
+        "primary_camera": "camera",
+        "refine_cameras": ["camera"],
+        "subtasks": [{"skill": "pick", "text": "Pick up the item."}],
+    })
+    legacy_payload = config.model_dump(mode="json", exclude={"model": {"api_key"}})
+    legacy_payload.pop("augmentation")
+    canonical = json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"))
+
+    assert config.stable_hash() == hashlib.sha256(canonical.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("language", [" ", " English "])
+def test_augmentation_language_rejects_blank_or_padded_values(language: str) -> None:
+    with pytest.raises(ValidationError, match="language"):
+        AugmentationConfig(language=language)
 
 
 def test_load_config_valid_yaml_and_stable_hash(tmp_path: Path) -> None:
@@ -73,6 +138,7 @@ def test_annotation_config_rejects_unknown_keys() -> None:
     ("model_type", "payload"),
     [
         (Subtask, {"skill": "pick", "text": "Pick", "unexpected": True}),
+        (AugmentationConfig, {"unexpected": True}),
         (ModelConfig, {"unexpected": True}),
         (SamplingConfig, {"unexpected": True}),
     ],

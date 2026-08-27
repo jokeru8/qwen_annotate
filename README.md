@@ -186,9 +186,15 @@ sampling:
   dense_radius_seconds: 0.5
   agreement_tolerance_frames: 12
   min_segment_frames: 8
+
+augmentation:
+  enabled: true
+  language: English
 ```
 
 配置使用严格 schema，未知字段会直接报错。任何影响行为的配置、prompt、模型 revision 或源数据变化都会改变运行指纹，旧 workspace 不会被静默复用。
+
+`augmentation.enabled` 默认是 `false`，`augmentation.language` 默认是 `English`。开启后，`convert` 会使用配置中同一个 Qwen endpoint，为最终进入输出数据集的每个 accepted episode 单独改写其实际包含的每个 subtask。增广只替换 `meta/task_info/task_0.json` 中的 `action_text`；边界、`skill`、subtask 索引和全局 `subtask_template` 保持不变。DAgger episode 只增广它实际覆盖的 subtask 后缀。任一模型调用或结果校验失败时，整个转换失败且不会发布半成品。
 
 仓库也提供两个可直接修改的样例：
 

@@ -746,6 +746,8 @@ class WorkspaceStore:
         created_at: datetime,
     ) -> RunManifest:
         effective = config.model_dump(mode="json", exclude={"model": {"api_key"}})
+        if not config.augmentation.enabled and config.augmentation.language == "English":
+            effective.pop("augmentation")
         effective["model"]["endpoint"] = _redacted_endpoint(str(config.model.endpoint))
         return RunManifest(
             dataset_root=dataset.root.resolve(),
