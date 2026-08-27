@@ -1,149 +1,354 @@
-# Qwen LeRobot Annotate
+<div align="center">
 
-用官方 `Qwen/Qwen3.8-27B` 为 LeRobot v2.1 数据集批量生成 subtask 边界标注。模型只能从 YAML 中给出的有序 subtask 列表选择；系统先做完整 episode 的 coarse 判断，再围绕候选边界做多相机 refine。不能通过硬约束或两次判断不一致的 episode 会进入 `needs_review`，不会被完整发布流程静默接受。
+# Qwen × LeRobot 自动标注
 
-项目支持两类数据：
+**用 Qwen3.8 把机器人长视频切分成可审计、可复核、可发布的子任务标注。**
 
-- `complete`：从 subtask 0 开始，依序完成全部 N 项，必须得到 N−1 个边界。
-- `dagger_patch`：可从任意 subtask `k` 开始；合法结果是仅包含 `[k]` 并提前结束，或完整执行后缀 `[k, ..., N−1]`。
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![LeRobot v2.1](https://img.shields.io/badge/LeRobot-v2.1-7C3AED)](https://github.com/huggingface/lerobot)
+[![Qwen3.8 27B](https://img.shields.io/badge/Qwen3.8-27B-615CED)](https://huggingface.co/Qwen)
+[![测试框架](https://img.shields.io/badge/测试-pytest-0A9EDC?logo=pytest&logoColor=white)](#开发与测试)
 
-边界采用左闭右开语义：`boundaries: [180]` 表示下一 subtask 从原视频 frame 180 开始。
+[快速开始](#快速开始) · [界面预览](#可视化复核) · [标注效果](#标注效果) · [完整操作手册](docs/operations.md)
+
+<img src="docs/assets/review-console.webp" alt="Qwen LeRobot 多相机自动标注复核台" width="100%">
+
+</div>
+
+---
+
+Qwen × LeRobot 自动标注是一个面向 **LeRobot v2.1** 数据集的批量视频标注工具。你只需要提供高层任务、按顺序排列的子任务模板和相机名称，系统就会调用本地 Qwen3.8-27B 服务完成整段理解、边界精修、约束检查和结果持久化。
+
+它不是“模型给出一个答案就直接写回数据集”的一次性脚本。每个自动结果都有采样来源、模型版本、配置指纹和状态记录；低置信度、结果冲突或违反硬约束的 episode 会进入人工复核，而不会被静默发布。
+
+## 核心能力
+
+| 能力 | 说明 |
+| --- | --- |
+| 两阶段自动标注 | 先对完整 episode 做稀疏粗定位，再围绕候选边界进行高密度精修 |
+| 多相机联合判断 | 使用主视角理解全局任务，并结合眼部、左右腕部等相机定位动作切换 |
+| 模板约束输出 | 模型只能从 YAML 中给出的有序子任务选择，不能临时发明标签 |
+| 自动拦截异常 | 两次粗标不一致、相机证据冲突或边界非法时自动进入 `needs_review` |
+| 可视化人工复核 | 多路视频同步播放、逐帧移动、拖拽边界、人工接管和审计记录 |
+| 可恢复批处理 | episode 级原子状态持久化，重复运行可从 `coarse_done` / `refine_done` 继续 |
+| 安全发布 | 标注阶段只读源数据；转换写入新目录，并在发布前执行独立一致性校验 |
+| 离线质量评测 | 支持 golden set 的边界误差、覆盖率、约束阻断率和错误接受检查 |
+
+## 工作流程
+
+```mermaid
+flowchart LR
+    A["检查数据集<br/>inspect"] --> B["整集粗标<br/>coarse"]
+    B --> C["多相机精修<br/>refine"]
+    C --> D{"硬约束与<br/>一致性检查"}
+    D -->|通过| E["自动接受<br/>accepted"]
+    D -->|冲突或不确定| F["人工复核<br/>review"]
+    F --> E
+    E --> G["转换数据集<br/>convert"]
+    G --> H["独立校验<br/>validate"]
+    H --> I["Golden 评测<br/>evaluate"]
+```
+
+### 两阶段推理
+
+1. **整集粗标**：在主相机上生成两组覆盖完整时间范围的稀疏采样，独立判断起始子任务、已观察到的子任务序列和候选边界。
+2. **边界精修**：围绕每个候选点，先对多路相机做 broad window 判断，再在小范围内逐帧 dense 判断。
+3. **确定性校验**：检查子任务顺序、边界数量、严格递增、有效范围和最短片段长度。
+4. **状态分流**：证据一致且满足约束的结果进入 `accepted`；其余结果进入 `needs_review` 或 `failed`。
+
+## 标注效果
+
+<img src="docs/assets/annotation-result.webp" alt="真实机器人 episode 的子任务切分和边界标注效果" width="100%">
+
+以图中的真实 episode 为例，模型把 846 帧视频切分为 4 个连续子任务，并输出 3 个左闭右开的边界：
+
+```json
+{
+  "episode_index": 0,
+  "start_subtask_index": 0,
+  "boundaries": [220, 416, 627],
+  "status": "accepted"
+}
+```
+
+`boundaries: [220]` 表示：
+
+```text
+前一个子任务：[0, 220)
+后一个子任务：[220, ...)
+                      ↑ frame 220 属于后一个子任务
+```
+
+> 图中使用真实机器人数据与真实 workspace 结果展示标注形式。单个示例不代表完整精度评测；正式发布前请使用自己的 golden set 执行 `evaluate`。
+
+## 可视化复核
+
+启动本地复核台：
+
+```bash
+uv run qwen-annotate review ./runs/drink-arrangement --serve
+```
+
+浏览器访问 `http://127.0.0.1:8765` 后，可以：
+
+- 按状态筛选和切换 episode；
+- 同步播放全部相机，逐帧或每次 10 帧移动；
+- 在彩色时间线上查看当前子任务和边界；
+- 拖拽、添加或删除边界，并实时执行硬约束校验；
+- 查看自动标注依据，对 `pending`、`failed` 或已接受结果进行显式人工接管；
+- 将人工决定原子写回 workspace，同时保留来源指纹和审计信息。
+
+默认只监听 `127.0.0.1`。如果需要监听其他地址，请先评估访问控制与数据安全风险。
 
 ## 快速开始
 
-```bash
-cd /mnt/data/user/zhoukr/qwen_annotate
-python3 -m venv --copies /mnt/data/user/zhoukr/envs/qwen-annotate
-UV_PROJECT_ENVIRONMENT=/mnt/data/user/zhoukr/envs/qwen-annotate uv sync --extra dev
+### 1. 准备环境
 
-UV_PROJECT_ENVIRONMENT=/mnt/data/user/zhoukr/envs/qwen-annotate uv run qwen-annotate inspect examples/complete.yaml
-UV_PROJECT_ENVIRONMENT=/mnt/data/user/zhoukr/envs/qwen-annotate uv run qwen-annotate annotate examples/complete.yaml --max-concurrency 1
-UV_PROJECT_ENVIRONMENT=/mnt/data/user/zhoukr/envs/qwen-annotate uv run qwen-annotate status /mnt/data/user/zhoukr/annotations/arrange_orange_juice_and_green_tea_2
+运行要求：
+
+- Python `3.12`
+- [uv](https://docs.astral.sh/uv/)
+- Node.js（仅运行复核前端单元测试时需要）
+- 可读取的 LeRobot `v2.1` 数据集
+- 能提供 OpenAI-compatible 接口的 Qwen3.8-27B 推理服务
+- 下载模型时需要可用的 `hf` 命令行工具
+
+```bash
+uv sync --extra dev
+NODE_OPTIONS=--experimental-default-type=module uv run pytest -q
 ```
 
-模型的固定目标是：
+### 2. 下载并固定模型版本
 
-- 仓库：`Qwen/Qwen3.8-27B`
-- 路径：`/mnt/data/user/zhoukr/models/Qwen3.8-27B`
-- vLLM served name：`Qwen/Qwen3.8-27B`
+```bash
+export QWEN_MODEL_DIR=/path/to/models/Qwen3.8-27B
 
-配置样例见 [examples/complete.yaml](examples/complete.yaml) 与 [examples/dagger_patch.yaml](examples/dagger_patch.yaml)。完整下载、服务启动、人工复核、转换、验证、评测、扩容和故障恢复步骤见 [docs/operations.md](docs/operations.md)。
+uv run qwen-annotate model download \
+  --repo Qwen/Qwen3.8-27B \
+  --local-dir "$QWEN_MODEL_DIR" \
+  --max-workers 8
+```
 
-## 主流程
+命令会把远端 revision 解析成不可变 commit SHA，校验仓库文件，并在模型目录中写入 `model-install.json`。未通过完整性验证的目录不会被当作可信安装。
+
+### 3. 启动 vLLM
+
+下面是项目当前使用的单 GPU 起步配置。不同硬件、模型量化方式和并发数需要重新验证显存与吞吐。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve "$QWEN_MODEL_DIR" \
+  --served-model-name Qwen/Qwen3.8-27B \
+  --tensor-parallel-size 1 \
+  --max-model-len 131072 \
+  --max-num-seqs 8 \
+  --trust-remote-code \
+  --port 8000
+```
+
+### 4. 创建配置
+
+```yaml
+source: ./data/lerobot-source
+work_dir: ./runs/drink-arrangement
+mode: complete
+
+high_level_instruction: 将橙汁和绿茶整齐摆放
+primary_camera: observation.images.right_eye
+refine_cameras:
+  - observation.images.right_eye
+  - observation.images.left_wrist
+  - observation.images.right_wrist
+
+subtasks:
+  - skill: pick
+    text: 用右手拿起绿茶
+  - skill: handover
+    text: 用左手接过右手中的绿茶
+  - skill: place
+    text: 用右手拿起橙汁并放到正确位置
+  - skill: place
+    text: 用右手接过绿茶并放到正确位置
+
+model:
+  name: Qwen/Qwen3.8-27B
+  local_path: /path/to/models/Qwen3.8-27B
+  endpoint: http://127.0.0.1:8000/v1
+  api_key: local
+
+sampling:
+  coarse_fps: 1.0
+  coarse_max_frames: 64
+  refine_window_seconds: 2.5
+  refine_fps: 8.0
+  dense_radius_seconds: 0.5
+  agreement_tolerance_frames: 12
+  min_segment_frames: 8
+```
+
+配置使用严格 schema，未知字段会直接报错。任何影响行为的配置、prompt、模型 revision 或源数据变化都会改变运行指纹，旧 workspace 不会被静默复用。
+
+仓库也提供两个可直接修改的样例：
+
+- [完整任务配置](examples/complete.yaml)
+- [DAgger 补丁配置](examples/dagger_patch.yaml)
+
+### 5. 运行完整流程
+
+```bash
+# 推理前只读检查
+uv run qwen-annotate inspect config.yaml
+
+# 先用单个 episode 做 smoke test
+uv run qwen-annotate annotate config.yaml \
+  --episodes 0 \
+  --max-concurrency 1
+
+# 确认无误后再批量运行
+uv run qwen-annotate annotate config.yaml --max-concurrency 2
+
+# 查看状态与人工复核
+uv run qwen-annotate status ./runs/drink-arrangement
+uv run qwen-annotate review ./runs/drink-arrangement --serve
+
+# 创建新的已标注数据集并做独立校验
+uv run qwen-annotate convert ./runs/drink-arrangement \
+  --output ./data/lerobot-annotated
+uv run qwen-annotate validate ./data/lerobot-annotated \
+  --source ./data/lerobot-source
+```
+
+完整转换要求所有 episode 都为 `accepted`。如果只想发布已接受子集，需要显式使用 `--accepted-only`；系统会连续重编号 episode、frame 和全局 index，并重新计算统计量。
+
+## 两种数据模式
+
+| 模式 | 适用场景 | 合法结果 |
+| --- | --- | --- |
+| `complete` | 从头到尾完成标准任务的完整轨迹 | 必须从子任务 0 开始，按顺序完成全部 N 项，并产生 N−1 个边界 |
+| `dagger_patch` | 从任务中途开始或提前结束的修正轨迹 | 可以从任意子任务 k 开始；结果只能是单项 `[k]`，或完整后缀 `[k, ..., N−1]` |
+
+这两种模式共用同一套 YAML 子任务模板。对于 DAgger 数据，不需要预先填写起始子任务，coarse 阶段会从视觉证据中判断。
+
+## Workspace 与输出
+
+标注阶段不会复制或修改源 parquet / video。中间结果保存在独立 workspace：
 
 ```text
-inspect → annotate (coarse → refine) → status/review → convert → validate → evaluate
+runs/drink-arrangement/
+├── manifest.json          # 数据、配置、模型与 prompt 来源
+├── summary.json           # 可恢复的状态摘要
+├── episodes/
+│   └── episode_000000.json
+├── logs/
+│   └── run.jsonl          # 状态转换审计链
+└── previews/              # 离线复核页面
 ```
 
-标注阶段只读 source，不复制或修改源 parquet/video。workspace 保存每个 episode 的原子状态、模型 revision、prompt/config/source 指纹和审计日志；`convert` 才创建发布数据集。输出目录已存在时拒绝覆盖。
+`episodes/*.json` 是权威状态。重复执行相同标注命令时，系统会跳过终态 episode，并从已保存阶段继续；如果 source、配置、prompt 或模型来源不一致，则拒绝继续运行。
 
-常用命令：
+`convert` 会创建一个新的 LeRobot 数据集，并写入公开标注：
+
+```text
+lerobot-annotated/
+├── data/
+├── videos/
+└── meta/
+    ├── lerobot_annotations.json
+    ├── task_info/
+    ├── info.json
+    ├── stats.json
+    └── episodes_stats.jsonl
+```
+
+输出目录已存在时，转换会拒绝覆盖。
+
+## 可靠性设计
+
+- **源数据只读**：`inspect`、`annotate`、`review` 和 `evaluate` 不修改 source。
+- **失败即关闭**：来源指纹、模型 revision、prompt 或配置不匹配时停止复用旧状态。
+- **结构化响应**：coarse / refine 都使用严格 JSON schema，格式修复也受有限重试约束。
+- **确定性约束**：子任务顺序、边界数量、取值范围和最短片段长度由代码独立验证。
+- **敏感信息隔离**：API key、模型内部响应和 confidence 不写入发布数据集。
+- **安全发布**：转换使用新目录、原子写入和发布后独立校验，不覆盖已有输出。
+- **可追溯**：episode 保存采样帧、相机、prompt 版本、模型 SHA 和状态转换记录。
+
+## 质量评测
+
+准备人工标注的完整任务数据集作为 golden set 后运行：
 
 ```bash
-uv run qwen-annotate annotate CONFIG.yaml --episodes 0,3,8 --max-concurrency 2
-uv run qwen-annotate status WORK_DIR --json
-# 本地多相机可视化复核（默认仅监听本机）
-uv run qwen-annotate review WORK_DIR --serve
-uv run qwen-annotate review WORK_DIR
-uv run qwen-annotate review WORK_DIR --apply decision_episode_000003.json
-uv run qwen-annotate convert WORK_DIR --output DATASET_ANNOTATED
-uv run qwen-annotate validate DATASET_ANNOTATED --source SOURCE_DATASET
+uv run qwen-annotate evaluate ./runs/drink-arrangement \
+  --golden ./data/lerobot-golden \
+  --output ./evaluation-report.json
 ```
 
-默认完整转换要求所有 episode 都为 `accepted`。需要只发布已接受子集时，显式使用 `--accepted-only`；该模式会连续重编号 episode/frame/global index 并重新计算统计量。
+评测会报告：
 
-## 开发验证
+- 边界绝对误差的中位数和 P90（帧 / 秒）；
+- 起始子任务准确率；
+- 自动接受覆盖率、需复核率和失败率；
+- 硬约束违规是否被成功拦截；
+- 明显错误是否被错误接受；
+- 内置 launch gates 的逐项结果。
 
-```bash
-uv run pytest -q
-uv run qwen-annotate inspect examples/complete.yaml
-```
+当前仓库中的真实运行记录用于开发验证和界面展示，**47 episode golden benchmark 尚未完成**。请不要把部分运行、mock 测试或旧 prompt 的结果描述为完整 launch gate 成功。详细实测记录见 [操作手册](docs/operations.md)。
 
-CLI 错误信息会隐藏底层服务响应和 traceback；详细阶段结果在 workspace 的 `episodes/`、`summary.json` 和 `logs/run.jsonl` 中。
+## 命令速查
 
-## Agent 接手指南
+| 命令 | 用途 |
+| --- | --- |
+| `qwen-annotate inspect CONFIG` | 推理前只读检查 LeRobot 数据集 |
+| `qwen-annotate annotate CONFIG` | 执行 coarse + refine 批量标注 |
+| `qwen-annotate status WORK_DIR` | 查看 workspace 状态 |
+| `qwen-annotate review WORK_DIR --serve` | 启动多相机可视化复核台 |
+| `qwen-annotate review WORK_DIR` | 生成离线静态复核页面 |
+| `qwen-annotate convert WORK_DIR --output PATH` | 创建新的已标注数据集 |
+| `qwen-annotate validate PATH --source SOURCE` | 独立验证发布结果 |
+| `qwen-annotate evaluate WORK_DIR --golden PATH --output FILE` | 运行 golden set 评测 |
+| `qwen-annotate model download` | 下载并固定模型 revision |
 
-后续 agent 应先阅读本节，再按任务需要阅读 [docs/operations.md](docs/operations.md)、相关代码和测试。不要仅凭历史设计计划推断当前实现；代码、测试以及操作手册中的已实测记录优先。
-
-### 当前状态
-
-截至 2026-08-23：
-
-- 当前 prompt 版本是 `coarse-v6/refine-v2`，定义在 `src/qwen_annotate/prompts.py`。
-- 已验证模型 revision 为 `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`，探索性运行使用 vLLM `0.27.1`。
-- refine-v1 在 episode 0--4 上只是失败基线；它促成了 refine-v2，不能代表当前版本效果。
-- refine-v2 的 47 episode golden benchmark 尚未完成，不能声称 launch gates 已通过。
-- 受控 8 episode 并发基准尚未完成。探索性运行中并发 2 可以推进，并发 4 出现过 120 秒超时和 deferred 请求；新配置仍应从单 episode、并发 1 开始验证。
-
-新实测结果应更新到 `docs/operations.md`，并明确区分实测、推断和未执行事项。
-
-### 代码地图
+## 项目结构
 
 ```text
 src/qwen_annotate/
-  cli.py                Typer CLI、参数和退出行为
-  config.py             严格 YAML schema 与稳定配置 hash
-  models.py             推理、状态和审计领域模型
-  constraints.py        complete/DAgger 硬约束
-  lerobot.py            LeRobot v2.1 索引和只读数据检查
-  video.py              精确抽帧和视觉样本编码
-  prompts.py            版本化 coarse/refine prompt 与 JSON schema
-  qwen_client.py         OpenAI-compatible 异步客户端、重试和脱敏
-  coarse.py              整集稀疏判断与两次一致性检查
-  refine.py              broad/dense 多相机边界精修
-  pipeline.py            episode/批处理编排与状态流转
-  workspace.py           指纹、原子持久化、恢复与审计
-  review.py              静态复核、严格人工 decision 与审计写入
-  review_server.py       本地可视化复核 API、视频 Range 响应
-  review_web/            多相机同步播放和人工标注前端
-  converter.py           完整/accepted-only 数据集转换
-  stats.py               parquet 和视频统计量重算
-  release_validator.py   独立发布一致性验证
-  evaluation.py          golden/DAgger 指标与 launch gates
-  model_manager.py       固定 revision 下载和完整性验证
-  templates/, static/    离线复核页面资源
+├── pipeline.py          # episode 与批处理编排
+├── coarse.py            # 整集稀疏粗标
+├── refine.py            # 多相机边界精修
+├── constraints.py       # complete / DAgger 硬约束
+├── review_server.py     # 本地可视化复核 API
+├── review_web/          # 多相机复核前端
+├── converter.py         # 完整 / accepted-only 数据集转换
+├── release_validator.py # 发布一致性校验
+├── evaluation.py        # golden / DAgger 评测
+└── workspace.py         # 指纹、恢复与审计
 ```
 
-`tests/test_*.py` 基本与模块一一对应，跨模块主流程见 `tests/test_end_to_end.py`。定位行为时先用 `rg` 查找对应实现和测试。
-
-### Workspace 与兼容性
-
-- `episodes/*.json` 是权威状态，`summary.json` 可恢复，`logs/run.jsonl` 是派生审计链。
-- `accepted`、`needs_review` 和 `failed` 是自动流程的终态；重复 annotate 会跳过它们。可视化复核允许显式人工接管 `pending`/`failed`，也允许显式修正 `accepted`，并保留审计。
-- source、work_dir、模式、subtask、模型 endpoint/revision、sampling 或 prompt 变化都会影响 provenance；不同配置不得复用同一 workspace。
-- prompt、配置、模型 revision 或 source 指纹不匹配时必须 fail closed。
-- 旧 schema workspace 只用于审计。重跑时创建新的空 `work_dir`，不要编辑旧 episode JSON、删除 manifest 或伪造指纹继续运行。
-
-### 修改约束
-
-- `inspect`、`annotate`、`review` 和 `evaluate` 不得修改 source 数据集。
-- `convert` 只能写新的输出目录，已有输出必须拒绝覆盖。
-- 不要删除、重写或手工“修复”用户已有 workspace、模型目录和数据集。
-- 模型响应、confidence、内部 prompt 和 decision source 不得写入发布数据集。
-- CLI 面向用户的错误必须脱敏，不能直接输出底层服务响应或 traceback。
-- 修改 prompt schema 或语义时必须递增 `PROMPT_VERSION`，更新测试和操作手册，并使用新 workspace 验证。
-- 不得为了通过 benchmark 修改 golden 数据或放宽 deterministic hard constraints。
-- `--max-concurrency` 不会自动启动多 GPU worker；不要把 worker 数硬编码为 8。
-- 开始和结束时运行 `git status --short`，保留用户已有修改，不回滚无关文件。
-
-### 交付检查
-
-代码变更至少执行对应的 focused tests；条件允许时执行全量测试：
+## 开发与测试
 
 ```bash
-uv run pytest tests/test_<module>.py -q
-uv run pytest -q
+# 全量测试
+NODE_OPTIONS=--experimental-default-type=module uv run pytest -q
+
+# 命令行 smoke test
 uv run qwen-annotate --help
+uv run qwen-annotate inspect examples/complete.yaml
 ```
 
-涉及真实数据读取、模型推理、转换或评测时，按 `docs/operations.md` 从最小样本逐级验证，并记录模型 SHA、vLLM 版本、命令、workspace、episode 集和结果。不要把 mock 测试、只读 inspect、partial run 或旧 prompt 的结果描述成 launch gate 成功。
+`tests/test_*.py` 基本与源码模块一一对应，跨模块完整流程见 `tests/test_end_to_end.py`。
 
-交付说明应列出修改内容、实际验证结果、因数据/模型/GPU/服务不可用而未运行的检查，以及留给下一位 agent 的风险或未完成事项。
+## 文档
 
-### 深入文档
+- [完整操作手册](docs/operations.md)：模型下载、vLLM 启动、批量运行、故障恢复、复核、转换与评测
+- [系统设计](docs/superpowers/specs/2026-08-22-qwen38-lerobot-annotation-design.md)：数据边界、状态机与安全约束
+- [可视化复核设计](docs/superpowers/specs/2026-08-23-visual-manual-review-design.md)：复核台交互和人工决定协议
 
-- [操作手册](docs/operations.md)：当前实现的权威运行步骤、实测证据、故障恢复和发布清单。
-- [设计文档](docs/superpowers/specs/2026-08-22-qwen38-lerobot-annotation-design.md)：项目最初设计与系统边界。
-- [历史实现计划](docs/superpowers/plans/2026-08-22-qwen38-lerobot-annotation.md)：用于理解实现来源，不代表其中未勾选内容仍未实现。
+## 贡献
 
-若文档与实现冲突，先通过代码和测试确认事实，再在同一变更中修正文档。
+欢迎提交 Issue 和 Pull Request。修改行为逻辑时，请同时补充对应测试；修改 prompt schema 或语义时，请递增 prompt 版本，并使用新的空 workspace 验证，避免把旧结果与新行为混用。
+
+---
+
+<div align="center">
+
+**让机器人视频标注从“模型猜一次”，变成可检查、可恢复、可发布的工程流程。**
+
+</div>
