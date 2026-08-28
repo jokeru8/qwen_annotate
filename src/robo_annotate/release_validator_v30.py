@@ -8,19 +8,22 @@ ingest time.
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 import math
 import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from string import Formatter
 from typing import Any
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+from PIL import Image
 
 from .constraints import validate_annotation
 from .lerobot import EpisodeVideoRef, video_fps_matches
@@ -31,21 +34,13 @@ from .release_validator import (
     ReleaseServices,
     _aware_utc,
     _integer,
-    _payload_files,
-    _read_object,
-    _regular_under,
     _reject_forbidden,
-    _safe_root,
-    _sha256,
     _string,
     _subtasks,
-    _validate_splits,
-    _validate_task_info,
-    _walk_regular,
 )
+from .secure_tree import SecureFile, SecureTree
 
 
-_TASK_COLUMNS = {"task_index", "task"}
 _DATA_COLUMNS = {"index", "episode_index", "frame_index", "timestamp", "task_index"}
 _EPISODE_COLUMNS = {
     "episode_index",
@@ -59,14 +54,24 @@ _EPISODE_COLUMNS = {
     "meta/episodes/file_index",
 }
 _VIDEO_PARTS = ("chunk_index", "file_index", "from_timestamp", "to_timestamp")
-_STAT_METRICS = ("min", "max", "mean", "std", "count")
+_BASIC_STAT_METRICS = ("min", "max", "mean", "std", "count")
 _CHUNK = re.compile(r"chunk-([0-9]{3})\Z")
 _FILE = re.compile(r"file-([0-9]{3})\.parquet\Z")
+_DEFAULT_CHUNKS_SIZE = 1000
+_DEFAULT_DATA_FILE_SIZE_MB = 100
+_DEFAULT_VIDEO_FILE_SIZE_MB = 200
+_DEFAULT_DATA_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+_DEFAULT_VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+_DEFAULT_EPISODES_PATH = "meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+_MAX_JSON_BYTES = 16 * 1024 * 1024
+_MAX_PARQUET_BYTES = 1024 * 1024 * 1024
+_MAX_VIDEO_BYTES = 16 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
 class _VideoSlice:
-    path: Path
+    relative: str
+    file: SecureFile
     from_timestamp: float
     to_timestamp: float
 
@@ -76,10 +81,19 @@ class _Episode:
     index: int
     length: int
     task: str
-    data_path: Path
+    data_path: str
     data_offset: int
     videos: dict[str, _VideoSlice]
     metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _DataFeature:
+    name: str
+    dtype: str
+    shape: tuple[int, ...]
+    arrow_type: pa.DataType
+    stats_width: int | None
 
 
 def validate_v30_release(
@@ -91,20 +105,35 @@ def validate_v30_release(
     deep_video_stats: bool,
 ) -> ReleaseReport:
     """Validate v3 directly while retaining the same safe public boundary."""
-    release_root = _safe_root(root, "release")
-    checked_source = (
-        _safe_root(source_root, "source") if source_root is not None else None
-    )
-    _walk_regular(release_root)
-    info = _read_object(release_root / "meta/info.json")
-    return _validate_v30_release_with_info(
-        release_root,
-        source_root=checked_source,
-        services=services,
-        expected_output_root=expected_output_root,
-        deep_video_stats=deep_video_stats,
-        info=info,
-    )
+    with SecureTree(root, "release") as release_tree:
+        release_tree.scan()
+        info_bytes = _read_bytes(release_tree, "meta/info.json", _MAX_JSON_BYTES, "info.json")
+        info = _decode_object(info_bytes, "info.json")
+        if source_root is None:
+            return _validate_v30_release_with_info(
+                release_tree.path,
+                source_root=None,
+                services=services,
+                expected_output_root=expected_output_root,
+                deep_video_stats=deep_video_stats,
+                info=info,
+                release_tree=release_tree,
+                source_tree=None,
+                info_digest=hashlib.sha256(info_bytes).hexdigest(),
+            )
+        with SecureTree(source_root, "source") as source_tree:
+            source_tree.scan()
+            return _validate_v30_release_with_info(
+                release_tree.path,
+                source_root=source_tree.path,
+                services=services,
+                expected_output_root=expected_output_root,
+                deep_video_stats=deep_video_stats,
+                info=info,
+                release_tree=release_tree,
+                source_tree=source_tree,
+                info_digest=hashlib.sha256(info_bytes).hexdigest(),
+            )
 
 
 def _validate_v30_release_with_info(
@@ -115,6 +144,9 @@ def _validate_v30_release_with_info(
     expected_output_root: Path | None,
     deep_video_stats: bool,
     info: dict[str, Any],
+    release_tree: SecureTree,
+    source_tree: SecureTree | None,
+    info_digest: str,
 ) -> ReleaseReport:
     """Validate v3 using the facade's single bounded info.json read."""
     if _string(info, "codebase_version") != "v3.0":
@@ -125,50 +157,65 @@ def _validate_v30_release_with_info(
     total_episodes = _strict_int(info.get("total_episodes"), "total_episodes", 0)
     total_frames = _strict_int(info.get("total_frames"), "total_frames", 0)
     total_tasks = _strict_int(info.get("total_tasks"), "total_tasks", 0)
-    total_videos = _strict_int(info.get("total_videos"), "total_videos", 0)
-    total_data_files = _strict_int(
-        info.get("total_data_files"), "total_data_files", 0
+    chunks_size = _strict_int(
+        info.get("chunks_size", _DEFAULT_CHUNKS_SIZE), "chunks_size", 1
     )
-    total_video_files = _strict_int(
-        info.get("total_video_files"), "total_video_files", 0
-    )
-    chunks_size = _strict_int(info.get("chunks_size"), "chunks_size", 1)
     fps = _positive_number(info.get("fps"), "fps")
-    _positive_number(info.get("data_files_size_in_mb"), "data_files_size_in_mb")
-    _positive_number(info.get("video_files_size_in_mb"), "video_files_size_in_mb")
+    _positive_number(
+        info.get("data_files_size_in_mb", _DEFAULT_DATA_FILE_SIZE_MB),
+        "data_files_size_in_mb",
+    )
+    _positive_number(
+        info.get("video_files_size_in_mb", _DEFAULT_VIDEO_FILE_SIZE_MB),
+        "video_files_size_in_mb",
+    )
     data_template = _template(
-        info.get("data_path"), "data_path", {"chunk_index", "file_index"}
+        info.get("data_path", _DEFAULT_DATA_PATH),
+        "data_path",
+        {"chunk_index", "file_index"},
     )
     video_template = _template(
-        info.get("video_path"),
+        info.get("video_path", _DEFAULT_VIDEO_PATH),
         "video_path",
         {"video_key", "chunk_index", "file_index"},
     )
     episodes_template = None
     if "episodes_path" in info:
         episodes_template = _template(
-            info.get("episodes_path"),
+            info.get("episodes_path", _DEFAULT_EPISODES_PATH),
             "episodes_path",
             {"chunk_index", "file_index"},
         )
-    _validate_splits(info.get("splits"), total_episodes)
+    _validate_optional_splits(info.get("splits", {}), total_episodes)
 
     features = info.get("features")
     if not isinstance(features, dict) or not features:
         raise ValueError("features must be a nonempty object")
-    numeric_shapes, camera_shapes = _feature_shapes(features, fps)
+    data_features, camera_shapes = _feature_shapes(features, fps)
+    numeric_shapes = {
+        feature.name: feature.stats_width
+        for feature in data_features.values()
+        if feature.stats_width is not None
+    }
     cameras = list(camera_shapes)
     if not cameras:
         raise ValueError("v3 release must declare at least one video camera")
-    if total_videos != total_episodes * len(cameras):
-        raise ValueError("total_videos is inconsistent with episodes and cameras")
-
-    tasks = _read_tasks(root / "meta/tasks.parquet")
+    core_digests = {"meta/info.json": info_digest}
+    tasks = _read_tasks(release_tree, core_digests)
     if len(tasks) != total_tasks:
         raise ValueError("total_tasks differs from tasks.parquet")
     task_by_text = {text: index for index, text in tasks.items()}
 
-    episode_shards = _read_episode_shards(root)
+    published_stats_bytes = _read_bytes(
+        release_tree, "meta/stats.json", _MAX_JSON_BYTES, "stats.json"
+    )
+    published_stats = _decode_object(published_stats_bytes, "stats.json")
+    core_digests["meta/stats.json"] = hashlib.sha256(published_stats_bytes).hexdigest()
+    stats_profiles = _stats_profiles(
+        published_stats, set(numeric_shapes) | set(cameras)
+    )
+
+    episode_shards = _read_episode_shards(release_tree, core_digests)
     if episodes_template is not None:
         for chunk_index, file_index, _, path in episode_shards:
             relative = _render(
@@ -177,7 +224,7 @@ def _validate_v30_release_with_info(
                 "episodes_path",
                 "meta",
             )
-            if relative.parts[:2] != ("meta", "episodes") or root / relative != path:
+            if relative.parts[:2] != ("meta", "episodes") or relative.as_posix() != path:
                 raise ValueError(
                     "episodes_path must resolve each metadata shard under meta/episodes"
                 )
@@ -193,9 +240,10 @@ def _validate_v30_release_with_info(
     expected_stat_columns = {
         f"stats/{feature}/{metric}"
         for feature in [*numeric_shapes, *cameras]
-        for metric in _STAT_METRICS
+        for metric in stats_profiles[feature]
     }
-    for _, _, table, _ in episode_shards:
+    reference_episode_schema: pa.Schema | None = None
+    for _, _, table, relative in episode_shards:
         actual = set(table.column_names)
         if actual != required_episode_columns | expected_stat_columns:
             raise ValueError(
@@ -203,13 +251,25 @@ def _validate_v30_release_with_info(
                 f"missing={sorted((required_episode_columns | expected_stat_columns) - actual)}, "
                 f"extra={sorted(actual - required_episode_columns - expected_stat_columns)}"
             )
+        _validate_episode_arrow_schema(
+            table,
+            data_features,
+            cameras,
+            stats_profiles,
+            context=f"episode metadata {relative}",
+        )
+        if reference_episode_schema is None:
+            reference_episode_schema = table.schema
+        elif not table.schema.equals(reference_episode_schema, check_metadata=False):
+            raise ValueError("episode metadata shards must have identical ordered schemas")
 
-    data_tables: dict[Path, pa.Table] = {}
+    data_tables: dict[str, pa.Table] = {}
     data_pairs: set[tuple[int, int]] = set()
-    data_pair_paths: dict[tuple[int, int], Path] = {}
-    data_coverage: dict[Path, set[int]] = defaultdict(set)
-    video_probes: dict[Path, Any] = {}
-    video_ranges: dict[tuple[str, Path], list[tuple[float, float, int]]] = (
+    data_pair_paths: dict[tuple[int, int], str] = {}
+    data_coverage: dict[str, set[int]] = defaultdict(set)
+    video_files: dict[str, SecureFile] = {}
+    video_probes: dict[str, Any] = {}
+    video_ranges: dict[tuple[str, str], list[tuple[float, float, int]]] = (
         defaultdict(list)
     )
     video_pairs: dict[str, set[tuple[int, int]]] = defaultdict(set)
@@ -217,7 +277,7 @@ def _validate_v30_release_with_info(
     expected_global = 0
     expected_payload: set[str] = set()
     expected_episode_shards = {
-        path.relative_to(root).as_posix() for _, _, _, path in episode_shards
+        path for _, _, _, path in episode_shards
     }
 
     for expected_index, (meta_chunk, meta_file, row) in enumerate(rows):
@@ -271,7 +331,7 @@ def _validate_v30_release_with_info(
             "data_path",
             "data",
         )
-        data_path = _regular_under(root, data_relative)
+        data_path = data_relative.as_posix()
         data_pairs.add((data_chunk, data_file))
         prior_data_path = data_pair_paths.setdefault(
             (data_chunk, data_file), data_path
@@ -280,7 +340,9 @@ def _validate_v30_release_with_info(
             raise ValueError("one data shard number resolves to multiple paths")
         expected_payload.add(data_relative.as_posix())
         if data_path not in data_tables:
-            data_tables[data_path] = _read_data(data_path, features, numeric_shapes)
+            data_tables[data_path] = _read_data(
+                release_tree, data_path, data_features, core_digests
+            )
         data_offset = _validate_data_slice(
             data_tables[data_path],
             episode_index,
@@ -329,11 +391,18 @@ def _validate_v30_release_with_info(
                 "video_path",
                 "videos",
             )
-            video_path = _regular_under(root, video_relative)
+            video_path = video_relative.as_posix()
             video_pairs[camera].add((video_chunk, video_file))
             expected_payload.add(video_relative.as_posix())
             if video_path not in video_probes:
-                video_probes[video_path] = services.probe_video(video_path)
+                video_file = release_tree.open_file(
+                    video_path, _MAX_VIDEO_BYTES, "video shard"
+                )
+                video_files[video_path] = video_file
+                try:
+                    video_probes[video_path] = services.probe_video(video_file.proc_path)
+                finally:
+                    video_file.verify()
             probe = video_probes[video_path]
             width, height = camera_shapes[camera]
             if (
@@ -348,7 +417,7 @@ def _validate_v30_release_with_info(
                 (from_timestamp, to_timestamp, episode_index)
             )
             episode_videos[camera] = _VideoSlice(
-                video_path, from_timestamp, to_timestamp
+                video_path, video_files[video_path], from_timestamp, to_timestamp
             )
 
         episodes.append(
@@ -366,10 +435,6 @@ def _validate_v30_release_with_info(
 
     if expected_global != total_frames:
         raise ValueError("episode lengths differ from total_frames")
-    if len(data_tables) != total_data_files:
-        raise ValueError("total_data_files differs from referenced data shards")
-    if len(video_probes) != total_video_files:
-        raise ValueError("total_video_files differs from referenced video shards")
     _require_canonical_file_pairs(data_pairs, chunks_size, "data shard numbering")
     physical_indices = [
         value
@@ -394,23 +459,23 @@ def _validate_v30_release_with_info(
             raise ValueError(f"data shard has unreferenced or multiply referenced rows: {path}")
     _validate_video_coverage(video_ranges, video_probes, fps)
 
-    actual_payload = _payload_files(root)
+    actual_payload = _payload_files_secure(release_tree)
     if actual_payload != expected_payload:
         raise ValueError("missing or extra v3 payload files")
-    actual_episode_shards = {
-        path.relative_to(root).as_posix()
-        for path in (root / "meta/episodes").rglob("*.parquet")
-        if path.is_file()
-    }
+    actual_episode_shards = set(
+        release_tree.files_under("meta/episodes", suffix=".parquet")
+    )
     if actual_episode_shards != expected_episode_shards:
         raise ValueError("missing or extra episode metadata shards")
 
-    published_stats = _read_object(root / "meta/stats.json")
     expected_stats_features = set(numeric_shapes) | set(cameras)
     if set(published_stats) != expected_stats_features:
         raise ValueError("aggregate stats feature coverage mismatch")
     aggregate_numeric, episode_numeric = _numeric_stats(
-        data_tables, episodes, numeric_shapes
+        data_tables,
+        episodes,
+        {name: data_features[name] for name in numeric_shapes},
+        stats_profiles,
     )
     for feature, actual in aggregate_numeric.items():
         _compare_stats(
@@ -419,7 +484,7 @@ def _validate_v30_release_with_info(
     for episode in episodes:
         for feature, actual in episode_numeric[episode.index].items():
             _compare_stats(
-                _row_stats(episode.metadata, feature),
+                _row_stats(episode.metadata, feature, stats_profiles[feature]),
                 actual,
                 f"episode {episode.index} stats {feature}",
                 tolerance=1e-6,
@@ -433,6 +498,8 @@ def _validate_v30_release_with_info(
             video_ranges,
             services,
             fps,
+            video_files,
+            stats_profiles,
         )
         # Published v3 image statistics originate before lossy H.264 encoding.
         # A four-code-value envelope covers codec drift while still rejecting
@@ -448,26 +515,34 @@ def _validate_v30_release_with_info(
         for episode in episodes:
             for camera, actual in episode_video[episode.index].items():
                 _compare_stats(
-                    _row_stats(episode.metadata, camera),
+                    _row_stats(episode.metadata, camera, stats_profiles[camera]),
                     actual,
                     f"episode {episode.index} stats {camera}",
                     tolerance=codec_tolerance,
                 )
     else:
+        sampled_total = sum(len(_sample_indices(episode.length)) for episode in episodes)
         for camera in cameras:
             _validate_stats_shape(
-                published_stats[camera], 3, total_frames, f"stats {camera}"
+                published_stats[camera],
+                3,
+                sampled_total,
+                f"stats {camera}",
+                stats_profiles[camera],
             )
         for episode in episodes:
             for camera in cameras:
                 _validate_stats_shape(
-                    _row_stats(episode.metadata, camera),
+                    _row_stats(episode.metadata, camera, stats_profiles[camera]),
                     3,
-                    episode.length,
+                    len(_sample_indices(episode.length)),
                     f"episode {episode.index} stats {camera}",
+                    stats_profiles[camera],
                 )
 
-    annotations = _read_object(root / "meta/lerobot_annotations.json")
+    annotations = _read_secure_object(
+        release_tree, "meta/lerobot_annotations.json", "lerobot_annotations.json"
+    )
     template, mode, preview = _validate_annotations(
         root,
         source_root,
@@ -477,25 +552,32 @@ def _validate_v30_release_with_info(
         cameras,
         fps,
         services,
+        release_tree,
     )
 
-    digests = {relative: _sha256(root / relative) for relative in sorted(expected_payload)}
-    if source_root is not None:
-        _walk_regular(source_root)
-        release_core = _official_core_files(root)
-        source_core = _official_core_files(source_root)
+    for relative, video_file in video_files.items():
+        core_digests[relative] = video_file.sha256()
+    digests = {relative: core_digests[relative] for relative in sorted(expected_payload)}
+    if source_tree is not None:
+        release_core = _official_core_files(release_tree)
+        source_core = _official_core_files(source_tree)
         if release_core != source_core:
             raise ValueError("official v3 source/release file inventory differs")
         for relative in sorted(release_core):
-            if _sha256(root / relative) != _sha256(source_root / relative):
+            release_digest = core_digests.get(relative)
+            if release_digest is None:
+                release_digest = _secure_digest(release_tree, relative, "official release file")
+            source_digest = _secure_digest(source_tree, relative, "official source file")
+            if release_digest != source_digest:
                 raise ValueError(f"official v3 source byte mismatch: {relative}")
+    release_tree.verify()
     aggregate_digest = hashlib.sha256(
         "".join(
             f"{name}\0{digests[name]}\n" for name in sorted(digests)
         ).encode()
     ).hexdigest()
     return ReleaseReport(
-        path=root,
+        path=release_tree.path,
         dataset_version="v3.0",
         episode_count=total_episodes,
         frame_count=total_frames,
@@ -513,8 +595,8 @@ def _validate_v30_release_with_info(
 
 def _feature_shapes(
     features: Mapping[str, Any], fps: float
-) -> tuple[dict[str, int], dict[str, tuple[int, int]]]:
-    numeric: dict[str, int] = {}
+) -> tuple[dict[str, _DataFeature], dict[str, tuple[int, int]]]:
+    data: dict[str, _DataFeature] = {}
     cameras: dict[str, tuple[int, int]] = {}
     for name, value in features.items():
         if not isinstance(name, str) or not name or not isinstance(value, dict):
@@ -526,28 +608,200 @@ def _feature_shapes(
         ):
             raise ValueError(f"feature dtype or shape is invalid: {name}")
         if dtype == "video":
-            if len(shape) != 3 or shape[0] != 3:
-                raise ValueError(f"video feature shape must be [3,height,width]: {name}")
+            if len(shape) != 3:
+                raise ValueError(f"video feature shape must have rank 3: {name}")
             video_info = value.get("info")
             if not isinstance(video_info, dict):
                 raise ValueError(f"video feature info is invalid: {name}")
             video_fps = _positive_number(video_info.get("video.fps"), "video.fps")
             width = _strict_int(video_info.get("video.width"), "video.width", 1)
             height = _strict_int(video_info.get("video.height"), "video.height", 1)
-            if not video_fps_matches(video_fps, fps) or shape != [3, height, width]:
+            if not video_fps_matches(video_fps, fps) or shape not in (
+                [3, height, width],
+                [height, width, 3],
+            ):
                 raise ValueError(f"video feature fps or shape is inconsistent: {name}")
             cameras[name] = (width, height)
-        elif dtype.startswith("int") or dtype.startswith("float"):
-            numeric[name] = math.prod(shape)
+        elif dtype == "string":
+            if shape != [1]:
+                raise ValueError(f"string feature shape must be [1]: {name}")
+            data[name] = _DataFeature(name, dtype, (1,), pa.string(), None)
+        elif dtype == "language":
+            if name not in {"language_persistent", "language_events"} or shape != [1]:
+                raise ValueError(f"unsupported language feature declaration: {name}")
+            arrow_type = (
+                _language_persistent_arrow_type()
+                if name == "language_persistent"
+                else _language_events_arrow_type()
+            )
+            data[name] = _DataFeature(name, dtype, (1,), arrow_type, None)
+        elif dtype == "image":
+            if len(shape) != 3 or (shape[0] != 3 and shape[-1] != 3):
+                raise ValueError(f"RGB image feature shape must be CHW or HWC: {name}")
+            data[name] = _DataFeature(name, dtype, tuple(shape), _image_arrow_type(), 3)
         else:
-            raise ValueError(f"unsupported non-video feature dtype: {name}")
-    return numeric, cameras
+            try:
+                numpy_dtype = np.dtype(dtype)
+                arrow_type = pa.from_numpy_dtype(numpy_dtype)
+            except (TypeError, ValueError, NotImplementedError, pa.ArrowNotImplementedError) as exc:
+                raise ValueError(f"unsupported declared feature dtype: {name}") from exc
+            if len(shape) > 5:
+                raise ValueError(f"feature shape rank exceeds official HF support: {name}")
+            data[name] = _DataFeature(
+                name,
+                dtype,
+                tuple(shape),
+                arrow_type,
+                shape[-1],
+            )
+    official_defaults = {
+        "timestamp": ("float32", (1,)),
+        "frame_index": ("int64", (1,)),
+        "episode_index": ("int64", (1,)),
+        "index": ("int64", (1,)),
+        "task_index": ("int64", (1,)),
+    }
+    for name, (dtype, shape) in official_defaults.items():
+        feature = data.get(name)
+        if feature is None or (feature.dtype, feature.shape) != (dtype, shape):
+            raise ValueError(f"official default feature declaration mismatch: {name}")
+    return data, cameras
 
 
-def _read_tasks(path: Path) -> dict[int, str]:
-    table = _read_parquet(path, "tasks.parquet")
-    if set(table.column_names) != _TASK_COLUMNS:
-        raise ValueError("tasks.parquet schema must contain exactly task_index and task")
+def _language_persistent_arrow_type() -> pa.ListType:
+    return pa.list_(
+        pa.struct(
+            [
+                pa.field("role", pa.string()),
+                pa.field("content", pa.string()),
+                pa.field("style", pa.string()),
+                pa.field("timestamp", pa.float32()),
+                pa.field("camera", pa.string()),
+                pa.field("tool_calls", pa.list_(pa.string())),
+            ]
+        )
+    )
+
+
+def _language_events_arrow_type() -> pa.ListType:
+    return pa.list_(
+        pa.struct(
+            [
+                pa.field("role", pa.string()),
+                pa.field("content", pa.string()),
+                pa.field("style", pa.string()),
+                pa.field("camera", pa.string()),
+                pa.field("tool_calls", pa.list_(pa.string())),
+            ]
+        )
+    )
+
+
+def _image_arrow_type() -> pa.StructType:
+    return pa.struct([pa.field("bytes", pa.binary()), pa.field("path", pa.string())])
+
+
+def _feature_arrow_type_matches(actual: pa.DataType, feature: _DataFeature) -> bool:
+    storage = getattr(actual, "storage_type", actual)
+    if feature.dtype in {"string", "language", "image"}:
+        return storage.equals(feature.arrow_type)
+    if feature.shape == (1,):
+        return storage.equals(feature.arrow_type)
+
+    def matches(value: pa.DataType, dimensions: tuple[int, ...]) -> bool:
+        value = getattr(value, "storage_type", value)
+        if not dimensions:
+            return value.equals(feature.arrow_type)
+        if pa.types.is_fixed_size_list(value):
+            return value.list_size == dimensions[0] and matches(
+                value.value_type, dimensions[1:]
+            )
+        # HF ArrayND extension storage may use variable nested lists while its
+        # declared shape lives in info.json; values below are checked exactly.
+        if pa.types.is_list(value) or pa.types.is_large_list(value):
+            return matches(value.value_type, dimensions[1:])
+        return False
+
+    return matches(storage, feature.shape)
+
+
+def _validate_feature_values(array: pa.ChunkedArray, feature: _DataFeature) -> None:
+    if feature.dtype == "image":
+        for value in array.to_pylist():
+            if (
+                not isinstance(value, dict)
+                or not isinstance(value.get("bytes"), bytes)
+                or not isinstance(value.get("path"), (str, type(None)))
+            ):
+                raise ValueError(
+                    f"embedded image feature must contain bytes and a string/null path: {feature.name}"
+                )
+        return
+    if feature.dtype in {"string", "language"} or feature.shape == (1,):
+        return
+
+    def valid_shape(value: Any, dimensions: tuple[int, ...]) -> bool:
+        if not dimensions:
+            return not isinstance(value, (list, tuple))
+        return (
+            isinstance(value, (list, tuple))
+            and len(value) == dimensions[0]
+            and all(valid_shape(child, dimensions[1:]) for child in value)
+        )
+
+    if any(not valid_shape(value, feature.shape) for value in array.to_pylist()):
+        raise ValueError(f"data values disagree with declared feature shape: {feature.name}")
+
+
+def _validate_episode_arrow_schema(
+    table: pa.Table,
+    data_features: Mapping[str, _DataFeature],
+    cameras: Sequence[str],
+    profiles: Mapping[str, tuple[str, ...]],
+    *,
+    context: str,
+) -> None:
+    exact = {
+        "episode_index": pa.int64(),
+        "tasks": pa.list_(pa.string()),
+        "length": pa.int64(),
+        "data/chunk_index": pa.int64(),
+        "data/file_index": pa.int64(),
+        "dataset_from_index": pa.int64(),
+        "dataset_to_index": pa.int64(),
+        "meta/episodes/chunk_index": pa.int64(),
+        "meta/episodes/file_index": pa.int64(),
+    }
+    for camera in cameras:
+        exact[f"videos/{camera}/chunk_index"] = pa.int64()
+        exact[f"videos/{camera}/file_index"] = pa.int64()
+        exact[f"videos/{camera}/from_timestamp"] = pa.float64()
+        exact[f"videos/{camera}/to_timestamp"] = pa.float64()
+    for name, expected in exact.items():
+        field = table.schema.field(name)
+        if not field.nullable or not field.type.equals(expected) or table[name].null_count:
+            raise ValueError(f"{context} has nonofficial Arrow field {name}")
+    for feature, profile in profiles.items():
+        for metric in profile:
+            name = f"stats/{feature}/{metric}"
+            field = table.schema.field(name)
+            expected = pa.list_(pa.int64()) if metric == "count" else pa.list_(pa.float64())
+            visual = feature in cameras or (
+                feature in data_features and data_features[feature].dtype == "image"
+            )
+            if visual and metric != "count":
+                expected = pa.list_(pa.list_(pa.list_(pa.float64())))
+            if not field.nullable or not field.type.equals(expected) or table[name].null_count:
+                raise ValueError(f"{context} has nonofficial Arrow field {name}")
+
+
+def _read_tasks(tree: SecureTree, digests: dict[str, str]) -> dict[int, str]:
+    table = _read_parquet(tree, "meta/tasks.parquet", "tasks.parquet", digests)
+    expected_schema = pa.schema([pa.field("task_index", pa.int64()), pa.field("task", pa.string())])
+    if not table.schema.equals(expected_schema, check_metadata=False):
+        raise ValueError(
+            "tasks.parquet schema must be ordered nullable task_index:int64, task:string"
+        )
     result: dict[int, str] = {}
     texts: set[str] = set()
     for row_number, row in enumerate(table.to_pylist()):
@@ -565,76 +819,69 @@ def _read_tasks(path: Path) -> dict[int, str]:
 
 
 def _read_episode_shards(
-    root: Path,
-) -> list[tuple[int, int, pa.Table, Path]]:
-    directory = root / "meta/episodes"
-    if not directory.is_dir() or directory.is_symlink():
-        raise ValueError("missing safe meta/episodes directory")
-    result: list[tuple[int, int, pa.Table, Path]] = []
-    for chunk_path in sorted(directory.iterdir()):
-        match = _CHUNK.fullmatch(chunk_path.name)
-        if match is None or not chunk_path.is_dir() or chunk_path.is_symlink():
-            raise ValueError(f"unexpected episode metadata entry: {chunk_path.name}")
-        chunk_index = int(match.group(1))
-        for file_path in sorted(chunk_path.iterdir()):
-            file_match = _FILE.fullmatch(file_path.name)
-            if file_match is None:
-                raise ValueError(f"unexpected episode metadata file: {file_path.name}")
-            file_index = int(file_match.group(1))
-            result.append(
-                (
-                    chunk_index,
-                    file_index,
-                    _read_parquet(file_path, "episode metadata"),
-                    file_path,
-                )
+    tree: SecureTree,
+    digests: dict[str, str],
+) -> list[tuple[int, int, pa.Table, str]]:
+    result: list[tuple[int, int, pa.Table, str]] = []
+    all_under = tree.files_under("meta/episodes")
+    for relative in all_under:
+        parts = PurePosixPath(relative).parts
+        if len(parts) != 4:
+            raise ValueError(f"unexpected episode metadata entry: {relative}")
+        chunk_match = _CHUNK.fullmatch(parts[2])
+        file_match = _FILE.fullmatch(parts[3])
+        if chunk_match is None or file_match is None:
+            raise ValueError(f"unexpected episode metadata file: {relative}")
+        chunk_index = int(chunk_match.group(1))
+        file_index = int(file_match.group(1))
+        result.append(
+            (
+                chunk_index,
+                file_index,
+                _read_parquet(tree, relative, "episode metadata", digests),
+                relative,
             )
+        )
+    result.sort(key=lambda item: (item[0], item[1]))
     if not result:
         raise ValueError("episode metadata has no parquet shards")
     return result
 
 
-def _read_parquet(path: Path, context: str) -> pa.Table:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"unsafe or missing {context}: {path}")
+def _read_parquet(
+    tree: SecureTree,
+    relative: str,
+    context: str,
+    digests: dict[str, str],
+) -> pa.Table:
+    data = _read_bytes(tree, relative, _MAX_PARQUET_BYTES, context)
+    digests[relative] = hashlib.sha256(data).hexdigest()
     try:
-        return pq.read_table(path)
+        return pq.read_table(pa.BufferReader(data))
     except Exception as exc:
-        raise ValueError(f"unable to read {context}: {path}") from exc
+        raise ValueError(f"unable to read {context}: {relative}") from exc
 
 
 def _read_data(
-    path: Path,
-    features: Mapping[str, Any],
-    numeric_shapes: Mapping[str, int],
+    tree: SecureTree,
+    relative: str,
+    features: Mapping[str, _DataFeature],
+    digests: dict[str, str],
 ) -> pa.Table:
-    table = _read_parquet(path, "data shard")
-    required = _DATA_COLUMNS | set(numeric_shapes)
-    actual = set(table.column_names)
-    if actual != required:
+    table = _read_parquet(tree, relative, "data shard", digests)
+    expected_names = list(features)
+    if table.column_names != expected_names:
         raise ValueError(
             "data schema feature inventory mismatch: "
-            f"missing={sorted(required - actual)}, extra={sorted(actual - required)}"
+            f"expected ordered={expected_names}, actual={table.column_names}"
         )
-    for name in ("index", "episode_index", "frame_index", "task_index"):
-        field = table.schema.field(name)
-        if not pa.types.is_integer(field.type) or table[name].null_count:
-            raise ValueError(f"data schema requires a non-null integer {name} column")
-    timestamp_field = table.schema.field("timestamp")
-    if not pa.types.is_floating(timestamp_field.type) or table["timestamp"].null_count:
-        raise ValueError("data schema requires a non-null floating timestamp column")
-    for feature, width in numeric_shapes.items():
+    for feature, declared in features.items():
         field = table.schema.field(feature)
-        declared = features[feature]["dtype"]
-        base = field.type.value_type if pa.types.is_fixed_size_list(field.type) else field.type
-        try:
-            declared_type = pa.type_for_alias(declared)
-        except ValueError as exc:
-            raise ValueError(f"unsupported declared feature dtype: {feature}") from exc
-        compatible = base.equals(declared_type)
-        actual_width = field.type.list_size if pa.types.is_fixed_size_list(field.type) else 1
-        if not compatible or actual_width != width or table[feature].null_count:
+        if not field.nullable or table[feature].null_count:
+            raise ValueError(f"data schema requires a nullable, populated field: {feature}")
+        if not _feature_arrow_type_matches(field.type, declared):
             raise ValueError(f"data schema disagrees with feature declaration: {feature}")
+        _validate_feature_values(table[feature], declared)
     return table
 
 
@@ -679,24 +926,30 @@ def _validate_data_slice(
 
 
 def _validate_video_coverage(
-    ranges: Mapping[tuple[str, Path], list[tuple[float, float, int]]],
-    probes: Mapping[Path, Any],
+    ranges: Mapping[tuple[str, str], list[tuple[float, float, int]]],
+    probes: Mapping[str, Any],
     fps: float,
 ) -> None:
     tolerance = 1.0 / fps + 1e-9
-    for (camera, path), items in ranges.items():
-        ordered = sorted(items)
+    expected_episode: dict[str, int] = defaultdict(int)
+    for camera, path in sorted(ranges):
+        items = ranges[(camera, path)]
         expected = 0.0
-        for start, stop, episode_index in ordered:
+        for start, stop, episode_index in items:
+            if episode_index != expected_episode[camera]:
+                raise ValueError(
+                    f"video episode ranges are not in canonical physical video order for camera {camera}"
+                )
             if start < expected - 1e-9:
                 raise ValueError(
-                    f"video slice overlap for camera {camera}, episode {episode_index}"
+                    f"video slice overlap or noncanonical physical video order for camera {camera}, episode {episode_index}"
                 )
             if start > expected + tolerance:
                 raise ValueError(
-                    f"video coverage gap for camera {camera}, episode {episode_index}"
+                    f"video coverage gap or noncanonical physical video order for camera {camera}, episode {episode_index}"
                 )
             expected = stop
+            expected_episode[camera] += 1
         duration = probes[path].frames / probes[path].fps
         if abs(expected - duration) > tolerance:
             raise ValueError(f"video shard coverage differs from decoded duration: {path}")
@@ -714,26 +967,31 @@ def _require_canonical_file_pairs(
 
 
 def _numeric_stats(
-    tables: Mapping[Path, pa.Table],
+    tables: Mapping[str, pa.Table],
     episodes: Sequence[_Episode],
-    shapes: Mapping[str, int],
+    features: Mapping[str, _DataFeature],
+    profiles: Mapping[str, tuple[str, ...]],
 ) -> tuple[dict[str, dict[str, list[float]]], dict[int, dict[str, dict[str, list[float]]]]]:
-    ordered_tables = [tables[path] for path in sorted(tables)]
-    aggregate = {
-        feature: _stats(
-            np.concatenate(
-                [_matrix(table[feature], width) for table in ordered_tables]
-            )
-        )
-        for feature, width in shapes.items()
-    }
     by_episode: dict[int, dict[str, dict[str, list[float]]]] = {}
     for episode in episodes:
         table = tables[episode.data_path].slice(episode.data_offset, episode.length)
-        by_episode[episode.index] = {
-            feature: _stats(_matrix(table[feature], width))
-            for feature, width in shapes.items()
-        }
+        by_episode[episode.index] = {}
+        for feature, declaration in features.items():
+            matrix, count = _matrix(
+                table[feature],
+                declaration.stats_width or 1,
+                sample_images=declaration.dtype == "image",
+            )
+            by_episode[episode.index][feature] = _stats(
+                matrix, profiles[feature], count
+            )
+    aggregate = {
+        feature: _aggregate_stats(
+            [by_episode[episode.index][feature] for episode in episodes],
+            profiles[feature],
+        )
+        for feature in features
+    }
     return aggregate, by_episode
 
 
@@ -741,79 +999,209 @@ def _video_stats(
     episodes: Sequence[_Episode],
     cameras: Sequence[str],
     shapes: Mapping[str, tuple[int, int]],
-    ranges: Mapping[tuple[str, Path], list[tuple[float, float, int]]],
+    ranges: Mapping[tuple[str, str], list[tuple[float, float, int]]],
     services: ReleaseServices,
     fps: float,
+    files: Mapping[str, SecureFile],
+    profiles: Mapping[str, tuple[str, ...]],
 ) -> tuple[dict[str, dict[str, list[float]]], dict[int, dict[str, dict[str, list[float]]]]]:
-    aggregate_values: dict[str, list[np.ndarray]] = defaultdict(list)
     episode_values: dict[int, dict[str, np.ndarray]] = defaultdict(dict)
     ordered_ranges = sorted(
         ranges.items(), key=lambda item: (item[0][0], item[0][1])
     )
     for (camera, path), slices in ordered_ranges:
         width, height = shapes[camera]
-        decoded: list[np.ndarray] = []
-        iterator = iter(services.iter_video_rgb_frames(path))
-        try:
-            for frame in iterator:
-                array = np.asarray(frame)
-                if array.dtype != np.uint8 or array.shape != (height, width, 3):
-                    raise ValueError(f"decoded video frame shape or dtype mismatch: {path}")
-                decoded.append(array.mean(axis=(0, 1), dtype=np.float64) / 255.0)
-        finally:
-            close = getattr(iterator, "close", None)
-            if callable(close):
-                close()
-        probe_frames = max(round(stop * fps) for _, stop, _ in slices)
-        if len(decoded) != probe_frames:
-            raise ValueError(f"decoded video frame count mismatch: {path}")
-        values = np.asarray(decoded, dtype=np.float64)
-        aggregate_values[camera].append(values)
+        requested: dict[int, int] = {}
+        sampled_pixels: dict[int, list[np.ndarray]] = defaultdict(list)
         for start, stop, episode_index in slices:
             left, right = round(start * fps), round(stop * fps)
             expected = next(item.length for item in episodes if item.index == episode_index)
             if right - left != expected:
                 raise ValueError(f"episode {episode_index} decoded video slice length mismatch")
-            episode_values[episode_index][camera] = values[left:right]
-    aggregate = {
-        camera: _stats(np.concatenate(aggregate_values[camera])) for camera in cameras
-    }
+            for local_index in _sample_indices(expected):
+                requested[left + local_index] = episode_index
+        video_file = files[path]
+        iterator = iter(services.iter_video_rgb_frames(video_file.proc_path))
+        decoded_count = 0
+        try:
+            for decoded_index, frame in enumerate(iterator):
+                array = np.asarray(frame)
+                if array.dtype != np.uint8 or array.shape != (height, width, 3):
+                    raise ValueError(f"decoded video frame shape or dtype mismatch: {path}")
+                if decoded_index in requested:
+                    sampled = _downsample_rgb(array).astype(np.float64) / 255.0
+                    sampled_pixels[requested[decoded_index]].append(
+                        sampled.reshape(-1, 3)
+                    )
+                decoded_count += 1
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                close()
+            video_file.verify()
+        probe_frames = max(round(stop * fps) for _, stop, _ in slices)
+        if decoded_count != probe_frames:
+            raise ValueError(f"decoded video frame count mismatch: {path}")
+        for _, _, episode_index in slices:
+            episode_values[episode_index][camera] = np.concatenate(
+                sampled_pixels[episode_index], axis=0
+            )
     by_episode = {
         episode.index: {
-            camera: _stats(episode_values[episode.index][camera]) for camera in cameras
+            camera: _stats(
+                episode_values[episode.index][camera],
+                profiles[camera],
+                len(_sample_indices(episode.length)),
+            )
+            for camera in cameras
         }
         for episode in episodes
+    }
+    aggregate = {
+        camera: _aggregate_stats(
+            [by_episode[episode.index][camera] for episode in episodes],
+            profiles[camera],
+        )
+        for camera in cameras
     }
     return aggregate, by_episode
 
 
-def _matrix(array: pa.ChunkedArray, width: int) -> np.ndarray:
+def _matrix(
+    array: pa.ChunkedArray,
+    width: int,
+    *,
+    sample_images: bool,
+) -> tuple[np.ndarray, int]:
     combined = array.combine_chunks()
     if combined.null_count:
         raise ValueError("numeric feature contains null values")
-    if pa.types.is_fixed_size_list(combined.type):
-        values = np.asarray(
-            combined.values.to_numpy(zero_copy_only=False), dtype=np.float64
-        )
-        return values.reshape(-1, width)
-    return np.asarray(combined.to_numpy(zero_copy_only=False), dtype=np.float64).reshape(-1, 1)
+    if pa.types.is_struct(combined.type):
+        pixels: list[np.ndarray] = []
+        rows = combined.to_pylist()
+        indices = _sample_indices(len(rows)) if sample_images else list(range(len(rows)))
+        for index in indices:
+            value = rows[index]
+            try:
+                with Image.open(io.BytesIO(value["bytes"])) as image:
+                    rgb = _downsample_rgb(np.asarray(image.convert("RGB")))
+                    rgb = rgb.astype(np.float64) / 255.0
+            except Exception as exc:
+                raise ValueError("unable to decode embedded image feature") from exc
+            pixels.append(rgb.reshape(-1, 3))
+        return np.concatenate(pixels, axis=0), len(indices)
+    return (
+        np.asarray(combined.to_pylist(), dtype=np.float64).reshape(-1, width),
+        len(combined),
+    )
 
 
-def _stats(values: np.ndarray) -> dict[str, list[float]]:
+def _sample_indices(length: int) -> list[int]:
+    minimum = min(100, length)
+    sample_count = max(minimum, min(int(length**0.75), 10_000))
+    return np.round(np.linspace(0, length - 1, sample_count)).astype(int).tolist()
+
+
+def _downsample_rgb(value: np.ndarray) -> np.ndarray:
+    height, width = value.shape[:2]
+    if max(width, height) < 300:
+        return value
+    factor = int(width / 150) if width > height else int(height / 150)
+    return value[::factor, ::factor]
+
+
+def _stats(
+    values: np.ndarray,
+    profile: Sequence[str],
+    count: int,
+) -> dict[str, list[float]]:
     if values.ndim != 2 or not len(values) or not np.isfinite(values).all():
         raise ValueError("statistics require a nonempty finite matrix")
-    return {
+    result = {
         "min": values.min(axis=0).astype(float).tolist(),
         "max": values.max(axis=0).astype(float).tolist(),
         "mean": values.mean(axis=0).astype(float).tolist(),
         "std": values.std(axis=0).astype(float).tolist(),
-        "count": [float(len(values))],
+        "count": [float(count)],
     }
+    for metric in profile:
+        if metric.startswith("q"):
+            quantile = int(metric[1:]) / 100.0
+            result[metric] = [
+                _histogram_quantile(values[:, column], quantile)
+                for column in range(values.shape[1])
+            ]
+    return result
 
 
-def _row_stats(row: Mapping[str, Any], feature: str) -> dict[str, Any]:
+def _histogram_quantile(values: np.ndarray, quantile: float) -> float:
+    if len(values) < 2:
+        return float(values.mean())
+    minimum, maximum = float(values.min()), float(values.max())
+    edges = np.linspace(minimum - 1e-10, maximum + 1e-10, 5001)
+    histogram, _ = np.histogram(values, bins=edges)
+    cumulative = np.cumsum(histogram)
+    target = quantile * len(values)
+    index = int(np.searchsorted(cumulative, target))
+    if index == 0:
+        return float(edges[0])
+    if index >= len(cumulative):
+        return float(edges[-1])
+    count_before = cumulative[index - 1]
+    count_in_bin = cumulative[index] - count_before
+    if count_in_bin == 0:
+        return float(edges[index])
+    fraction = (target - count_before) / count_in_bin
+    return float(edges[index] + fraction * (edges[index + 1] - edges[index]))
+
+
+def _aggregate_stats(
+    values: Sequence[Mapping[str, list[float]]],
+    profile: Sequence[str],
+) -> dict[str, list[float]]:
+    counts = [item["count"][0] for item in values]
+    total = sum(counts)
+    width = len(values[0]["mean"])
+    means = [
+        sum(item["mean"][column] * count for item, count in zip(values, counts, strict=True))
+        / total
+        for column in range(width)
+    ]
+    result = {
+        "min": [min(item["min"][column] for item in values) for column in range(width)],
+        "max": [max(item["max"][column] for item in values) for column in range(width)],
+        "mean": means,
+        "std": [
+            math.sqrt(
+                sum(
+                    (item["std"][column] ** 2 + (item["mean"][column] - means[column]) ** 2)
+                    * count
+                    for item, count in zip(values, counts, strict=True)
+                )
+                / total
+            )
+            for column in range(width)
+        ],
+        "count": [float(total)],
+    }
+    for metric in profile:
+        if metric.startswith("q"):
+            result[metric] = [
+                sum(
+                    item[metric][column] * count
+                    for item, count in zip(values, counts, strict=True)
+                )
+                / total
+                for column in range(width)
+            ]
+    return result
+
+
+def _row_stats(
+    row: Mapping[str, Any], feature: str, profile: Sequence[str]
+) -> dict[str, Any]:
     return {
-        metric: row.get(f"stats/{feature}/{metric}") for metric in _STAT_METRICS
+        metric: row.get(f"stats/{feature}/{metric}") for metric in profile
     }
 
 
@@ -825,9 +1213,15 @@ def _compare_stats(
     tolerance: float,
 ) -> None:
     width = len(actual["min"])
-    _validate_stats_shape(published, width, round(actual["count"][0]), context)
+    _validate_stats_shape(
+        published,
+        width,
+        round(actual["count"][0]),
+        context,
+        tuple(actual),
+    )
     assert isinstance(published, dict)
-    for metric in _STAT_METRICS:
+    for metric in actual:
         left = _flatten(published[metric])
         right = actual[metric]
         if len(left) != len(right):
@@ -841,14 +1235,20 @@ def _compare_stats(
 
 
 def _validate_stats_shape(
-    value: Any, width: int, expected_count: int, context: str
+    value: Any,
+    width: int,
+    expected_count: int,
+    context: str,
+    profile: Sequence[str],
 ) -> None:
-    if not isinstance(value, dict) or set(value) != set(_STAT_METRICS):
+    if not isinstance(value, dict) or set(value) != set(profile):
         raise ValueError(f"{context} metric coverage mismatch")
     count = _flatten(value["count"])
     if len(count) != 1 or not math.isclose(count[0], expected_count):
         raise ValueError(f"{context} count differs from episode/frame count")
-    for metric in _STAT_METRICS[:-1]:
+    for metric in profile:
+        if metric == "count":
+            continue
         numbers = _flatten(value[metric])
         if len(numbers) != width or not all(math.isfinite(item) for item in numbers):
             raise ValueError(f"{context} metric shape or values are invalid")
@@ -863,6 +1263,13 @@ def _validate_stats_shape(
         )
     ):
         raise ValueError(f"{context} statistic ordering is invalid")
+    quantiles = [metric for metric in profile if metric.startswith("q")]
+    for left, right in zip(quantiles, quantiles[1:], strict=False):
+        if any(
+            low > high
+            for low, high in zip(_flatten(value[left]), _flatten(value[right]), strict=True)
+        ):
+            raise ValueError(f"{context} quantile ordering is invalid")
 
 
 def _flatten(value: Any) -> list[float]:
@@ -888,6 +1295,7 @@ def _validate_annotations(
     cameras: Sequence[str],
     fps: float,
     services: ReleaseServices,
+    tree: SecureTree,
 ) -> tuple[list[Any], str, BoundaryPreview | None]:
     top_fields = {
         "source_root",
@@ -974,13 +1382,16 @@ def _validate_annotations(
             boundary = boundaries[0]
             video = episode.videos[primary]
             ref = EpisodeVideoRef(
-                path=video.path,
+                path=video.file.proc_path,
                 from_timestamp=video.from_timestamp,
                 to_timestamp=video.to_timestamp,
                 fps=fps,
             )
             requested = [boundary - 1, boundary]
-            samples = services.extract_frames(ref, primary, requested)
+            try:
+                samples = services.extract_frames(ref, primary, requested)
+            finally:
+                video.file.verify()
             labels_differ = (
                 len(samples) != 2
                 or [item.frame_index for item in samples] != requested
@@ -995,8 +1406,8 @@ def _validate_annotations(
                 camera_key=primary,
                 frame_indices=(boundary - 1, boundary),
             )
-    _validate_task_info(
-        root,
+    _validate_task_info_secure(
+        tree,
         len(episodes),
         instruction_names,
         [episode.length for episode in episodes],
@@ -1007,12 +1418,172 @@ def _validate_annotations(
     return template, mode, preview
 
 
-def _official_core_files(root: Path) -> set[str]:
+def _validate_task_info_secure(
+    tree: SecureTree,
+    total_episodes: int,
+    instructions: list[str],
+    lengths: list[int],
+    template: list[Any],
+    annotations: list[tuple[int, list[int]]],
+    augmentation_language: str | None,
+) -> None:
+    files = set(tree.files_under("meta/task_info"))
+    if files != {"meta/task_info/task_0.json"}:
+        raise ValueError("task_info must contain exactly task_0.json")
+    value = _read_secure_value(tree, "meta/task_info/task_0.json", "task_0.json")
+    if not isinstance(value, list) or len(value) != total_episodes:
+        raise ValueError("task_info must contain one entry per episode")
+    from .augmentation import valid_augmented_text
+
+    for index, item in enumerate(value):
+        if not isinstance(item, dict) or set(item) != {
+            "episode_id", "task_id", "task_name", "label_info"
+        }:
+            raise ValueError("task_info episode schema mismatch")
+        if (
+            _integer(item, "episode_id", minimum=0) != index
+            or _integer(item, "task_id", minimum=0) != 0
+            or _string(item, "task_name") != instructions[index]
+        ):
+            raise ValueError("task_info episode/task id or task_name mismatch")
+        label = item["label_info"]
+        if not isinstance(label, dict) or set(label) != {"action_config"}:
+            raise ValueError("task_info label_info schema mismatch")
+        actions = label["action_config"]
+        start_subtask, boundaries = annotations[index]
+        starts, ends = [0, *boundaries], [*boundaries, lengths[index]]
+        expected = template[start_subtask : start_subtask + len(starts)]
+        if not isinstance(actions, list) or len(actions) != len(starts) or len(expected) != len(actions):
+            raise ValueError("task_info action count mismatch")
+        for action, start, end, subtask in zip(actions, starts, ends, expected, strict=True):
+            if not isinstance(action, dict) or set(action) != {
+                "start_frame", "end_frame", "action_text", "skill"
+            }:
+                raise ValueError("task_info action schema mismatch")
+            action_text = _string(action, "action_text")
+            text_is_valid = (
+                valid_augmented_text(action_text, subtask.text, augmentation_language)
+                if augmentation_language is not None
+                else action_text == subtask.text
+            )
+            if (
+                _integer(action, "start_frame", minimum=0) != start
+                or _integer(action, "end_frame", minimum=1) != end
+                or end <= start
+                or not text_is_valid
+                or _string(action, "skill") != subtask.skill
+            ):
+                raise ValueError("task_info action differs from annotation/template")
+
+
+def _stats_profiles(
+    published: Mapping[str, Any], expected_features: set[str]
+) -> dict[str, tuple[str, ...]]:
+    if set(published) != expected_features:
+        raise ValueError("aggregate stats feature coverage mismatch")
+    result: dict[str, tuple[str, ...]] = {}
+    for feature, value in published.items():
+        if not isinstance(value, dict):
+            raise ValueError(f"stats {feature} must be an object")
+        metrics = set(value)
+        if not set(_BASIC_STAT_METRICS) <= metrics:
+            raise ValueError(f"stats {feature} metric coverage mismatch")
+        extras = metrics - set(_BASIC_STAT_METRICS)
+        if any(
+            len(metric) != 3 or not metric.startswith("q") or not metric[1:].isdigit()
+            for metric in extras
+        ):
+            raise ValueError(f"stats {feature} contains an unsupported metric")
+        quantiles = tuple(sorted(extras, key=lambda metric: int(metric[1:])))
+        result[feature] = (*_BASIC_STAT_METRICS, *quantiles)
+    return result
+
+
+def _validate_optional_splits(value: Any, total_episodes: int) -> None:
+    if value in (None, {}):
+        return
+    if not isinstance(value, dict) or not value:
+        raise ValueError("splits must be an object")
+    covered: set[int] = set()
+    for name, interval in value.items():
+        if not isinstance(name, str) or not name or not isinstance(interval, str) or interval.count(":") != 1:
+            raise ValueError("invalid split range")
+        left, right = interval.split(":")
+        if not left.isdecimal() or not right.isdecimal():
+            raise ValueError("invalid split range")
+        start, stop = int(left), int(right)
+        if not 0 <= start <= stop <= total_episodes:
+            raise ValueError("split range is outside episode indices")
+        indices = set(range(start, stop))
+        if covered & indices:
+            raise ValueError("split ranges overlap")
+        covered |= indices
+    if covered != set(range(total_episodes)):
+        raise ValueError("splits do not cover every episode exactly once")
+
+
+def _payload_files_secure(tree: SecureTree) -> set[str]:
+    result: set[str] = set()
+    for prefix, suffix in (("data", ".parquet"), ("videos", ".mp4")):
+        files = tree.files_under(prefix)
+        if not files:
+            raise ValueError(f"missing payload directory {prefix}")
+        if any(not relative.endswith(suffix) for relative in files):
+            raise ValueError("unexpected payload file type")
+        result.update(files)
+    return result
+
+
+def _read_bytes(tree: SecureTree, relative: str, limit: int, context: str) -> bytes:
+    with tree.open_file(relative, limit, context) as opened:
+        return opened.read_bytes()
+
+
+def _decode_value(value: bytes, context: str) -> Any:
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, child in pairs:
+            if key in result:
+                raise ValueError(f"duplicate key {key!r}")
+            result[key] = child
+        return result
+
+    try:
+        return json.loads(
+            value.decode("utf-8"),
+            object_pairs_hook=unique,
+            parse_constant=lambda item: (_ for _ in ()).throw(ValueError(f"nonfinite {item}")),
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"malformed {context}") from exc
+
+
+def _decode_object(value: bytes, context: str) -> dict[str, Any]:
+    decoded = _decode_value(value, context)
+    if not isinstance(decoded, dict):
+        raise ValueError(f"{context} must contain an object")
+    return decoded
+
+
+def _read_secure_value(tree: SecureTree, relative: str, context: str) -> Any:
+    return _decode_value(_read_bytes(tree, relative, _MAX_JSON_BYTES, context), context)
+
+
+def _read_secure_object(tree: SecureTree, relative: str, context: str) -> dict[str, Any]:
+    value = _read_secure_value(tree, relative, context)
+    if not isinstance(value, dict):
+        raise ValueError(f"{context} must contain an object")
+    return value
+
+
+def _secure_digest(tree: SecureTree, relative: str, context: str) -> str:
+    with tree.open_file(relative, _MAX_VIDEO_BYTES, context) as opened:
+        return opened.sha256()
+
+
+def _official_core_files(tree: SecureTree) -> set[str]:
     result = set()
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(root).as_posix()
+    for relative in tree.scan():
         if relative == "meta/lerobot_annotations.json" or relative.startswith("meta/task_info/"):
             continue
         result.add(relative)

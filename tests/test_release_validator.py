@@ -31,22 +31,22 @@ def test_release_dispatch_reads_bounded_info_exactly_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import robo_annotate.release_validator as validator
+    from robo_annotate.secure_tree import SecureFile
 
     _, work, services = _fixture(tmp_path)
     output = tmp_path / "release"
     convert_dataset(work, output, services=services)
-    original = validator._read_object
+    original = SecureFile.read_bytes
     reads = []
 
-    def counting_reader(path: Path):
-        if path == output / "meta/info.json":
-            reads.append(path)
-        return original(path)
+    def counting_reader(opened: SecureFile):
+        if opened.relative == "meta/info.json":
+            reads.append(opened.relative)
+        return original(opened)
 
-    monkeypatch.setattr(validator, "_read_object", counting_reader)
+    monkeypatch.setattr(SecureFile, "read_bytes", counting_reader)
     assert validate_release(output, services=services).valid
-    assert reads == [output / "meta/info.json"]
+    assert reads == ["meta/info.json"]
 
 
 def test_release_validator_requires_both_stats_artifacts(tmp_path: Path) -> None:

@@ -207,6 +207,41 @@ def test_v30_accepted_only_waits_for_shared_shard_repacking(
     assert not list(tmp_path.glob("accepted-only.staging-*"))
 
 
+def test_v30_accepted_only_rejects_before_any_external_side_effect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import robo_annotate.converter as converter
+    from tests.test_release_validator_v30 import accepted_v30_workspace
+
+    work, source, services = accepted_v30_workspace(tmp_path)
+    output = tmp_path / "accepted-only"
+    calls: list[str] = []
+
+    def forbidden(name: str):
+        def fail(*args, **kwargs):
+            calls.append(name)
+            raise AssertionError(f"unexpected side effect: {name}")
+
+        return fail
+
+    monkeypatch.setattr(converter, "_guard_workspace", forbidden("inspect"))
+    monkeypatch.setattr(converter, "_tree_digest", forbidden("source hash"))
+    monkeypatch.setattr(converter, "_augment_selected", forbidden("augmentation"))
+    monkeypatch.setattr(converter, "_copy_tree", forbidden("tree copy"))
+    monkeypatch.setattr(converter, "validate_release", forbidden("validation"))
+    # The rejection must not even resolve or inspect the source tree after loading
+    # the manifest.  Removing it makes accidental source access observable.
+    shutil.rmtree(source)
+
+    with pytest.raises(ValueError, match=r"shared-shard repacking"):
+        converter.convert_dataset(work, output, accepted_only=True, services=services)
+
+    assert calls == []
+    assert not output.exists()
+    assert not list(tmp_path.glob("accepted-only.staging-*"))
+
+
 def test_full_v30_conversion_rechecks_source_digest_before_publish(
     tmp_path: Path,
 ) -> None:

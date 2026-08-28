@@ -127,6 +127,10 @@ def convert_dataset(
 
     store = WorkspaceStore(work)
     manifest = store._load_manifest()  # secure bounded loader; conversion is a workspace peer.
+    if accepted_only and manifest.dataset_version == "v3.0":
+        raise ValueError(
+            "accepted-only LeRobot v3.0 publication requires shared-shard repacking"
+        )
     source = manifest.dataset_root.resolve(strict=True)
     if manifest.dataset_root.is_symlink() or not source.is_dir():
         raise ValueError("manifest source root is unsafe")
@@ -150,10 +154,6 @@ def convert_dataset(
         _copy_tree(source, staging, include_payload=not accepted_only)
         converted_at = datetime.now(UTC)
         if accepted_only:
-            if manifest.dataset_version == "v3.0":
-                raise ValueError(
-                    "accepted-only LeRobot v3.0 publication requires shared-shard repacking"
-                )
             frame_count = _rewrite_accepted_subset(
                 staging, source, out, manifest, dataset, records, converted_at, services,
                 augmented_texts,

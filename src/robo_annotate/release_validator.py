@@ -23,6 +23,7 @@ from .constraints import validate_annotation
 from .lerobot import EpisodeVideoRef, VideoProbe, probe_video, video_fps_matches
 from .models import FinalAnnotation
 from .stats import iter_video_rgb_frames, recompute_stats, recompute_video_stats
+from .secure_tree import SecureTree
 from .video import extract_frames
 
 
@@ -113,26 +114,47 @@ def validate_release(
     """Validate a converted release without consulting an annotation workspace."""
     if type(allow_legacy_sampled_image_stats) is not bool or type(deep_video_stats) is not bool:
         raise TypeError("statistics validation options must be bools")
+    svc = _services(services)
+    with SecureTree(path, "release") as release_tree:
+        release_tree.scan()
+        with release_tree.open_file("meta/info.json", _MAX_JSON, "info.json") as info_file:
+            info_bytes = info_file.read_bytes()
+        info = _decode_bytes_object(info_bytes, "info.json")
+        version = _string(info, "codebase_version")
+        if version == "v3.0":
+            if allow_legacy_sampled_image_stats:
+                raise ValueError("legacy sampled image stats apply only to LeRobot v2.1")
+            from .release_validator_v30 import _validate_v30_release_with_info
+
+            if source is None:
+                return _validate_v30_release_with_info(
+                    release_tree.path,
+                    source_root=None,
+                    services=svc,
+                    expected_output_root=_expected_output_root,
+                    deep_video_stats=deep_video_stats,
+                    info=info,
+                    release_tree=release_tree,
+                    source_tree=None,
+                    info_digest=hashlib.sha256(info_bytes).hexdigest(),
+                )
+            with SecureTree(source, "source") as source_tree:
+                source_tree.scan()
+                return _validate_v30_release_with_info(
+                    release_tree.path,
+                    source_root=source_tree.path,
+                    services=svc,
+                    expected_output_root=_expected_output_root,
+                    deep_video_stats=deep_video_stats,
+                    info=info,
+                    release_tree=release_tree,
+                    source_tree=source_tree,
+                    info_digest=hashlib.sha256(info_bytes).hexdigest(),
+                )
     root = _safe_root(path, "release")
     source_root = _safe_root(source, "source") if source is not None else None
     stats_source = _safe_root(_expected_stats_source, "stats source") if _expected_stats_source is not None else source_root
-    svc = _services(services)
     _walk_regular(root)
-    info = _read_object(root / "meta/info.json")
-    version = _string(info, "codebase_version")
-    if version == "v3.0":
-        if allow_legacy_sampled_image_stats:
-            raise ValueError("legacy sampled image stats apply only to LeRobot v2.1")
-        from .release_validator_v30 import _validate_v30_release_with_info
-
-        return _validate_v30_release_with_info(
-            root,
-            source_root=source_root,
-            services=svc,
-            expected_output_root=_expected_output_root,
-            deep_video_stats=deep_video_stats,
-            info=info,
-        )
     if version != "v2.1":
         raise ValueError(f"Unsupported LeRobot codebase_version: {version!r}")
     if allow_legacy_sampled_image_stats and deep_video_stats:
@@ -147,6 +169,17 @@ def validate_release(
         deep_video_stats=deep_video_stats,
         info=info,
     )
+
+
+def _decode_bytes_object(value: bytes, context: str) -> dict[str, Any]:
+    try:
+        text = value.decode("utf-8")
+    except UnicodeError as exc:
+        raise ValueError(f"malformed {context}") from exc
+    decoded = _decode(text, context)
+    if not isinstance(decoded, dict):
+        raise ValueError(f"{context} must contain an object")
+    return decoded
 
 
 def _validate_v21_release(

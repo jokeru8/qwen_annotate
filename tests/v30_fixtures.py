@@ -23,7 +23,7 @@ from robo_annotate.config import AnnotationConfig
 _FRAME_WIDTH = 32
 _FRAME_HEIGHT = 24
 _TASK_TEXT = "Arrange the colored blocks."
-_STAT_METRICS = ("min", "max", "mean", "std", "count")
+_STAT_METRICS = ("min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99")
 _COLOR_FRAME_CAPACITY = 1 + (255 - 16) // 20
 
 
@@ -59,22 +59,56 @@ def make_lerobot_v30_fixture(
     global_offset = 0
 
     for episode_index, length in enumerate(lengths):
-        state_values: list[tuple[float, ...]] = []
-        action_values: list[tuple[float, ...]] = []
+        numeric_values: dict[str, list[tuple[float, ...]]] = {
+            name: []
+            for name in (
+                "observation.state",
+                "action",
+                "observation.matrix",
+                "observation.enabled",
+                "timestamp",
+                "frame_index",
+                "episode_index",
+                "index",
+                "task_index",
+            )
+        }
         for frame_index in range(length):
             state = (float(episode_index), float(frame_index), float(episode_index + frame_index))
             action = (float(frame_index), float(-episode_index), float(frame_index - episode_index))
-            state_values.append(state)
-            action_values.append(action)
+            matrix = (
+                (float(episode_index), float(frame_index)),
+                (float(episode_index + frame_index), float(frame_index - episode_index)),
+            )
+            global_index = global_offset + frame_index
+            enabled = frame_index % 2 == 0
+            values = {
+                "observation.state": state,
+                "action": action,
+                "observation.matrix": tuple(value for row in matrix for value in row),
+                "observation.enabled": (float(enabled),),
+                "timestamp": (frame_index / fps,),
+                "frame_index": (float(frame_index),),
+                "episode_index": (float(episode_index),),
+                "index": (float(global_index),),
+                "task_index": (0.0,),
+            }
+            for feature, feature_value in values.items():
+                numeric_values[feature].append(feature_value)
             all_rows.append(
                 {
-                    "index": global_offset + frame_index,
-                    "episode_index": episode_index,
-                    "frame_index": frame_index,
-                    "timestamp": frame_index / fps,
-                    "task_index": 0,
                     "observation.state": state,
                     "action": action,
+                    "observation.matrix": matrix,
+                    "observation.enabled": enabled,
+                    "note": f"episode {episode_index}, frame {frame_index}",
+                    "language_persistent": [],
+                    "language_events": [],
+                    "timestamp": frame_index / fps,
+                    "frame_index": frame_index,
+                    "episode_index": episode_index,
+                    "index": global_index,
+                    "task_index": 0,
                 }
             )
 
@@ -86,8 +120,6 @@ def make_lerobot_v30_fixture(
             "data/file_index": 0,
             "dataset_from_index": global_offset,
             "dataset_to_index": global_offset + length,
-            "meta/episodes/chunk_index": 0,
-            "meta/episodes/file_index": 0,
         }
         for camera in cameras:
             row[f"videos/{camera}/chunk_index"] = 0
@@ -95,22 +127,38 @@ def make_lerobot_v30_fixture(
             row[f"videos/{camera}/from_timestamp"] = global_offset / fps
             row[f"videos/{camera}/to_timestamp"] = (global_offset + length) / fps
         episode_rows.append(row)
-        episode_numeric_values.append({"observation.state": state_values, "action": action_values})
+        episode_numeric_values.append(numeric_values)
         global_offset += length
 
     data_path = root / "data/chunk-000/file-000.parquet"
     data_path.parent.mkdir(parents=True)
     data_table = pa.table(
         {
-            "index": pa.array([row["index"] for row in all_rows], type=pa.int64()),
-            "episode_index": pa.array([row["episode_index"] for row in all_rows], type=pa.int64()),
-            "frame_index": pa.array([row["frame_index"] for row in all_rows], type=pa.int64()),
-            "timestamp": pa.array([row["timestamp"] for row in all_rows], type=pa.float64()),
-            "task_index": pa.array([row["task_index"] for row in all_rows], type=pa.int64()),
             "observation.state": pa.array(
                 [row["observation.state"] for row in all_rows], type=pa.list_(pa.float32(), 3)
             ),
             "action": pa.array([row["action"] for row in all_rows], type=pa.list_(pa.float32(), 3)),
+            "observation.matrix": pa.array(
+                [row["observation.matrix"] for row in all_rows],
+                type=pa.list_(pa.list_(pa.float32(), 2), 2),
+            ),
+            "observation.enabled": pa.array(
+                [row["observation.enabled"] for row in all_rows], type=pa.bool_()
+            ),
+            "note": pa.array([row["note"] for row in all_rows], type=pa.string()),
+            "language_persistent": pa.array(
+                [row["language_persistent"] for row in all_rows],
+                type=_language_persistent_arrow_type(),
+            ),
+            "language_events": pa.array(
+                [row["language_events"] for row in all_rows],
+                type=_language_events_arrow_type(),
+            ),
+            "timestamp": pa.array([row["timestamp"] for row in all_rows], type=pa.float32()),
+            "frame_index": pa.array([row["frame_index"] for row in all_rows], type=pa.int64()),
+            "episode_index": pa.array([row["episode_index"] for row in all_rows], type=pa.int64()),
+            "index": pa.array([row["index"] for row in all_rows], type=pa.int64()),
+            "task_index": pa.array([row["task_index"] for row in all_rows], type=pa.int64()),
         }
     )
     pq.write_table(data_table, data_path)
@@ -145,23 +193,33 @@ def make_lerobot_v30_fixture(
     episode_stats: list[dict[str, dict[str, list[float]]]] = []
     for episode_index in range(len(lengths)):
         values = episode_numeric_values[episode_index] | video_values[episode_index]
-        stats = {feature: _feature_stats(feature_values) for feature, feature_values in values.items()}
+        stats = {
+            feature: _feature_stats(feature_values, _stats_width(feature))
+            for feature, feature_values in values.items()
+        }
         episode_stats.append(stats)
         for feature, feature_stats in stats.items():
             for metric, value in feature_stats.items():
-                episode_rows[episode_index][f"stats/{feature}/{metric}"] = value
+                episode_rows[episode_index][f"stats/{feature}/{metric}"] = (
+                    value
+                    if feature not in cameras or metric == "count"
+                    else [[[channel]] for channel in value]
+                )
+        episode_rows[episode_index]["meta/episodes/chunk_index"] = 0
+        episode_rows[episode_index]["meta/episodes/file_index"] = 0
 
     episode_path = meta / "episodes/chunk-000/file-000.parquet"
     episode_path.parent.mkdir(parents=True)
     pq.write_table(pa.Table.from_pylist(episode_rows), episode_path)
 
-    all_feature_values: dict[str, list[tuple[float, ...]]] = {
-        "observation.state": [value for values in episode_numeric_values for value in values["observation.state"]],
-        "action": [value for values in episode_numeric_values for value in values["action"]],
+    stats = {
+        feature: _aggregate_feature_stats(
+            [episode_stats[index][feature] for index in range(len(lengths))]
+        )
+        for feature in episode_stats[0]
     }
     for camera in cameras:
-        all_feature_values[camera] = [value for values in video_values for value in values[camera]]
-    stats = {feature: _feature_stats(values) for feature, values in all_feature_values.items()}
+        stats[camera] = _image_stats_shape(stats[camera])
     (meta / "stats.json").write_text(json.dumps(stats, sort_keys=True), encoding="utf-8")
 
     info = {
@@ -179,11 +237,32 @@ def make_lerobot_v30_fixture(
                 "shape": [3],
                 "names": ["action_0", "action_1", "action_2"],
             },
+            "observation.matrix": {
+                "dtype": "float32",
+                "shape": [2, 2],
+                "names": [["row_0", "row_1"], ["column_0", "column_1"]],
+            },
+            "observation.enabled": {
+                "dtype": "bool",
+                "shape": [1],
+                "names": None,
+            },
+            "note": {"dtype": "string", "shape": [1], "names": None},
+            "language_persistent": {
+                "dtype": "language",
+                "shape": [1],
+                "names": None,
+            },
+            "language_events": {
+                "dtype": "language",
+                "shape": [1],
+                "names": None,
+            },
             **{
                 camera: {
                     "dtype": "video",
-                    "shape": [3, _FRAME_HEIGHT, _FRAME_WIDTH],
-                    "names": ["channels", "height", "width"],
+                    "shape": [_FRAME_HEIGHT, _FRAME_WIDTH, 3],
+                    "names": ["height", "width", "channels"],
                     "info": {
                         "video.codec": "h264",
                         "video.fps": fps,
@@ -194,13 +273,15 @@ def make_lerobot_v30_fixture(
                 }
                 for camera in cameras
             },
+            "timestamp": {"dtype": "float32", "shape": [1], "names": None},
+            "frame_index": {"dtype": "int64", "shape": [1], "names": None},
+            "episode_index": {"dtype": "int64", "shape": [1], "names": None},
+            "index": {"dtype": "int64", "shape": [1], "names": None},
+            "task_index": {"dtype": "int64", "shape": [1], "names": None},
         },
         "total_episodes": len(lengths),
         "total_frames": sum(lengths),
         "total_tasks": 1,
-        "total_videos": len(lengths) * len(cameras),
-        "total_data_files": 1,
-        "total_video_files": len(cameras),
         "chunks_size": 1000,
         "data_files_size_in_mb": 100,
         "video_files_size_in_mb": 200,
@@ -208,7 +289,7 @@ def make_lerobot_v30_fixture(
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
         "splits": {"train": f"0:{len(lengths)}"},
     }
-    (meta / "info.json").write_text(json.dumps(info, sort_keys=True), encoding="utf-8")
+    (meta / "info.json").write_text(json.dumps(info), encoding="utf-8")
     return root
 
 
@@ -298,21 +379,140 @@ def _write_video(path: Path, colors: Iterable[tuple[int, int, int]], fps: float)
             container.mux(packet)
 
 
-def _feature_stats(values: list[tuple[float, ...]]) -> dict[str, list[float]]:
+def _feature_stats(
+    values: list[tuple[float, ...]], width: int
+) -> dict[str, list[float]]:
     if not values:
         raise ValueError("statistics require at least one value")
     dimensions = len(values[0])
-    if any(len(value) != dimensions for value in values):
+    if width <= 0 or dimensions % width or any(len(value) != dimensions for value in values):
         raise ValueError("statistics require equally shaped values")
-    columns = tuple(tuple(value[dimension] for value in values) for dimension in range(dimensions))
+    samples = [value[offset : offset + width] for value in values for offset in range(0, dimensions, width)]
+    columns = tuple(tuple(value[dimension] for value in samples) for dimension in range(width))
     means = tuple(sum(column) / len(column) for column in columns)
-    return {
+    result = {
         "min": [min(column) for column in columns],
         "max": [max(column) for column in columns],
         "mean": list(means),
         "std": [math.sqrt(sum((value - mean) ** 2 for value in column) / len(column)) for column, mean in zip(columns, means, strict=True)],
-        "count": [float(len(values))],
+        "count": [len(values)],
     }
+    for quantile in (0.01, 0.10, 0.50, 0.90, 0.99):
+        result[f"q{int(quantile * 100):02d}"] = [
+            _official_histogram_quantile(column, quantile) for column in columns
+        ]
+    return result
+
+
+def _stats_width(feature: str) -> int:
+    if feature in {"observation.state", "action"} or feature.startswith("observation.images."):
+        return 3
+    if feature == "observation.matrix":
+        return 2
+    return 1
+
+
+def _image_stats_shape(stats: dict[str, list[float]]) -> dict[str, list[float]]:
+    return {
+        metric: value if metric == "count" else [[[channel]] for channel in value]
+        for metric, value in stats.items()
+    }
+
+
+def _aggregate_feature_stats(
+    values: list[dict[str, list[float]]],
+) -> dict[str, list[float]]:
+    counts = [item["count"][0] for item in values]
+    total = sum(counts)
+    width = len(values[0]["mean"])
+    means = [
+        sum(item["mean"][column] * count for item, count in zip(values, counts, strict=True))
+        / total
+        for column in range(width)
+    ]
+    variances = [
+        sum(
+            (item["std"][column] ** 2 + (item["mean"][column] - means[column]) ** 2)
+            * count
+            for item, count in zip(values, counts, strict=True)
+        )
+        / total
+        for column in range(width)
+    ]
+    result = {
+        "min": [min(item["min"][column] for item in values) for column in range(width)],
+        "max": [max(item["max"][column] for item in values) for column in range(width)],
+        "mean": means,
+        "std": [math.sqrt(value) for value in variances],
+        "count": [total],
+    }
+    for metric in _STAT_METRICS[5:]:
+        result[metric] = [
+            sum(item[metric][column] * count for item, count in zip(values, counts, strict=True))
+            / total
+            for column in range(width)
+        ]
+    return result
+
+
+def _official_histogram_quantile(values: tuple[float, ...], quantile: float) -> float:
+    """Match LeRobot v0.6.1's one-batch 5,000-bin quantile estimator."""
+    if len(values) < 2:
+        return sum(values) / len(values)
+    import numpy as np
+
+    array = np.asarray(values, dtype=np.float64)
+    minimum, maximum = float(array.min()), float(array.max())
+    edges = np.linspace(minimum - 1e-10, maximum + 1e-10, 5001)
+    histogram, _ = np.histogram(array, bins=edges)
+    cumulative = np.cumsum(histogram)
+    target = quantile * len(array)
+    index = int(np.searchsorted(cumulative, target))
+    if index == 0:
+        return float(edges[0])
+    if index >= len(cumulative):
+        return float(edges[-1])
+    count_before = cumulative[index - 1]
+    count_in_bin = cumulative[index] - count_before
+    if count_in_bin == 0:
+        return float(edges[index])
+    fraction = (target - count_before) / count_in_bin
+    return float(edges[index] + fraction * (edges[index + 1] - edges[index]))
+
+
+def _json_arrow_type() -> pa.DataType:
+    # Hugging Face ``datasets.Json`` persists through Parquet as its string
+    # storage type; LeRobot also explicitly falls back to string on older Arrow.
+    return pa.string()
+
+
+def _language_persistent_arrow_type() -> pa.ListType:
+    return pa.list_(
+        pa.struct(
+            [
+                pa.field("role", pa.string()),
+                pa.field("content", pa.string()),
+                pa.field("style", pa.string()),
+                pa.field("timestamp", pa.float32()),
+                pa.field("camera", pa.string()),
+                pa.field("tool_calls", pa.list_(_json_arrow_type())),
+            ]
+        )
+    )
+
+
+def _language_events_arrow_type() -> pa.ListType:
+    return pa.list_(
+        pa.struct(
+            [
+                pa.field("role", pa.string()),
+                pa.field("content", pa.string()),
+                pa.field("style", pa.string()),
+                pa.field("camera", pa.string()),
+                pa.field("tool_calls", pa.list_(_json_arrow_type())),
+            ]
+        )
+    )
 
 
 def _normalized_rgb(rgb: object) -> tuple[int, int, int]:

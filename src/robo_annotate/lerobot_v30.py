@@ -105,16 +105,23 @@ def inspect_v30_dataset(
         raise ValueError(f"LeRobot codebase_version must be v3.0, got {version!r}")
 
     fps = _positive_number(info, "fps", "info.json")
-    _positive_int(info, "chunks_size", "info.json")
+    chunks_size = info.get("chunks_size", 1000)
+    if type(chunks_size) is not int or chunks_size <= 0:
+        raise ValueError("Malformed info.json: chunks_size must be a positive integer")
     total_episodes = _nonnegative_int(info, "total_episodes", "info.json")
     expected_total_frames = _nonnegative_int(info, "total_frames", "info.json")
     expected_total_tasks = _nonnegative_int(info, "total_tasks", "info.json")
-    expected_total_videos = _nonnegative_int(info, "total_videos", "info.json")
-    expected_data_files = _nonnegative_int(info, "total_data_files", "info.json")
-    expected_video_files = _nonnegative_int(info, "total_video_files", "info.json")
-
-    data_template = _required_string(info, "data_path", "info.json")
-    video_template = _required_string(info, "video_path", "info.json")
+    data_template = info.get(
+        "data_path", "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+    )
+    video_template = info.get(
+        "video_path",
+        "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+    )
+    if not isinstance(data_template, str) or not data_template:
+        raise ValueError("Malformed info.json: data_path must be a nonempty string")
+    if not isinstance(video_template, str) or not video_template:
+        raise ValueError("Malformed info.json: video_path must be a nonempty string")
     _validate_template(data_template, "data_path", DATA_FIELDS)
     _validate_template(video_template, "video_path", VIDEO_FIELDS)
 
@@ -290,21 +297,6 @@ def inspect_v30_dataset(
     if total_frames != expected_total_frames:
         raise ValueError(
             f"info.total_frames is {expected_total_frames}, but episode lengths total {total_frames}"
-        )
-    expected_logical_videos = total_episodes * len(camera_keys)
-    if expected_total_videos != expected_logical_videos:
-        raise ValueError(
-            f"info.total_videos is {expected_total_videos}, expected {expected_logical_videos}"
-        )
-    if len(data_paths) != expected_data_files:
-        raise ValueError(
-            f"info.total_data_files is {expected_data_files}, but metadata references "
-            f"{len(data_paths)} data shard(s)"
-        )
-    if len(video_paths) != expected_video_files:
-        raise ValueError(
-            f"info.total_video_files is {expected_video_files}, but metadata references "
-            f"{len(video_paths)} video shard(s)"
         )
     return DatasetIndex(
         root=root,
@@ -558,10 +550,10 @@ def _validate_video_features(
             raise ValueError(
                 f"Malformed video feature {camera!r}: video.fps is {video_fps}, expected {fps}"
             )
-        if shape[-2:] != [height, width]:
+        if shape not in ([3, height, width], [height, width, 3]):
             raise ValueError(
                 f"Malformed video feature {camera!r}: shape {shape} disagrees with "
-                f"video height/width [{height}, {width}]"
+                f"official CHW/HWC shape for {height}x{width} RGB video"
             )
         result[camera] = (width, height)
     return result
@@ -661,7 +653,10 @@ def _reject_unknown_episode_columns(
         if column.startswith("stats/"):
             remainder = column[len("stats/") :]
             feature, separator, metric = remainder.rpartition("/")
-            if separator and feature in features and metric in _STAT_METRICS:
+            if separator and feature in features and (
+                metric in _STAT_METRICS
+                or (len(metric) == 3 and metric.startswith("q") and metric[1:].isdigit())
+            ):
                 continue
         raise ValueError(f"Unexpected episode metadata column {column!r}")
 
