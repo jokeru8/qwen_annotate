@@ -1045,25 +1045,48 @@ def _numeric_stats(
     features: Mapping[str, _DataFeature],
     profiles: Mapping[str, tuple[str, ...]],
 ) -> tuple[dict[str, dict[str, list[float]]], dict[int, dict[str, dict[str, list[float]]]]]:
-    by_episode: dict[int, dict[str, dict[str, list[float]]]] = {}
+    numpy_by_episode: dict[
+        int,
+        dict[str, dict[str, np.ndarray[Any, Any]]],
+    ] = {}
     for episode in episodes:
         table = tables[episode.data_path].slice(episode.data_offset, episode.length)
-        by_episode[episode.index] = {}
+        numpy_by_episode[episode.index] = {}
         for feature, declaration in features.items():
+            dtype = (
+                np.dtype(np.uint8)
+                if declaration.dtype == "image"
+                else np.dtype(declaration.dtype)
+            )
             matrix, count = _matrix(
                 table[feature],
+                dtype,
                 declaration.stats_width or 1,
                 sample_images=declaration.dtype == "image",
             )
-            by_episode[episode.index][feature] = _stats(
-                matrix, profiles[feature], count
+            numpy_by_episode[episode.index][feature] = _stats(
+                matrix,
+                profiles[feature],
+                count,
+                image=declaration.dtype == "image",
             )
-    aggregate = {
+    numpy_aggregate = {
         feature: _aggregate_stats(
-            [by_episode[episode.index][feature] for episode in episodes],
+            [numpy_by_episode[episode.index][feature] for episode in episodes],
             profiles[feature],
         )
         for feature in features
+    }
+    aggregate = {
+        feature: _stats_to_lists(stats)
+        for feature, stats in numpy_aggregate.items()
+    }
+    by_episode = {
+        episode.index: {
+            feature: _stats_to_lists(stats)
+            for feature, stats in numpy_by_episode[episode.index].items()
+        }
+        for episode in episodes
     }
     return aggregate, by_episode
 
@@ -1125,29 +1148,42 @@ def _video_stats(
             episode_values[episode_index][camera] = np.concatenate(
                 sampled_pixels[episode_index], axis=0
             )
-    by_episode = {
+    numpy_by_episode = {
         episode.index: {
             camera: _stats(
                 episode_values[episode.index][camera],
                 profiles[camera],
                 len(_sample_indices(episode.length)),
+                image=False,
             )
             for camera in cameras
         }
         for episode in episodes
     }
-    aggregate = {
+    numpy_aggregate = {
         camera: _aggregate_stats(
-            [by_episode[episode.index][camera] for episode in episodes],
+            [numpy_by_episode[episode.index][camera] for episode in episodes],
             profiles[camera],
         )
         for camera in cameras
+    }
+    aggregate = {
+        camera: _stats_to_lists(stats)
+        for camera, stats in numpy_aggregate.items()
+    }
+    by_episode = {
+        episode.index: {
+            camera: _stats_to_lists(stats)
+            for camera, stats in numpy_by_episode[episode.index].items()
+        }
+        for episode in episodes
     }
     return aggregate, by_episode
 
 
 def _matrix(
     array: pa.ChunkedArray,
+    dtype: np.dtype[Any],
     width: int,
     *,
     sample_images: bool,
@@ -1164,15 +1200,17 @@ def _matrix(
             try:
                 with Image.open(io.BytesIO(value["bytes"])) as image:
                     rgb = _downsample_rgb(np.asarray(image.convert("RGB")))
-                    rgb = rgb.astype(np.float64) / 255.0
             except Exception as exc:
                 raise ValueError("unable to decode embedded image feature") from exc
             pixels.append(rgb.reshape(-1, 3))
         return np.concatenate(pixels, axis=0), len(indices)
-    return (
-        np.asarray(combined.to_pylist(), dtype=np.float64).reshape(-1, width),
-        len(combined),
-    )
+    try:
+        matrix = np.asarray(combined.to_pylist(), dtype=dtype).reshape(-1, width)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "numeric feature values do not match their declared shape"
+        ) from exc
+    return matrix, len(combined)
 
 
 def _sample_indices(length: int) -> list[int]:
@@ -1193,30 +1231,60 @@ def _stats(
     values: np.ndarray,
     profile: Sequence[str],
     count: int,
-) -> dict[str, list[float]]:
+    *,
+    image: bool,
+) -> dict[str, np.ndarray[Any, Any]]:
     if values.ndim != 2 or not len(values) or not np.isfinite(values).all():
         raise ValueError("statistics require a nonempty finite matrix")
-    result = {
-        "min": values.min(axis=0).astype(float).tolist(),
-        "max": values.max(axis=0).astype(float).tolist(),
-        "mean": values.mean(axis=0).astype(float).tolist(),
-        "std": values.std(axis=0).astype(float).tolist(),
-        "count": [float(count)],
-    }
-    for metric in profile:
-        if metric.startswith("q"):
-            quantile = int(metric[1:]) / 100.0
-            result[metric] = [
-                _histogram_quantile(values[:, column], quantile)
-                for column in range(values.shape[1])
-            ]
+    if len(values) < 2:
+        mean = np.mean(values, axis=0)
+        result = {
+            "min": np.min(values, axis=0),
+            "max": np.max(values, axis=0),
+            "mean": mean,
+            "std": np.std(values, axis=0),
+            "count": np.array([count]),
+        }
+        for metric in profile:
+            if metric.startswith("q"):
+                result[metric] = mean.copy()
+    else:
+        batch = values.astype(
+            np.result_type(values.dtype, np.float32),
+            copy=False,
+        )
+        mean = np.mean(batch, axis=0)
+        mean_of_squares = np.mean(batch**2, axis=0)
+        result = {
+            "min": np.min(batch, axis=0),
+            "max": np.max(batch, axis=0),
+            "mean": mean,
+            "std": np.sqrt(np.maximum(0, mean_of_squares - mean**2)),
+            "count": np.array([count]),
+        }
+        for metric in profile:
+            if metric.startswith("q"):
+                quantile = int(metric[1:]) / 100.0
+                result[metric] = np.array(
+                    [
+                        _histogram_quantile(batch[:, column], quantile)
+                        for column in range(batch.shape[1])
+                    ]
+                )
+    if image:
+        result = {
+            metric: value
+            if metric == "count"
+            else value.reshape(-1, 1, 1) / 255.0
+            for metric, value in result.items()
+        }
     return result
 
 
 def _histogram_quantile(values: np.ndarray, quantile: float) -> float:
     if len(values) < 2:
         return float(values.mean())
-    minimum, maximum = float(values.min()), float(values.max())
+    minimum, maximum = values.min(), values.max()
     edges = np.linspace(minimum - 1e-10, maximum + 1e-10, 5001)
     histogram, _ = np.histogram(values, bins=edges)
     cumulative = np.cumsum(histogram)
@@ -1235,45 +1303,40 @@ def _histogram_quantile(values: np.ndarray, quantile: float) -> float:
 
 
 def _aggregate_stats(
-    values: Sequence[Mapping[str, list[float]]],
+    values: Sequence[Mapping[str, np.ndarray[Any, Any]]],
     profile: Sequence[str],
-) -> dict[str, list[float]]:
-    counts = [item["count"][0] for item in values]
-    total = sum(counts)
-    width = len(values[0]["mean"])
-    means = [
-        sum(item["mean"][column] * count for item, count in zip(values, counts, strict=True))
-        / total
-        for column in range(width)
-    ]
+) -> dict[str, np.ndarray[Any, Any]]:
+    means = np.stack([item["mean"] for item in values])
+    variances = np.stack([item["std"] ** 2 for item in values])
+    counts = np.stack([item["count"] for item in values])
+    total_count = counts.sum(axis=0)
+    while counts.ndim < means.ndim:
+        counts = np.expand_dims(counts, axis=-1)
+    total_mean = (means * counts).sum(axis=0) / total_count
+    delta_means = means - total_mean
+    total_variance = (
+        ((variances + delta_means**2) * counts).sum(axis=0) / total_count
+    )
     result = {
-        "min": [min(item["min"][column] for item in values) for column in range(width)],
-        "max": [max(item["max"][column] for item in values) for column in range(width)],
-        "mean": means,
-        "std": [
-            math.sqrt(
-                sum(
-                    (item["std"][column] ** 2 + (item["mean"][column] - means[column]) ** 2)
-                    * count
-                    for item, count in zip(values, counts, strict=True)
-                )
-                / total
-            )
-            for column in range(width)
-        ],
-        "count": [float(total)],
+        "min": np.min(np.stack([item["min"] for item in values]), axis=0),
+        "max": np.max(np.stack([item["max"] for item in values]), axis=0),
+        "mean": total_mean,
+        "std": np.sqrt(total_variance),
+        "count": total_count,
     }
     for metric in profile:
         if metric.startswith("q"):
-            result[metric] = [
-                sum(
-                    item[metric][column] * count
-                    for item, count in zip(values, counts, strict=True)
-                )
-                / total
-                for column in range(width)
-            ]
+            quantiles = np.stack([item[metric] for item in values])
+            result[metric] = (
+                (quantiles * counts).sum(axis=0) / total_count
+            )
     return result
+
+
+def _stats_to_lists(
+    stats: Mapping[str, np.ndarray[Any, Any]],
+) -> dict[str, Any]:
+    return {metric: value.tolist() for metric, value in stats.items()}
 
 
 def _row_stats(
@@ -1291,7 +1354,7 @@ def _compare_stats(
     *,
     tolerance: float,
 ) -> None:
-    width = len(actual["min"])
+    width = len(_flatten(actual["min"]))
     _validate_stats_shape(
         published,
         width,
@@ -1302,7 +1365,7 @@ def _compare_stats(
     assert isinstance(published, dict)
     for metric in actual:
         left = _flatten(published[metric])
-        right = actual[metric]
+        right = _flatten(actual[metric])
         if len(left) != len(right):
             raise ValueError(f"{context} stats shape mismatch")
         differs = any(

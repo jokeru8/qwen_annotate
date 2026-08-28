@@ -212,6 +212,16 @@ class SecureTree:
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.close()
 
+    @property
+    def directory_identity(self) -> tuple[int, int]:
+        """Return the stable device/inode identity of the open root directory."""
+        if self._root_fd < 0:
+            raise ValueError(f"closed secure tree: {self.label}")
+        current = _Identity.from_stat(os.fstat(self._root_fd))
+        if current != self._root_identity:
+            raise ValueError(f"{self.label} root changed during validation")
+        return current.device, current.inode
+
     def scan(self) -> tuple[str, ...]:
         if self._entries is not None:
             return tuple(sorted(self._entries))

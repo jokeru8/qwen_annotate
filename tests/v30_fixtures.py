@@ -8,12 +8,12 @@ and validator tests all have an independent source of truth.
 import hashlib
 import io
 import json
-import math
 from fractions import Fraction
 from pathlib import Path
 from typing import Iterable
 
 import av
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -259,7 +259,11 @@ def make_lerobot_v30_fixture(
     for episode_index in range(len(lengths)):
         values = episode_numeric_values[episode_index] | video_values[episode_index]
         stats = {
-            feature: _feature_stats(feature_values, _stats_width(feature))
+            feature: _feature_stats(
+                feature_values,
+                _stats_width(feature),
+                _stats_dtype(feature),
+            )
             for feature, feature_values in values.items()
         }
         episode_stats.append(stats)
@@ -449,26 +453,32 @@ def _write_video(path: Path, colors: Iterable[tuple[int, int, int]], fps: float)
 
 
 def _feature_stats(
-    values: list[tuple[float, ...]], width: int
+    values: list[tuple[float, ...]],
+    width: int,
+    dtype: np.dtype,
 ) -> dict[str, list[float]]:
     if not values:
         raise ValueError("statistics require at least one value")
     dimensions = len(values[0])
     if width <= 0 or dimensions % width or any(len(value) != dimensions for value in values):
         raise ValueError("statistics require equally shaped values")
-    samples = [value[offset : offset + width] for value in values for offset in range(0, dimensions, width)]
-    columns = tuple(tuple(value[dimension] for value in samples) for dimension in range(width))
-    means = tuple(sum(column) / len(column) for column in columns)
+    samples = np.asarray(values, dtype=dtype).reshape(-1, width)
+    batch = samples.astype(np.result_type(samples.dtype, np.float32), copy=False)
+    means = np.mean(batch, axis=0)
+    mean_of_squares = np.mean(batch**2, axis=0)
     result = {
-        "min": [min(column) for column in columns],
-        "max": [max(column) for column in columns],
-        "mean": list(means),
-        "std": [math.sqrt(sum((value - mean) ** 2 for value in column) / len(column)) for column, mean in zip(columns, means, strict=True)],
+        "min": np.min(batch, axis=0).tolist(),
+        "max": np.max(batch, axis=0).tolist(),
+        "mean": means.tolist(),
+        "std": np.sqrt(
+            np.maximum(0, mean_of_squares - means**2)
+        ).tolist(),
         "count": [len(values)],
     }
     for quantile in (0.01, 0.10, 0.50, 0.90, 0.99):
         result[f"q{int(quantile * 100):02d}"] = [
-            _official_histogram_quantile(column, quantile) for column in columns
+            _official_histogram_quantile(batch[:, column], quantile)
+            for column in range(width)
         ]
     return result
 
@@ -481,6 +491,21 @@ def _stats_width(feature: str) -> int:
     return 1
 
 
+def _stats_dtype(feature: str) -> np.dtype:
+    if feature.startswith("observation.images."):
+        return np.dtype(np.float64)
+    if feature in {
+        "observation.state",
+        "action",
+        "observation.matrix",
+        "timestamp",
+    }:
+        return np.dtype(np.float32)
+    if feature == "observation.enabled":
+        return np.dtype(np.bool_)
+    return np.dtype(np.int64)
+
+
 def _image_stats_shape(stats: dict[str, list[float]]) -> dict[str, list[float]]:
     return {
         metric: value if metric == "count" else [[[channel]] for channel in value]
@@ -491,47 +516,36 @@ def _image_stats_shape(stats: dict[str, list[float]]) -> dict[str, list[float]]:
 def _aggregate_feature_stats(
     values: list[dict[str, list[float]]],
 ) -> dict[str, list[float]]:
-    counts = [item["count"][0] for item in values]
-    total = sum(counts)
-    width = len(values[0]["mean"])
-    means = [
-        sum(item["mean"][column] * count for item, count in zip(values, counts, strict=True))
-        / total
-        for column in range(width)
-    ]
-    variances = [
-        sum(
-            (item["std"][column] ** 2 + (item["mean"][column] - means[column]) ** 2)
-            * count
-            for item, count in zip(values, counts, strict=True)
-        )
-        / total
-        for column in range(width)
-    ]
+    means = np.stack([item["mean"] for item in values])
+    variances = np.stack([np.square(item["std"]) for item in values])
+    counts = np.stack([item["count"] for item in values])
+    total = counts.sum(axis=0)
+    while counts.ndim < means.ndim:
+        counts = np.expand_dims(counts, axis=-1)
+    total_mean = (means * counts).sum(axis=0) / total
+    delta_means = means - total_mean
+    total_variance = (
+        ((variances + delta_means**2) * counts).sum(axis=0) / total
+    )
     result = {
-        "min": [min(item["min"][column] for item in values) for column in range(width)],
-        "max": [max(item["max"][column] for item in values) for column in range(width)],
-        "mean": means,
-        "std": [math.sqrt(value) for value in variances],
-        "count": [total],
+        "min": np.min(np.stack([item["min"] for item in values]), axis=0).tolist(),
+        "max": np.max(np.stack([item["max"] for item in values]), axis=0).tolist(),
+        "mean": total_mean.tolist(),
+        "std": np.sqrt(total_variance).tolist(),
+        "count": total.tolist(),
     }
     for metric in _STAT_METRICS[5:]:
-        result[metric] = [
-            sum(item[metric][column] * count for item, count in zip(values, counts, strict=True))
-            / total
-            for column in range(width)
-        ]
+        quantiles = np.stack([item[metric] for item in values])
+        result[metric] = ((quantiles * counts).sum(axis=0) / total).tolist()
     return result
 
 
-def _official_histogram_quantile(values: tuple[float, ...], quantile: float) -> float:
+def _official_histogram_quantile(values: np.ndarray, quantile: float) -> float:
     """Match LeRobot v0.6.1's one-batch 5,000-bin quantile estimator."""
     if len(values) < 2:
         return sum(values) / len(values)
-    import numpy as np
-
-    array = np.asarray(values, dtype=np.float64)
-    minimum, maximum = float(array.min()), float(array.max())
+    array = np.asarray(values)
+    minimum, maximum = array.min(), array.max()
     edges = np.linspace(minimum - 1e-10, maximum + 1e-10, 5001)
     histogram, _ = np.histogram(array, bins=edges)
     cumulative = np.cumsum(histogram)

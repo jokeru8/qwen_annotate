@@ -1,8 +1,10 @@
 import io
 import json
 import math
+import os
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -289,13 +291,17 @@ def test_all_selected_numeric_stats_match_pinned_fixture_metadata(
     ).to_pylist()
     for feature, actual in result.aggregate_stats.items():
         for metric, values in actual.items():
-            assert values == pytest.approx(expected_aggregate[feature][metric])
+            assert values == pytest.approx(
+                expected_aggregate[feature][metric],
+                rel=1e-6,
+                abs=1e-6,
+            )
         for episode_index, episode in result.episode_stats.items():
             for metric, values in episode[feature].items():
                 expected = expected_episodes[episode_index][
                     f"stats/{feature}/{metric}"
                 ]
-                assert values == pytest.approx(expected)
+                assert values == pytest.approx(expected, rel=1e-6, abs=1e-6)
 
 
 def test_preserves_embedded_image_feature_and_recomputes_rgb_stats(
@@ -352,10 +358,72 @@ def test_preserves_embedded_image_feature_and_recomputes_rgb_stats(
     output = pq.read_table(result.parquet_files[0])
     assert output.schema.field(name).type.equals(image_type)
     assert output[name].to_pylist()[0]["bytes"] == encoded.getvalue()
-    assert result.aggregate_stats[name]["mean"] == pytest.approx(
-        [64 / 255, 128 / 255, 192 / 255]
-    )
+    expected_mean = [
+        [[64 / 255]],
+        [[128 / 255]],
+        [[192 / 255]],
+    ]
+    np.testing.assert_allclose(result.aggregate_stats[name]["mean"], expected_mean)
+    np.testing.assert_allclose(result.episode_stats[0][name]["mean"], expected_mean)
     assert result.aggregate_stats[name]["count"] == [5]
+    image_stats_type = pa.list_(pa.list_(pa.list_(pa.float64())))
+    episode_stat_column = pa.array(
+        [result.episode_stats[0][name]["mean"]],
+        type=image_stats_type,
+    )
+    assert episode_stat_column.type.equals(image_stats_type)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "values", "expected"),
+    [
+        (
+            "float32",
+            [10000, 10001, 9999, 10002, 10003, 9998],
+            {
+                "min": 9998.0,
+                "max": 10003.0,
+                "mean": 10000.5,
+                "std": 2.8284270763397217,
+                "q50": 10000.0009765625,
+            },
+        ),
+        (
+            "int16",
+            [30000, 30001, 29999, 30002, 30003, 29998],
+            {
+                "min": 29998.0,
+                "max": 30003.0,
+                "mean": 30000.5,
+                "std": 0.0,
+                "q50": 30000.001953125,
+            },
+        ),
+    ],
+)
+def test_matches_pinned_v061_dtype_promotion_and_cancellation_order(
+    tmp_path: Path,
+    dtype: str,
+    values: list[int],
+    expected: dict[str, float],
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    name = "observation.cancellation"
+    _add_numeric_feature(root, name, dtype, values)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+
+    result = write_v30_data_subset(
+        root,
+        tmp_path / "staging",
+        dataset,
+        [0],
+        read_v30_info(root),
+    )
+
+    stats = result.episode_stats[0][name]
+    assert stats["count"] == [6]
+    for metric, value in expected.items():
+        assert stats[metric] == pytest.approx([value], rel=0.0, abs=1e-9)
 
 
 def test_preserves_source_bytes_and_reads_parquet_only_through_descriptors(
@@ -493,6 +561,169 @@ def test_write_failure_leaves_no_published_data_or_tasks(
     assert not (staging / "meta/tasks.parquet").exists()
 
 
+@pytest.mark.parametrize("target_source", [False, True])
+def test_rejects_symlinked_staging_root_without_writing_target(
+    tmp_path: Path,
+    target_source: bool,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    sink = root if target_source else tmp_path / "outside"
+    if not target_source:
+        sink.mkdir()
+        (sink / "marker.txt").write_text("unchanged", encoding="utf-8")
+    staging = tmp_path / "staging-link"
+    staging.symlink_to(sink, target_is_directory=True)
+    before_source = source_tree_digest(root)
+    before_sink = _tree_digest(sink)
+
+    with pytest.raises(ValueError, match="symbolic link|real directory"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert source_tree_digest(root) == before_source
+    assert _tree_digest(sink) == before_sink
+
+
+def test_rejects_symlinked_intermediate_staging_component_without_writing_target(
+    tmp_path: Path,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    sink = tmp_path / "outside"
+    sink.mkdir()
+    (sink / "marker.txt").write_text("unchanged", encoding="utf-8")
+    alias = tmp_path / "staging-parent-link"
+    alias.symlink_to(sink, target_is_directory=True)
+    before_source = source_tree_digest(root)
+    before_sink = _tree_digest(sink)
+
+    with pytest.raises(ValueError, match="symbolic link|real directory"):
+        write_v30_data_subset(
+            root,
+            alias / "staging",
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert source_tree_digest(root) == before_source
+    assert _tree_digest(sink) == before_sink
+
+
+@pytest.mark.parametrize("component", ["meta", "data"])
+def test_rejects_symlinked_internal_staging_component_without_partial_output(
+    tmp_path: Path,
+    component: str,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    sink = tmp_path / "outside"
+    sink.mkdir()
+    (sink / "marker.txt").write_text("unchanged", encoding="utf-8")
+    (staging / component).symlink_to(sink, target_is_directory=True)
+    before_source = source_tree_digest(root)
+    before_sink = _tree_digest(sink)
+
+    with pytest.raises(ValueError, match="symbolic link|unsafe staging"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert source_tree_digest(root) == before_source
+    assert _tree_digest(sink) == before_sink
+    if component == "data":
+        assert (staging / "data").is_symlink()
+    else:
+        assert not (staging / "data").exists()
+
+
+def test_component_replacement_during_publication_is_detected_and_rolled_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    (staging / "meta").mkdir(parents=True)
+    sink = tmp_path / "outside"
+    sink.mkdir()
+    (sink / "marker.txt").write_text("unchanged", encoding="utf-8")
+    before_source = source_tree_digest(root)
+    before_sink = _tree_digest(sink)
+    actual_replace = os.replace
+    publications = 0
+
+    def replace_then_swap_meta(*args: object, **kwargs: object) -> None:
+        nonlocal publications
+        actual_replace(*args, **kwargs)
+        publications += 1
+        if publications == 1:
+            actual_replace(staging / "meta", staging / "displaced-meta")
+            (staging / "meta").symlink_to(sink, target_is_directory=True)
+
+    monkeypatch.setattr(v30_data_writer.os, "replace", replace_then_swap_meta)
+    with pytest.raises(ValueError, match="changed during publication"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert source_tree_digest(root) == before_source
+    assert _tree_digest(sink) == before_sink
+    assert not (staging / "data").exists()
+    assert not (staging / "displaced-meta/tasks.parquet").exists()
+
+
+def test_source_change_after_staging_publication_is_detected_and_rolled_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    info_path = root / "meta/info.json"
+    original_info = info_path.read_bytes()
+    actual_replace = os.replace
+    publications = 0
+
+    def replace_then_change_source(*args: object, **kwargs: object) -> None:
+        nonlocal publications
+        actual_replace(*args, **kwargs)
+        publications += 1
+        if publications == 2:
+            info_path.write_bytes(original_info + b" ")
+
+    monkeypatch.setattr(v30_data_writer.os, "replace", replace_then_change_source)
+    try:
+        with pytest.raises(ValueError, match="source.*changed"):
+            write_v30_data_subset(
+                root,
+                staging,
+                dataset,
+                [0],
+                read_v30_info(root),
+            )
+        assert not (staging / "data").exists()
+        assert not (staging / "meta/tasks.parquet").exists()
+    finally:
+        info_path.write_bytes(original_info)
+
+
 def _add_second_task(
     root: Path,
     *,
@@ -566,6 +797,52 @@ def _move_final_episode_to_second_data_shard(root: Path) -> None:
         pa.array(values, type=episodes.schema.field(position).type),
     )
     pq.write_table(episodes, episode_path)
+
+
+def _add_numeric_feature(
+    root: Path,
+    name: str,
+    dtype: str,
+    first_episode_values: list[int],
+) -> None:
+    data_path = root / "data/chunk-000/file-000.parquet"
+    data = pq.read_table(data_path)
+    values = [
+        first_episode_values[index % len(first_episode_values)]
+        for index in range(data.num_rows)
+    ]
+    arrow_type = {
+        "float32": pa.float32(),
+        "int16": pa.int16(),
+    }[dtype]
+    data = data.add_column(
+        data.schema.get_field_index("timestamp"),
+        name,
+        pa.array(values, type=arrow_type),
+    )
+    pq.write_table(data, data_path)
+
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    features = {}
+    for feature, declaration in info["features"].items():
+        if feature == "timestamp":
+            features[name] = {"dtype": dtype, "shape": [1], "names": None}
+        features[feature] = declaration
+    info["features"] = features
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    stats_path = root / "meta/stats.json"
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    stats[name] = {
+        metric: ([19] if metric == "count" else [0.0])
+        for metric in stats["action"]
+    }
+    stats_path.write_text(json.dumps(stats), encoding="utf-8")
+
+
+def _tree_digest(root: Path) -> str:
+    return source_tree_digest(root)
 
 
 def _schema_with_metadata(

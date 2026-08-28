@@ -6,11 +6,11 @@ import io
 import json
 import math
 import os
-import shutil
+import secrets
+import stat
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
@@ -26,6 +26,19 @@ _MAX_PARQUET_BYTES = 1024 * 1024 * 1024
 _MAX_JSON_BYTES = 16 * 1024 * 1024
 _OFFICIAL_INDEX_COLUMNS = ("episode_index", "frame_index", "index", "task_index")
 _BASIC_STAT_METRICS = ("min", "max", "mean", "std", "count")
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+_OUTPUT_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+StatValue = list[int | float] | list[list[list[float]]]
+FeatureStats = dict[str, StatValue]
 
 
 @dataclass(frozen=True)
@@ -50,8 +63,8 @@ class V30DataWriteResult:
     task_table: pa.Table
     parquet_files: tuple[Path, ...]
     total_frames: int
-    aggregate_stats: dict[str, dict[str, list[int | float]]]
-    episode_stats: dict[int, dict[str, dict[str, list[int | float]]]]
+    aggregate_stats: dict[str, FeatureStats]
+    episode_stats: dict[int, dict[str, FeatureStats]]
 
 
 def write_v30_data_subset(
@@ -142,8 +155,14 @@ def write_v30_data_subset(
         )
         task_table = _compact_task_table(tasks, task_order)
         tree.verify()
+        parquet_files = _publish(
+            staging,
+            packed,
+            task_table,
+            chunks_size,
+            source_tree=tree,
+        )
 
-    parquet_files = _publish(staging, packed, task_table, chunks_size)
     return V30DataWriteResult(
         placements=placements,
         task_table=task_table,
@@ -411,15 +430,15 @@ def _numeric_stats(
     info: Mapping[str, Any],
     profiles: Mapping[str, tuple[str, ...]],
 ) -> tuple[
-    dict[str, dict[str, list[int | float]]],
-    dict[int, dict[str, dict[str, list[int | float]]]],
+    dict[str, FeatureStats],
+    dict[int, dict[str, FeatureStats]],
 ]:
     if not tables:
         raise ValueError("numeric statistics require selected episode tables")
     features = info.get("features")
     if not isinstance(features, Mapping):
         raise ValueError("info.features must be an object")
-    specs: dict[str, tuple[str, int]] = {}
+    specs: dict[str, tuple[np.dtype[Any], int, bool]] = {}
     columns = set(tables[0].column_names)
     for name, profile in profiles.items():
         declaration = features.get(name)
@@ -434,7 +453,7 @@ def _numeric_stats(
         if dtype == "image":
             if len(shape) != 3 or (shape[0] != 3 and shape[-1] != 3):
                 raise ValueError(f"embedded image feature must declare an RGB shape: {name}")
-            specs[name] = (dtype, 3)
+            specs[name] = (np.dtype(np.uint8), 3, True)
             continue
         try:
             numpy_dtype = np.dtype(dtype)
@@ -442,37 +461,49 @@ def _numeric_stats(
             raise ValueError(f"unsupported numeric feature dtype: {name}") from exc
         if numpy_dtype.kind not in "biuf":
             raise ValueError(f"unsupported numeric feature dtype: {name}")
-        specs[name] = (dtype, shape[-1])
+        specs[name] = (numpy_dtype, shape[-1], False)
         if not profile:
             raise ValueError(f"numeric stats profile is empty for {name}")
 
-    episode_stats: dict[int, dict[str, dict[str, list[int | float]]]] = {}
+    numpy_episode_stats: dict[int, dict[str, dict[str, np.ndarray[Any, Any]]]] = {}
     for episode_index, table in enumerate(tables):
-        episode_stats[episode_index] = {}
-        for name, (dtype, width) in specs.items():
+        numpy_episode_stats[episode_index] = {}
+        for name, (dtype, width, is_image) in specs.items():
             matrix, count = _numeric_matrix(
                 table[name],
+                dtype,
                 width,
-                sample_images=dtype == "image",
+                sample_images=is_image,
             )
-            episode_stats[episode_index][name] = _feature_stats(
+            numpy_episode_stats[episode_index][name] = _feature_stats(
                 matrix,
                 profiles[name],
                 count,
+                image=is_image,
             )
 
-    aggregate = {
+    numpy_aggregate = {
         name: _aggregate_feature_stats(
-            [episode_stats[index][name] for index in range(len(tables))],
+            [numpy_episode_stats[index][name] for index in range(len(tables))],
             profiles[name],
         )
         for name in specs
+    }
+    aggregate = {
+        name: _stats_to_lists(stats) for name, stats in numpy_aggregate.items()
+    }
+    episode_stats = {
+        episode_index: {
+            name: _stats_to_lists(stats) for name, stats in features.items()
+        }
+        for episode_index, features in numpy_episode_stats.items()
     }
     return aggregate, episode_stats
 
 
 def _numeric_matrix(
     array: pa.ChunkedArray,
+    dtype: np.dtype[Any],
     width: int,
     *,
     sample_images: bool,
@@ -493,10 +524,10 @@ def _numeric_matrix(
                     rgb = _downsample_rgb(np.asarray(image.convert("RGB")))
             except Exception as exc:
                 raise ValueError("unable to decode embedded image feature") from exc
-            pixels.append(rgb.astype(np.float64).reshape(-1, 3) / 255.0)
+            pixels.append(rgb.reshape(-1, 3))
         return np.concatenate(pixels, axis=0), len(indices)
     try:
-        matrix = np.asarray(combined.to_pylist(), dtype=np.float64).reshape(-1, width)
+        matrix = np.asarray(combined.to_pylist(), dtype=dtype).reshape(-1, width)
     except (TypeError, ValueError) as exc:
         raise ValueError("numeric feature values do not match their declared shape") from exc
     return matrix, len(combined)
@@ -524,30 +555,57 @@ def _feature_stats(
     values: np.ndarray,
     profile: Sequence[str],
     count: int,
-) -> dict[str, list[int | float]]:
+    *,
+    image: bool,
+) -> dict[str, np.ndarray[Any, Any]]:
     if values.ndim != 2 or not len(values) or not np.isfinite(values).all():
         raise ValueError("statistics require a nonempty finite numeric matrix")
-    result: dict[str, list[int | float]] = {
-        "min": values.min(axis=0).astype(float).tolist(),
-        "max": values.max(axis=0).astype(float).tolist(),
-        "mean": values.mean(axis=0).astype(float).tolist(),
-        "std": values.std(axis=0).astype(float).tolist(),
-        "count": [count],
-    }
-    for metric in profile:
-        if metric.startswith("q"):
-            quantile = int(metric[1:]) / 100.0
-            result[metric] = [
-                _histogram_quantile(values[:, column], quantile)
-                for column in range(values.shape[1])
-            ]
+    if len(values) < 2:
+        mean = np.mean(values, axis=0)
+        result = {
+            "min": np.min(values, axis=0),
+            "max": np.max(values, axis=0),
+            "mean": mean,
+            "std": np.std(values, axis=0),
+            "count": np.array([count]),
+        }
+        for metric in profile:
+            if metric.startswith("q"):
+                result[metric] = mean.copy()
+    else:
+        batch = values.astype(np.result_type(values.dtype, np.float32), copy=False)
+        mean = np.mean(batch, axis=0)
+        mean_of_squares = np.mean(batch**2, axis=0)
+        result = {
+            "min": np.min(batch, axis=0),
+            "max": np.max(batch, axis=0),
+            "mean": mean,
+            "std": np.sqrt(np.maximum(0, mean_of_squares - mean**2)),
+            "count": np.array([count]),
+        }
+        for metric in profile:
+            if metric.startswith("q"):
+                quantile = int(metric[1:]) / 100.0
+                result[metric] = np.array(
+                    [
+                        _histogram_quantile(batch[:, column], quantile)
+                        for column in range(batch.shape[1])
+                    ]
+                )
+    if image:
+        result = {
+            metric: value
+            if metric == "count"
+            else value.reshape(-1, 1, 1) / 255.0
+            for metric, value in result.items()
+        }
     return result
 
 
 def _histogram_quantile(values: np.ndarray, quantile: float) -> float:
     if len(values) < 2:
         return float(values.mean())
-    minimum, maximum = float(values.min()), float(values.max())
+    minimum, maximum = values.min(), values.max()
     edges = np.linspace(minimum - 1e-10, maximum + 1e-10, 5001)
     histogram, _ = np.histogram(values, bins=edges)
     cumulative = np.cumsum(histogram)
@@ -566,57 +624,362 @@ def _histogram_quantile(values: np.ndarray, quantile: float) -> float:
 
 
 def _aggregate_feature_stats(
-    values: Sequence[Mapping[str, list[int | float]]],
+    values: Sequence[Mapping[str, np.ndarray[Any, Any]]],
     profile: Sequence[str],
-) -> dict[str, list[int | float]]:
-    counts = [int(item["count"][0]) for item in values]
-    total = sum(counts)
-    width = len(values[0]["mean"])
-    means = [
-        sum(
-            float(item["mean"][column]) * count
-            for item, count in zip(values, counts, strict=True)
-        )
-        / total
-        for column in range(width)
-    ]
-    result: dict[str, list[int | float]] = {
-        "min": [
-            min(float(item["min"][column]) for item in values)
-            for column in range(width)
-        ],
-        "max": [
-            max(float(item["max"][column]) for item in values)
-            for column in range(width)
-        ],
-        "mean": means,
-        "std": [
-            math.sqrt(
-                sum(
-                    (
-                        float(item["std"][column]) ** 2
-                        + (float(item["mean"][column]) - means[column]) ** 2
-                    )
-                    * count
-                    for item, count in zip(values, counts, strict=True)
-                )
-                / total
-            )
-            for column in range(width)
-        ],
-        "count": [total],
+) -> dict[str, np.ndarray[Any, Any]]:
+    means = np.stack([item["mean"] for item in values])
+    variances = np.stack([item["std"] ** 2 for item in values])
+    counts = np.stack([item["count"] for item in values])
+    total_count = counts.sum(axis=0)
+    while counts.ndim < means.ndim:
+        counts = np.expand_dims(counts, axis=-1)
+    total_mean = (means * counts).sum(axis=0) / total_count
+    delta_means = means - total_mean
+    total_variance = (
+        ((variances + delta_means**2) * counts).sum(axis=0) / total_count
+    )
+    result = {
+        "min": np.min(np.stack([item["min"] for item in values]), axis=0),
+        "max": np.max(np.stack([item["max"] for item in values]), axis=0),
+        "mean": total_mean,
+        "std": np.sqrt(total_variance),
+        "count": total_count,
     }
     for metric in profile:
         if metric.startswith("q"):
-            result[metric] = [
-                sum(
-                    float(item[metric][column]) * count
-                    for item, count in zip(values, counts, strict=True)
-                )
-                / total
-                for column in range(width)
-            ]
+            quantile_values = np.stack([item[metric] for item in values])
+            result[metric] = (quantile_values * counts).sum(axis=0) / total_count
     return result
+
+
+def _stats_to_lists(stats: Mapping[str, np.ndarray[Any, Any]]) -> FeatureStats:
+    return {metric: value.tolist() for metric, value in stats.items()}
+
+
+@dataclass(frozen=True)
+class _EntryIdentity:
+    device: int
+    inode: int
+    mode: int
+
+    @classmethod
+    def from_stat(cls, value: os.stat_result) -> "_EntryIdentity":
+        return cls(value.st_dev, value.st_ino, value.st_mode)
+
+    @property
+    def directory_key(self) -> tuple[int, int]:
+        return self.device, self.inode
+
+
+class _AnchoredDirectoryPath:
+    """Hold every component of an absolute directory path open and verified."""
+
+    def __init__(
+        self,
+        path: Path,
+        label: str,
+        descriptors: list[int],
+        names: list[str],
+        identities: list[_EntryIdentity],
+        created_final: bool,
+    ) -> None:
+        self.path = path
+        self.label = label
+        self._descriptors = descriptors
+        self._names = names
+        self._identities = identities
+        self.created_final = created_final
+
+    @classmethod
+    def open(
+        cls,
+        path: Path,
+        label: str,
+        *,
+        create_final: bool,
+    ) -> "_AnchoredDirectoryPath":
+        absolute = Path(os.path.abspath(path))
+        components = absolute.parts[1:]
+        if not components:
+            raise ValueError(f"{label} must not be the filesystem root")
+        descriptors = [os.open("/", _DIRECTORY_FLAGS)]
+        names: list[str] = []
+        identities = [_directory_identity(os.fstat(descriptors[0]), label)]
+        created_final_component = False
+        created_parent_fd: int | None = None
+        created_name = ""
+        try:
+            for position, component in enumerate(components):
+                parent_fd = descriptors[-1]
+                try:
+                    before = os.stat(
+                        component,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileNotFoundError:
+                    if not create_final or position != len(components) - 1:
+                        raise ValueError(
+                            f"{label} parent components must already exist"
+                        ) from None
+                    os.mkdir(component, 0o700, dir_fd=parent_fd)
+                    created_final_component = True
+                    created_parent_fd = parent_fd
+                    created_name = component
+                    before = os.stat(
+                        component,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                expected = _directory_identity(before, label)
+                child_fd = os.open(component, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+                opened = _directory_identity(os.fstat(child_fd), label)
+                current = _directory_identity(
+                    os.stat(
+                        component,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    ),
+                    label,
+                )
+                if expected != opened or opened != current:
+                    os.close(child_fd)
+                    raise ValueError(f"{label} changed while opening")
+                descriptors.append(child_fd)
+                names.append(component)
+                identities.append(opened)
+            return cls(
+                absolute,
+                label,
+                descriptors,
+                names,
+                identities,
+                created_final_component,
+            )
+        except (OSError, ValueError) as exc:
+            if created_parent_fd is not None:
+                try:
+                    os.rmdir(created_name, dir_fd=created_parent_fd)
+                except OSError:
+                    pass
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+            if isinstance(exc, ValueError):
+                raise
+            raise ValueError(f"unable to anchor {label}") from exc
+
+    @property
+    def descriptor(self) -> int:
+        return self._descriptors[-1]
+
+    @property
+    def identity(self) -> _EntryIdentity:
+        return self._identities[-1]
+
+    @property
+    def ancestry(self) -> tuple[tuple[int, int], ...]:
+        return tuple(identity.directory_key for identity in self._identities)
+
+    def verify(self, context: str) -> None:
+        if len(self._descriptors) != len(self._identities):
+            raise ValueError(f"closed {self.label}")
+        if _directory_identity(
+            os.fstat(self._descriptors[0]), self.label
+        ) != self._identities[0]:
+            raise ValueError(f"{self.label} changed during {context}")
+        for index, name in enumerate(self._names):
+            expected = self._identities[index + 1]
+            try:
+                entry = _directory_identity(
+                    os.stat(
+                        name,
+                        dir_fd=self._descriptors[index],
+                        follow_symlinks=False,
+                    ),
+                    self.label,
+                )
+                opened = _directory_identity(
+                    os.fstat(self._descriptors[index + 1]), self.label
+                )
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"{self.label} changed during {context}") from exc
+            if entry != expected or opened != expected:
+                raise ValueError(f"{self.label} changed during {context}")
+
+    def remove_created_final(self) -> None:
+        if not self.created_final:
+            return
+        parent_fd = self._descriptors[-2]
+        name = self._names[-1]
+        try:
+            current = _directory_identity(
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False),
+                self.label,
+            )
+            if current == self.identity:
+                os.rmdir(name, dir_fd=parent_fd)
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+
+    def close(self) -> None:
+        for descriptor in reversed(self._descriptors):
+            os.close(descriptor)
+        self._descriptors.clear()
+
+
+@dataclass
+class _ChildDirectory:
+    parent_fd: int
+    name: str
+    descriptor: int
+    identity: _EntryIdentity
+    context: str
+    created: bool
+
+    def verify(self, phase: str) -> None:
+        try:
+            entry = _directory_identity(
+                os.stat(
+                    self.name,
+                    dir_fd=self.parent_fd,
+                    follow_symlinks=False,
+                ),
+                self.context,
+            )
+            opened = _directory_identity(os.fstat(self.descriptor), self.context)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{self.context} changed during {phase}") from exc
+        if entry != self.identity or opened != self.identity:
+            raise ValueError(f"{self.context} changed during {phase}")
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+
+
+def _directory_identity(value: os.stat_result, context: str) -> _EntryIdentity:
+    if stat.S_ISLNK(value.st_mode):
+        raise ValueError(f"{context} path contains a symbolic link")
+    if not stat.S_ISDIR(value.st_mode):
+        raise ValueError(f"{context} path must contain only real directories")
+    return _EntryIdentity.from_stat(value)
+
+
+def _open_or_create_child_directory(
+    parent_fd: int,
+    name: str,
+    context: str,
+) -> _ChildDirectory:
+    created = False
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        created = True
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    expected = _directory_identity(before, context)
+    try:
+        descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+        opened = _directory_identity(os.fstat(descriptor), context)
+        current = _directory_identity(
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False),
+            context,
+        )
+        if expected != opened or opened != current:
+            os.close(descriptor)
+            raise ValueError(f"{context} changed while opening")
+    except (OSError, ValueError) as exc:
+        if created:
+            try:
+                os.rmdir(name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        if isinstance(exc, ValueError):
+            raise
+        raise ValueError(f"unable to open {context}") from exc
+    return _ChildDirectory(
+        parent_fd,
+        name,
+        descriptor,
+        expected,
+        context,
+        created,
+    )
+
+
+def _create_private_child_directory(
+    parent_fd: int,
+    prefix: str,
+    context: str,
+) -> _ChildDirectory:
+    for _ in range(100):
+        name = prefix + secrets.token_hex(12)
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        return _open_or_create_child_directory(parent_fd, name, context)
+    raise ValueError(f"unable to create {context}")
+
+
+def _entry_at(parent_fd: int, name: str) -> _EntryIdentity | None:
+    try:
+        return _EntryIdentity.from_stat(
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        )
+    except FileNotFoundError:
+        return None
+
+
+def _write_parquet_at(parent_fd: int, name: str, table: pa.Table) -> _EntryIdentity:
+    try:
+        descriptor = os.open(name, _OUTPUT_FLAGS, 0o600, dir_fd=parent_fd)
+    except OSError as exc:
+        raise ValueError(f"unable to create staged parquet {name}") from exc
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            pq.write_table(table, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(current.st_mode):
+            raise ValueError(f"staged parquet is not a regular file: {name}")
+        return _EntryIdentity.from_stat(current)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _remove_tree_at(
+    parent_fd: int,
+    name: str,
+    expected: _EntryIdentity,
+) -> None:
+    current = _entry_at(parent_fd, name)
+    if current is None or current != expected:
+        return
+    if not stat.S_ISDIR(current.mode):
+        os.unlink(name, dir_fd=parent_fd)
+        return
+    descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    try:
+        if _EntryIdentity.from_stat(os.fstat(descriptor)) != expected:
+            return
+        for child in os.listdir(descriptor):
+            child_identity = _entry_at(descriptor, child)
+            if child_identity is not None:
+                _remove_tree_at(descriptor, child, child_identity)
+    finally:
+        os.close(descriptor)
+    if _entry_at(parent_fd, name) == expected:
+        os.rmdir(name, dir_fd=parent_fd)
 
 
 def _publish(
@@ -624,59 +987,176 @@ def _publish(
     packed: Sequence[pa.Table],
     task_table: pa.Table,
     chunks_size: int,
+    *,
+    source_tree: SecureTree,
 ) -> tuple[Path, ...]:
-    staging_preexisted = staging.exists()
-    staging.mkdir(parents=True, exist_ok=True)
-    data_target = staging / "data"
-    meta_target = staging / "meta"
-    tasks_target = meta_target / "tasks.parquet"
-    if data_target.exists() or tasks_target.exists():
-        raise FileExistsError("staging already contains v3 data output")
-    meta_preexisted = meta_target.exists()
-    published_data = False
-    published_tasks = False
+    source_anchor: _AnchoredDirectoryPath | None = None
+    staging_anchor: _AnchoredDirectoryPath | None = None
+    meta: _ChildDirectory | None = None
+    bundle: _ChildDirectory | None = None
+    data_identity: _EntryIdentity | None = None
+    tasks_identity: _EntryIdentity | None = None
+    data_published = False
+    tasks_published = False
+    success = False
     try:
-        with TemporaryDirectory(prefix=".v30-data-", dir=staging) as temporary:
-            bundle = Path(temporary)
-            temporary_data = bundle / "data"
-            temporary_tasks = bundle / "tasks.parquet"
+        source_anchor = _AnchoredDirectoryPath.open(
+            source_tree.path,
+            "source path",
+            create_final=False,
+        )
+        if source_anchor.identity.directory_key != source_tree.directory_identity:
+            raise ValueError("source path changed before staging publication")
+        staging_anchor = _AnchoredDirectoryPath.open(
+            staging,
+            "staging path",
+            create_final=True,
+        )
+        if (
+            source_anchor.identity.directory_key in staging_anchor.ancestry
+            or staging_anchor.identity.directory_key in source_anchor.ancestry
+        ):
+            raise ValueError("staging and source directory identities overlap")
+        if _entry_at(staging_anchor.descriptor, "data") is not None:
+            raise ValueError("unsafe staging data entry already exists")
+        meta = _open_or_create_child_directory(
+            staging_anchor.descriptor,
+            "meta",
+            "staging meta",
+        )
+        if _entry_at(meta.descriptor, "tasks.parquet") is not None:
+            raise ValueError("unsafe staging tasks entry already exists")
+        bundle = _create_private_child_directory(
+            staging_anchor.descriptor,
+            ".v30-data-",
+            "staging bundle",
+        )
+        data = _open_or_create_child_directory(
+            bundle.descriptor,
+            "data",
+            "staging bundle data",
+        )
+        data_identity = data.identity
+        chunk_directories: dict[int, _ChildDirectory] = {}
+        try:
             for number, table in enumerate(packed):
-                relative = (
-                    f"chunk-{number // chunks_size:03d}/"
-                    f"file-{number % chunks_size:03d}.parquet"
+                chunk_index = number // chunks_size
+                chunk = chunk_directories.get(chunk_index)
+                if chunk is None:
+                    chunk = _open_or_create_child_directory(
+                        data.descriptor,
+                        f"chunk-{chunk_index:03d}",
+                        "staging data chunk",
+                    )
+                    chunk_directories[chunk_index] = chunk
+                _write_parquet_at(
+                    chunk.descriptor,
+                    f"file-{number % chunks_size:03d}.parquet",
+                    table,
                 )
-                path = temporary_data / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                pq.write_table(table, path)
-            pq.write_table(task_table, temporary_tasks)
-            meta_target.mkdir(exist_ok=True)
-            os.replace(temporary_data, data_target)
-            published_data = True
-            os.replace(temporary_tasks, tasks_target)
-            published_tasks = True
-    except BaseException:
-        if published_tasks:
-            try:
-                tasks_target.unlink()
-            except OSError:
-                pass
-        if published_data:
-            try:
-                shutil.rmtree(data_target)
-            except OSError:
-                pass
-        if not meta_preexisted:
-            try:
-                meta_target.rmdir()
-            except OSError:
-                pass
-        if not staging_preexisted:
-            try:
-                staging.rmdir()
-            except OSError:
-                pass
-        raise
+            tasks_identity = _write_parquet_at(
+                bundle.descriptor,
+                "tasks.parquet",
+                task_table,
+            )
+            for chunk in chunk_directories.values():
+                chunk.verify("publication")
+            data.verify("publication")
+        finally:
+            for chunk in chunk_directories.values():
+                chunk.close()
+            data.close()
+
+        staging_anchor.verify("publication")
+        meta.verify("publication")
+        bundle.verify("publication")
+        os.replace(
+            "data",
+            "data",
+            src_dir_fd=bundle.descriptor,
+            dst_dir_fd=staging_anchor.descriptor,
+        )
+        data_published = True
+        if _entry_at(staging_anchor.descriptor, "data") != data_identity:
+            raise ValueError("staging data changed during publication")
+        staging_anchor.verify("publication")
+        meta.verify("publication")
+        os.replace(
+            "tasks.parquet",
+            "tasks.parquet",
+            src_dir_fd=bundle.descriptor,
+            dst_dir_fd=meta.descriptor,
+        )
+        tasks_published = True
+        if _entry_at(meta.descriptor, "tasks.parquet") != tasks_identity:
+            raise ValueError("staging tasks changed during publication")
+        staging_anchor.verify("publication")
+        meta.verify("publication")
+        source_anchor.verify("staging publication")
+        try:
+            source_tree.verify()
+        except ValueError as exc:
+            raise ValueError("source changed during staging publication") from exc
+        staging_anchor.verify("publication")
+        meta.verify("publication")
+        if _entry_at(staging_anchor.descriptor, "data") != data_identity:
+            raise ValueError("staging data changed during publication")
+        if _entry_at(meta.descriptor, "tasks.parquet") != tasks_identity:
+            raise ValueError("staging tasks changed during publication")
+        os.fsync(meta.descriptor)
+        os.fsync(staging_anchor.descriptor)
+        success = True
+    finally:
+        if not success:
+            if tasks_published and meta is not None and tasks_identity is not None:
+                if _entry_at(meta.descriptor, "tasks.parquet") == tasks_identity:
+                    try:
+                        os.unlink("tasks.parquet", dir_fd=meta.descriptor)
+                    except OSError:
+                        pass
+            if (
+                data_published
+                and staging_anchor is not None
+                and data_identity is not None
+            ):
+                try:
+                    _remove_tree_at(
+                        staging_anchor.descriptor,
+                        "data",
+                        data_identity,
+                    )
+                except OSError:
+                    pass
+        if bundle is not None:
+            bundle.close()
+            if staging_anchor is not None:
+                try:
+                    _remove_tree_at(
+                        staging_anchor.descriptor,
+                        bundle.name,
+                        bundle.identity,
+                    )
+                except OSError:
+                    pass
+        if meta is not None:
+            meta.close()
+            if not success and meta.created and staging_anchor is not None:
+                try:
+                    if _entry_at(staging_anchor.descriptor, "meta") == meta.identity:
+                        os.rmdir("meta", dir_fd=staging_anchor.descriptor)
+                except OSError:
+                    pass
+        if staging_anchor is not None:
+            if not success:
+                staging_anchor.remove_created_final()
+            staging_anchor.close()
+        if source_anchor is not None:
+            source_anchor.close()
     return tuple(
-        staging / f"data/chunk-{number // chunks_size:03d}/file-{number % chunks_size:03d}.parquet"
+        staging
+        / (
+            f"data/chunk-{number // chunks_size:03d}/"
+            f"file-{number % chunks_size:03d}.parquet"
+        )
         for number in range(len(packed))
     )
