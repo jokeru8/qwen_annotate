@@ -265,7 +265,7 @@ def _validate_pipeline_transition_outbox(record: EpisodeRecord) -> None:
 
 class RunManifest(_StrictModel):
     dataset_root: Path
-    dataset_version: Literal["v2.1"]
+    dataset_version: Literal["v2.1", "v3.0"]
     fps: float = Field(gt=0)
     camera_keys: list[NonemptyString]
     total_episodes: int = Field(ge=0)
@@ -329,22 +329,26 @@ def compute_source_fingerprint(dataset_root: Path, episode: EpisodeInfo) -> str:
     """Hash source metadata needed to determine whether cached evidence is stale."""
     root = _absolute_root(dataset_root)
     parquet, parquet_relative = _contained_file(root, episode.data.path, "parquet")
-    parquet_stat = parquet.stat()
-    videos: list[dict[str, object]] = []
+    videos: dict[str, object] = {}
     for camera, reference in sorted(episode.videos.items()):
         video, relative = _contained_file(root, reference.path, f"video {camera!r}")
-        stat = video.stat()
-        videos.append(
-            {
-                "camera": camera,
+        videos[camera] = {
                 "path": relative.as_posix(),
-                "size": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
+                "from_timestamp": reference.from_timestamp,
+                "to_timestamp": reference.to_timestamp,
+                "fps": reference.fps,
+                "identity": _regular_file_identity(video, f"video {camera!r}"),
             }
-        )
     payload = {
-        "episode_length": episode.length,
-        "parquet": {"path": parquet_relative.as_posix(), "size": parquet_stat.st_size},
+        "episode_index": episode.episode_index,
+        "length": episode.length,
+        "task": episode.task,
+        "data": {
+            "path": parquet_relative.as_posix(),
+            "from": episode.data.dataset_from_index,
+            "to": episode.data.dataset_to_index,
+            "sha256": _sha256_file(parquet, "parquet"),
+        },
         "videos": videos,
     }
     return _canonical_sha256(payload)
@@ -1159,15 +1163,22 @@ def _redacted_endpoint(endpoint: str) -> str:
 
 
 def _contained_file(root: Path, path: Path, label: str) -> tuple[Path, Path]:
-    candidate = path.resolve(strict=False)
+    candidate = path if path.is_absolute() else root / path
+    candidate = Path(os.path.abspath(candidate))
     try:
         relative = candidate.relative_to(root)
     except ValueError as exc:
         raise ValueError(f"{label} path escapes dataset root: {path}") from exc
-    if not candidate.exists():
-        raise FileNotFoundError(f"missing {label} file: {candidate}")
-    if not candidate.is_file():
-        raise ValueError(f"{label} path is not a file: {candidate}")
+    current = root
+    for component in relative.parts:
+        current = current / component
+        try:
+            metadata = current.stat(follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"missing {label} file: {candidate}") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"{label} path must not contain symlinks: {path}")
+    _regular_file_stat(candidate, label)
     return candidate, relative
 
 
@@ -1178,6 +1189,71 @@ def _absolute_root(path: Path) -> Path:
     if not root.is_dir():
         raise ValueError(f"dataset root is not a directory: {root}")
     return root
+
+
+def _sha256_file(path: Path, label: str) -> str:
+    """Return a digest read from one no-follow regular-file descriptor."""
+    descriptor = _open_regular_file(path, label)
+    try:
+        digest = hashlib.sha256()
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _regular_file_identity(path: Path, label: str) -> dict[str, int]:
+    """Capture a stable regular-file identity without following a replacement link."""
+    before = _regular_file_stat(path, label)
+    descriptor = _open_regular_file(path, label)
+    try:
+        opened = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = _regular_file_stat(path, label)
+    if _stat_identity(before) != _stat_identity(opened) or _stat_identity(opened) != _stat_identity(after):
+        raise ValueError(f"{label} identity changed during fingerprinting: {path}")
+    return {
+        "device": opened.st_dev,
+        "inode": opened.st_ino,
+        "size": opened.st_size,
+        "mtime_ns": opened.st_mtime_ns,
+    }
+
+
+def _open_regular_file(path: Path, label: str) -> int:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise ValueError(f"unable to open {label} file without following links: {path}") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError(f"{label} path is not a file: {path}")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _regular_file_stat(path: Path, label: str) -> os.stat_result:
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"missing {label} file: {path}") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"{label} path must not be a symlink: {path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"{label} path is not a file: {path}")
+    return metadata
+
+
+def _stat_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return (metadata.st_dev, metadata.st_ino)
 
 
 def _canonical_sha256(value: Mapping[str, object]) -> str:

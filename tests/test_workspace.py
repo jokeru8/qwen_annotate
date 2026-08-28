@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from robo_annotate.coarse import CoarseDecision
 from robo_annotate.config import Subtask
-from robo_annotate.lerobot import DatasetIndex
+from robo_annotate.lerobot import DatasetIndex, inspect_dataset
 from robo_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
 from robo_annotate.prompts import PROMPT_VERSION
 from robo_annotate.refine import RefineDecision
@@ -21,6 +21,7 @@ from robo_annotate.workspace import (
     compute_source_fingerprint,
 )
 from tests.fixtures import make_config, make_episode_info, make_legacy_v4_workspace
+from tests.v30_fixtures import make_lerobot_v30_fixture, make_v30_config
 
 
 SHA = "a" * 40
@@ -650,6 +651,35 @@ def test_source_fingerprint_is_stable_and_tracks_required_dimensions(tmp_path: P
     assert compute_source_fingerprint(index.root, episode) != first
     changed_length = episode.model_copy(update={"length": 11})
     assert compute_source_fingerprint(index.root, changed_length) != compute_source_fingerprint(index.root, episode)
+
+
+def test_v30_manifest_round_trips_and_slices_change_fingerprint(tmp_path: Path) -> None:
+    """Catches shared video files being fingerprinted without their episode slice."""
+    root = make_lerobot_v30_fixture(tmp_path)
+    config = make_v30_config(root, tmp_path / "work")
+    dataset = inspect_dataset(config)
+    store = WorkspaceStore(config.work_dir)
+    manifest = store.initialize(config, dataset, model_revision="a" * 40)
+
+    assert manifest.dataset_version == "v3.0"
+    first = compute_source_fingerprint(root, dataset.episodes[0])
+    shifted = dataset.episodes[0].model_copy(update={
+        "videos": dataset.episodes[1].videos,
+    })
+    assert compute_source_fingerprint(root, shifted) != first
+
+
+def test_shared_v30_parquet_mutation_invalidates_every_referencing_fingerprint(tmp_path: Path) -> None:
+    """Catches shared data shards being fingerprinted by path or metadata alone."""
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    before = [compute_source_fingerprint(root, episode) for episode in dataset.episodes]
+    parquet = dataset.episodes[0].data.path
+    original = parquet.read_bytes()
+    parquet.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+
+    after = [compute_source_fingerprint(root, episode) for episode in dataset.episodes]
+    assert all(previous != current for previous, current in zip(before, after))
 
 
 @pytest.mark.parametrize("kind", ["video", "parquet"])
