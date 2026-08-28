@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from robo_annotate.coarse import CoarseDecision
 from robo_annotate.config import Subtask
 from robo_annotate.lerobot import DatasetIndex, inspect_dataset
+from robo_annotate import workspace as workspace_module
 from robo_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
 from robo_annotate.prompts import PROMPT_VERSION
 from robo_annotate.refine import RefineDecision
@@ -706,6 +707,114 @@ def test_source_fingerprint_rejects_escape_missing_and_nonfile(tmp_path: Path, k
     outside.unlink()
     with pytest.raises((FileNotFoundError, ValueError)):
         compute_source_fingerprint(index.root, bad)
+
+
+def test_source_fingerprint_rejects_symlinked_dataset_root_before_opening_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Catches a root symlink being resolved before source identity is established."""
+    index = make_index(tmp_path, [10])
+    linked_root = tmp_path / "dataset-link"
+    linked_root.symlink_to(index.root, target_is_directory=True)
+    protected = {
+        (item.data.path.stat().st_dev, item.data.path.stat().st_ino)
+        for item in index.episodes
+    } | {
+        (reference.path.stat().st_dev, reference.path.stat().st_ino)
+        for item in index.episodes
+        for reference in item.videos.values()
+    }
+    opened_protected: list[tuple[int, int]] = []
+    real_open = os.open
+
+    def tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+        kwargs = {} if dir_fd is None else {"dir_fd": dir_fd}
+        descriptor = real_open(path, flags, mode, **kwargs)
+        identity = (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+        if identity in protected:
+            opened_protected.append(identity)
+        return descriptor
+
+    monkeypatch.setattr(workspace_module.os, "open", tracking_open)
+    with pytest.raises(ValueError, match="symbolic link|symlink"):
+        compute_source_fingerprint(linked_root, index.episodes[0])
+    assert opened_protected == []
+
+
+def test_source_fingerprint_rejects_intermediate_symlink_without_opening_target(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Catches source paths that reach an outside file through a directory link."""
+    index = make_index(tmp_path, [10])
+    episode = index.episodes[0]
+    source_data = index.root / "data"
+    preserved_data = tmp_path / "preserved-data"
+    source_data.replace(preserved_data)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / episode.data.path.name
+    outside_file.write_bytes(b"outside source must remain unread")
+    source_data.symlink_to(outside, target_is_directory=True)
+    protected_identity = (outside_file.stat().st_dev, outside_file.stat().st_ino)
+    opened_outside: list[tuple[int, int]] = []
+    real_open = os.open
+
+    def tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+        kwargs = {} if dir_fd is None else {"dir_fd": dir_fd}
+        descriptor = real_open(path, flags, mode, **kwargs)
+        identity = (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+        if identity == protected_identity:
+            opened_outside.append(identity)
+        return descriptor
+
+    monkeypatch.setattr(workspace_module.os, "open", tracking_open)
+    with pytest.raises(ValueError, match="symlink"):
+        compute_source_fingerprint(index.root, episode)
+    assert opened_outside == []
+
+
+def test_source_fingerprint_rejects_component_replacement_race_without_opening_target(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Catches a directory swap after the trusted root is opened but before traversal."""
+    index = make_index(tmp_path, [10])
+    episode = index.episodes[0]
+    source_data = index.root / "data"
+    preserved_data = tmp_path / "preserved-data"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / episode.data.path.name
+    outside_file.write_bytes(b"outside source must remain unread")
+    protected_identity = (outside_file.stat().st_dev, outside_file.stat().st_ino)
+    opened_outside: list[tuple[int, int]] = []
+    replaced = False
+    real_open = os.open
+    real_dup = os.dup
+    root_identity = (index.root.stat().st_dev, index.root.stat().st_ino)
+
+    def tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+        kwargs = {} if dir_fd is None else {"dir_fd": dir_fd}
+        descriptor = real_open(path, flags, mode, **kwargs)
+        identity = (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+        if identity == protected_identity:
+            opened_outside.append(identity)
+        return descriptor
+
+    def replace_after_root_dup(descriptor):
+        nonlocal replaced
+        duplicate = real_dup(descriptor)
+        if not replaced and (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino) == root_identity:
+            source_data.replace(preserved_data)
+            source_data.symlink_to(outside, target_is_directory=True)
+            replaced = True
+        return duplicate
+
+    monkeypatch.setattr(workspace_module.os, "open", tracking_open)
+    monkeypatch.setattr(workspace_module.os, "dup", replace_after_root_dup)
+    with pytest.raises(ValueError, match="symlink|follow|identity"):
+        compute_source_fingerprint(index.root, episode)
+    assert replaced
+    assert opened_outside == []
 
 
 def test_run_fingerprint_dimensions_and_revision_validation(tmp_path: Path) -> None:
