@@ -231,9 +231,9 @@ uv run Robo-annotate validate ./data/lerobot-annotated \
 
 ## LeRobot 格式兼容
 
-上面的快速开始首先展示 LeRobot v2.1，这是项目默认采用和优先介绍的格式。CLI 不需要版本参数，YAML 也没有版本字段；`inspect`、`annotate`、`convert` 和 `validate` 都会从 `meta/info.json` 自动识别严格的 `v2.1` 或 `v3.0`，缺失或未知版本会直接报错。
+上面的快速开始首先展示 LeRobot v2.1，这是项目默认采用和优先介绍的格式。CLI 不需要版本参数，YAML 也没有版本字段；`inspect`、`annotate`、`convert` 和 `validate` 都会自动识别版本。`meta/info.json` 的 `codebase_version` 仅接受精确值 `v2.1` 或 `v3.0`，字段缺失或其他值都会 fail closed。
 
-LeRobot v3.0 允许多个 episode 共用 Parquet 与 MP4 分片。Robo-annotate 会根据 episode 元数据把共享分片解析成 episode 局部的数据行与视频时间切片，因此模型标注、边界和复核界面仍使用从零开始的 episode 局部帧编号。要使用 v3.0，可复用前面的完整配置，只替换数据路径、workspace 和英文标注内容，例如：
+LeRobot v3.0 允许多个 episode 共用 Parquet 与 MP4 分片。Robo-annotate 会根据 episode 元数据把共享分片解析成 episode 局部的数据行与视频时间切片。每个 boundary 和模型可见的 frame index 都采用 episode 局部半开坐标 `[0, length)`，其中 `length` 是该 episode 的帧数；边界帧属于后一个 subtask。要使用 v3.0，可复用前面的完整配置，只替换数据路径、workspace 和英文标注内容，例如：
 
 ```yaml
 source: ./data/lerobot-v30-source

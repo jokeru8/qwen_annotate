@@ -14,7 +14,7 @@ uv run pytest -q
 uv run Robo-annotate inspect examples/complete.yaml
 ```
 
-`inspect` 在推理前从 `meta/info.json` 自动识别严格的 `v2.1` 或 `v3.0`，不需要命令行版本参数或 YAML 版本字段。未知或缺失版本会 fail closed。两种格式都会检查连续 episode index、数据行、任务引用、相机集合、每路视频 frame/FPS/尺寸和 metadata 总数；v3.0 还会解析多个 episode 共用的 Parquet/MP4 分片及其行区间和时间区间。它不创建 workspace。
+`inspect` 在推理前自动识别版本，不需要命令行版本参数或 YAML 版本字段。`meta/info.json` 的 `codebase_version` 仅接受精确值 `v2.1` 或 `v3.0`，字段缺失或其他值都会 fail closed。两种格式都会检查连续 episode index、数据行、任务引用、相机集合、每路视频 frame/FPS/尺寸和 metadata 总数；v3.0 还会解析多个 episode 共用的 Parquet/MP4 分片及其行区间和时间区间。它不创建 workspace。
 
 v2.1 仍是默认、主要和文档优先格式。v3.0 配置中的路径和标注同样使用英文，例如可把第 2 节完整配置的对应字段改为：
 

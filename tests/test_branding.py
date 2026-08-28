@@ -44,3 +44,22 @@ def test_documentation_explains_lerobot_version_compatibility() -> None:
     assert "--accepted-only" in operations
     assert "重新编码" in operations
     assert "v3-validation" in operations
+
+
+def test_documentation_names_the_strict_lerobot_version_metadata_key() -> None:
+    """Both entry-point docs must name the exact version-detection contract."""
+    required_contract = (
+        "`meta/info.json` 的 `codebase_version` 仅接受精确值 "
+        "`v2.1` 或 `v3.0`"
+    )
+
+    for path in (Path("README.md"), Path("docs/operations.md")):
+        assert required_contract in path.read_text(encoding="utf-8")
+
+
+def test_readme_defines_episode_local_frame_coordinate_contract() -> None:
+    """The README must define the half-open coordinates used by model output."""
+    readme = Path("README.md").read_text(encoding="utf-8")
+
+    assert "局部半开坐标 `[0, length)`" in readme
+    assert "边界帧属于后一个 subtask" in readme
