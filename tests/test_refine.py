@@ -128,15 +128,15 @@ class RecordingSampler:
         self.calls = []
         self.mutate = mutate
 
-    def __call__(self, path, camera, indices, fps):
-        self.calls.append((path, camera, list(indices), fps))
+    def __call__(self, video, camera, indices):
+        self.calls.append((video, camera, list(indices)))
         if self.mutate:
             self.mutate(len(self.calls))
         return [
             FrameSample(
                 camera_key=camera,
                 frame_index=index,
-                timestamp_seconds=index / fps,
+                timestamp_seconds=index / video.fps,
                 jpeg=b"jpeg",
             )
             for index in indices
@@ -669,8 +669,8 @@ async def test_expected_fingerprint_duplicate_metadata_and_symlink_are_rejected(
 @pytest.mark.parametrize("corruption", ["order", "camera", "timestamp", "duplicate"])
 async def test_invalid_sampler_evidence_is_rejected(corruption: str, tmp_path: Path) -> None:
     class BadSampler(RecordingSampler):
-        def __call__(self, path, camera, indices, fps):
-            samples = super().__call__(path, camera, indices, fps)
+        def __call__(self, video, camera, indices):
+            samples = super().__call__(video, camera, indices)
             if corruption == "order":
                 return list(reversed(samples))
             if corruption == "camera":

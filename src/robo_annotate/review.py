@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .config import AnnotationConfig
 from .constraints import validate_annotation
-from .lerobot import DatasetIndex, inspect_dataset
+from .lerobot import DatasetIndex, EpisodeVideoRef, inspect_dataset
 from .models import FinalAnnotation
 from .video import FrameSample, extract_frames, uniform_indices, window_indices
 from .workspace import (
@@ -124,7 +124,7 @@ class ManualDecision(HumanDecision):
 @dataclass(frozen=True, slots=True)
 class ReviewServices:
     inspect_dataset: Callable[[AnnotationConfig], DatasetIndex] = inspect_dataset
-    sampler: Callable[[Path, str, list[int], float], list[FrameSample]] = extract_frames
+    sampler: Callable[[EpisodeVideoRef, str, list[int]], list[FrameSample]] = extract_frames
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
 
@@ -394,7 +394,7 @@ def _render_episode(staging, config, manifest, episode, record, service):
         if image_budget <= 0:
             break
         indices = grid[:image_budget]
-        samples = _sample(service, episode, config.primary_camera, indices, manifest.fps)
+        samples = _sample(service, episode, config.primary_camera, indices)
         for sample in samples:
             name = f"coarse-{pass_id}-frame-{sample.frame_index}.jpg"
             _write_file(assets / name, sample.jpeg)
@@ -415,7 +415,7 @@ def _render_episode(staging, config, manifest, episode, record, service):
         candidates.append(candidate)
         for camera in camera_order:
             requested = context[:image_budget]
-            samples = _sample(service, episode, camera, requested, manifest.fps)
+            samples = _sample(service, episode, camera, requested)
             slug = _camera_slug(camera)
             by_index = {}
             for sample in samples:
@@ -452,13 +452,13 @@ def _render_episode(staging, config, manifest, episode, record, service):
     return payload
 
 
-def _sample(service, episode, camera, indices, fps):
+def _sample(service, episode, camera, indices):
     if camera not in episode.videos:
         raise ValueError(f"review camera {camera!r} is absent from episode")
     if indices != sorted(set(indices)) or any(type(item) is not int or not 0 <= item < episode.length for item in indices):
         raise ValueError("review sampling indices are invalid")
     video = episode.videos[camera]
-    samples = service.sampler(video.path, camera, indices, video.fps)
+    samples = service.sampler(video, camera, indices)
     if not isinstance(samples, list) or len(samples) != len(indices):
         raise ValueError("review sampler must return exactly the requested frames")
     if [item.frame_index for item in samples] != indices:

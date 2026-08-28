@@ -138,7 +138,9 @@ def test_real_reference_dataset_is_accepted_read_only() -> None:
         episode = int(path.stem.split("_")[-1])
         return VideoProbe(frames=lengths[episode], fps=28, width=960, height=744)
 
-    extractor = lambda path, camera, indices, fps: [type("S", (), {"frame_index": n, "camera_key": camera})() for n in indices]
+    extractor = lambda video, camera, indices: [
+        type("S", (), {"frame_index": n, "camera_key": camera})() for n in indices
+    ]
     with pytest.raises(ValueError, match="stats"):
         validate_release(REFERENCE, services={"probe_video": probe, "extract_frames": extractor})
     report = validate_release(

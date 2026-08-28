@@ -111,7 +111,9 @@ def _fixture(
         (work / f"episodes/episode_{i:06d}.json").write_text(accepted.model_dump_json())
     services = {
         "probe_video": lambda path: VideoProbe(frames=20, fps=10, width=6, height=4),
-        "extract_frames": lambda path, camera, indices, fps: [type("S", (), {"frame_index": n, "camera_key": camera})() for n in indices],
+        "extract_frames": lambda video, camera, indices: [
+            type("S", (), {"frame_index": n, "camera_key": camera})() for n in indices
+        ],
         "iter_video_rgb_frames": lambda path: iter([
             np.full((4, 6, 3), int(path.read_bytes().decode().split("-")[-1]) * 50, dtype=np.uint8)
             for _ in range(20)

@@ -26,7 +26,7 @@ from pydantic import (
 from .coarse import CoarseDecision
 from .config import AnnotationConfig
 from .constraints import coarse_sequence_is_legal, validate_annotation
-from .lerobot import EpisodeInfo
+from .lerobot import EpisodeInfo, EpisodeVideoRef
 from .models import FinalAnnotation, RefineResult
 from .prompts import build_refine_prompt
 from .qwen_client import ModelOutOfMemory, QwenClient
@@ -67,7 +67,7 @@ class _Completer(Protocol):
     ) -> RefineResult: ...
 
 
-Sampler = Callable[[Path, str, list[int], float], list[FrameSample]]
+Sampler = Callable[[EpisodeVideoRef, str, list[int]], list[FrameSample]]
 
 
 class _ImmutableRefineResult(RefineResult):
@@ -701,13 +701,15 @@ def _evidence_indices(center, radius, stride, frame_count):
 
 
 async def _sample_stage(source, cameras, indices, sampler, episode, expected_fingerprint):
+    source_videos = dict(source.videos)
     batches = await asyncio.gather(*(
         asyncio.to_thread(
             sampler,
-            episode.videos[camera].path,
+            episode.videos[camera].model_copy(
+                update={"path": source_videos[camera].resolved}
+            ),
             camera,
             indices,
-            episode.videos[camera].fps,
         )
         for camera in cameras
     ))

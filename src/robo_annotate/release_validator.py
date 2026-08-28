@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .augmentation import valid_augmented_text
 from .config import Subtask
 from .constraints import validate_annotation
-from .lerobot import VideoProbe, probe_video, video_fps_matches
+from .lerobot import EpisodeVideoRef, VideoProbe, probe_video, video_fps_matches
 from .models import FinalAnnotation
 from .stats import iter_video_rgb_frames, recompute_stats, recompute_video_stats
 from .video import extract_frames
@@ -95,7 +95,7 @@ class ReleaseReport(_Report):
 @dataclass(frozen=True)
 class _Services:
     probe_video: Callable[[Path], VideoProbe]
-    extract_frames: Callable[..., list[Any]]
+    extract_frames: Callable[[EpisodeVideoRef, str, list[int]], list[Any]]
     iter_video_rgb_frames: Callable[[Path], Any]
 
 
@@ -301,7 +301,16 @@ def validate_release(
         if first_preview is None and boundaries:
             boundary = boundaries[0]
             requested = [boundary - 1, boundary]
-            samples = svc.extract_frames(video_paths[(index, primary)], primary, requested, fps)
+            samples = svc.extract_frames(
+                EpisodeVideoRef(
+                    path=video_paths[(index, primary)],
+                    from_timestamp=0.0,
+                    to_timestamp=lengths[index] / fps,
+                    fps=fps,
+                ),
+                primary,
+                requested,
+            )
             if len(samples) != 2 or [item.frame_index for item in samples] != requested or any(item.camera_key != primary for item in samples):
                 raise ValueError("boundary preview labels do not match requested source frames")
             first_preview = BoundaryPreview(episode_index=index, camera_key=primary, frame_indices=(boundary - 1, boundary))

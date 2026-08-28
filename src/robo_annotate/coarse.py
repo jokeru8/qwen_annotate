@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validat
 
 from .config import AnnotationConfig
 from .constraints import coarse_sequence_is_legal
-from .lerobot import EpisodeInfo
+from .lerobot import EpisodeInfo, EpisodeVideoRef
 from .models import CoarseBoundary, CoarseResult, SemanticUncertaintyCode
 from .prompts import build_coarse_prompt
 from .qwen_client import QwenClient
@@ -51,7 +51,7 @@ class _Completer(Protocol):
     ) -> CoarseResult: ...
 
 
-Sampler = Callable[[Path, str, list[int], float], list[FrameSample]]
+Sampler = Callable[[EpisodeVideoRef, str, list[int]], list[FrameSample]]
 
 
 @dataclass(frozen=True)
@@ -251,13 +251,12 @@ async def run_coarse(
         for pass_id in (0, 1)
     ]
     union = sorted(set(grids[0]) | set(grids[1]))
-    video = episode.videos[camera]
+    video = episode.videos[camera].model_copy(update={"path": source.video_resolved})
     union_samples = await asyncio.to_thread(
         sampler,
-        video.path,
+        video,
         camera,
         union,
-        video.fps,
     )
     _validate_samples(union_samples, union, camera, video.fps)
     _assert_source_unchanged(source, episode, expected_source_fingerprint)

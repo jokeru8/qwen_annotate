@@ -92,13 +92,13 @@ class RecordingSampler:
         self.calls = []
         self.corrupt = corrupt
 
-    def __call__(self, video_path, camera_key, indices, fps):
-        self.calls.append((video_path, camera_key, list(indices), fps))
+    def __call__(self, video, camera_key, indices):
+        self.calls.append((video, camera_key, list(indices)))
         samples = [
             FrameSample(
                 camera_key=camera_key,
                 frame_index=index,
-                timestamp_seconds=index / fps,
+                timestamp_seconds=index / video.fps,
                 jpeg=b"jpeg",
             )
             for index in indices
@@ -391,10 +391,12 @@ async def test_sampler_receives_exact_video_camera_grid_and_source_fps(tmp_path:
     decision = await run_coarse(make_config(tmp_path), episode, sampler, client)
 
     assert len(sampler.calls) == 1
-    assert sampler.calls[0][0] == episode.videos["cam.eye"].path.resolve()
+    assert sampler.calls[0][0] == episode.videos["cam.eye"].model_copy(
+        update={"path": episode.videos["cam.eye"].path.resolve()}
+    )
     assert sampler.calls[0][1] == "cam.eye"
     assert sampler.calls[0][2] == sorted(set().union(*decision.sampled_frame_indices))
-    assert sampler.calls[0][3] == 20.0
+    assert sampler.calls[0][0].fps == 20.0
     assert decision.sampled_frame_indices[0] != decision.sampled_frame_indices[1]
     assert [[sample.frame_index for sample in call[1]] for call in client.calls] == [
         list(grid) for grid in decision.sampled_frame_indices

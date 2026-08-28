@@ -136,7 +136,7 @@ def _mixed_workspace(tmp_path: Path) -> tuple[Path, Path, dict]:
     services = {
         "probe_video": probe,
         "iter_video_rgb_frames": frames,
-        "extract_frames": lambda path, camera, indices, fps: [
+        "extract_frames": lambda video, camera, indices: [
             type("S", (), {"frame_index": n, "camera_key": camera})() for n in indices
         ],
     }
