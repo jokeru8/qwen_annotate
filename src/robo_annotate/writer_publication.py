@@ -17,6 +17,12 @@ _DIRECTORY_FLAGS = (
     | getattr(os, "O_DIRECTORY", 0)
     | getattr(os, "O_NOFOLLOW", 0)
 )
+_OUTPUT_FILE_FLAGS = (
+    os.O_RDWR
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+)
 _PRIVATE_DIRECTORY_PREFIX = ".writer-dir-"
 
 
@@ -372,6 +378,42 @@ class _ChildDirectory:
             os.close(descriptor)
 
 
+@dataclass
+class OwnedFile:
+    """Hold one writer-owned regular file by descriptor and exact identity."""
+
+    parent_fd: int
+    name: str
+    descriptor: int
+    identity: _EntryIdentity
+    context: str
+
+    @property
+    def proc_path(self) -> Path:
+        if self.descriptor < 0:
+            raise ValueError(f"closed {self.context}")
+        return Path(f"/proc/self/fd/{self.descriptor}")
+
+    def verify(self, phase: str) -> None:
+        try:
+            descriptor = _EntryIdentity.from_stat(os.fstat(self.descriptor))
+            current = _entry_at(self.parent_fd, self.name)
+        except OSError as exc:
+            raise ValueError(f"{self.context} changed during {phase}") from exc
+        if (
+            descriptor != self.identity
+            or current != self.identity
+            or not stat.S_ISREG(self.identity.mode)
+        ):
+            raise ValueError(f"{self.context} changed during {phase}")
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            descriptor = self.descriptor
+            self.descriptor = -1
+            os.close(descriptor)
+
+
 def _directory_identity(value: os.stat_result, context: str) -> _EntryIdentity:
     if stat.S_ISLNK(value.st_mode):
         raise ValueError(f"{context} path contains a symbolic link")
@@ -667,6 +709,58 @@ def _entry_at(parent_fd: int, name: str) -> _EntryIdentity | None:
         return None
 
 
+def _create_owned_file_at(
+    parent_fd: int,
+    name: str,
+    context: str,
+    parent_is_attached: Callable[[], bool],
+    registry: _OwnershipRegistry,
+) -> OwnedFile:
+    if not name or "/" in name or name in (".", ".."):
+        raise ValueError(f"unsafe {context} filename")
+    if not parent_is_attached():
+        raise ValueError(f"{context} parent changed before creation")
+    descriptor = -1
+    identity: _EntryIdentity | None = None
+    try:
+        descriptor = os.open(
+            name,
+            _OUTPUT_FILE_FLAGS,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        created = os.fstat(descriptor)
+        if not stat.S_ISREG(created.st_mode):
+            raise ValueError(f"{context} is not a regular file")
+        identity = _EntryIdentity.from_stat(created)
+        registry.register(identity)
+        if (
+            not parent_is_attached()
+            or _entry_at(parent_fd, name) != identity
+        ):
+            raise ValueError(f"{context} changed while opening")
+        return OwnedFile(parent_fd, name, descriptor, identity, context)
+    except BaseException as exc:
+        failures = _CleanupFailures()
+        if descriptor >= 0:
+            failures.attempt(
+                f"{context} descriptor close",
+                lambda: os.close(descriptor),
+            )
+        if identity is not None:
+            failures.attempt(
+                f"{context} removal",
+                lambda: _remove_owned_entry_at(
+                    parent_fd,
+                    name,
+                    identity,
+                    registry,
+                    parent_is_attached,
+                ),
+            )
+        failures.finish(exc, context)
+        raise
+
 
 def _retire_and_delete_owned_entry_at(
     parent_fd: int,
@@ -925,6 +1019,7 @@ class WriterPublication:
         self.staging_anchor: _AnchoredDirectoryPath | None = None
         self.bundle: _ChildDirectory | None = None
         self._children: list[_ChildDirectory] = []
+        self._files: list[OwnedFile] = []
         self._finished = False
 
     @classmethod
@@ -1063,6 +1158,23 @@ class WriterPublication:
         ):
             raise ValueError(f"{context} changed during publication")
 
+    def create_file(
+        self,
+        parent: _ChildDirectory,
+        name: str,
+        context: str,
+        parent_is_attached: Callable[[], bool],
+    ) -> OwnedFile:
+        output = _create_owned_file_at(
+            parent.descriptor,
+            name,
+            context,
+            parent_is_attached,
+            self.registry,
+        )
+        self._files.append(output)
+        return output
+
     def finish(
         self,
         primary: BaseException | None,
@@ -1074,6 +1186,9 @@ class WriterPublication:
         self._finished = True
         failures = _CleanupFailures()
 
+        for output in reversed(self._files):
+            failures.attempt(f"{output.context} close", output.close)
+        self._files.clear()
         for child in reversed(self._children):
             failures.attempt(f"{child.context} close", child.close)
         self._children.clear()
@@ -1124,18 +1239,17 @@ class WriterPublication:
                     self.staging_is_attached,
                 ),
             )
+        if rollback_required and self.staging_anchor is not None:
+            failures.attempt(
+                "created staging root removal",
+                lambda: self.staging_anchor.remove_created_final(self.registry),
+            )
         if rollback_required and self.registry.has_active():
             failures.errors.append(
                 (
                     f"{self.context} rollback",
                     ValueError("writer rollback left owned filesystem identities active"),
                 )
-            )
-
-        if rollback_required and self.staging_anchor is not None:
-            failures.attempt(
-                "created staging root removal",
-                lambda: self.staging_anchor.remove_created_final(self.registry),
             )
 
         staging_identity = (
@@ -1189,6 +1303,15 @@ class WriterPublication:
                 "created staging root removal after final close failure",
                 lambda: recovery.remove_final_if_owned(self.registry),
             )
+            if self.registry.has_active():
+                failures.errors.append(
+                    (
+                        "staging rollback recovery",
+                        ValueError(
+                            "writer rollback left owned filesystem identities active"
+                        ),
+                    )
+                )
         except BaseException as exc:
             failures.errors.append(("staging rollback recovery", exc))
         finally:
