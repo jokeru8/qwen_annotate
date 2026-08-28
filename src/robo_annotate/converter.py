@@ -21,15 +21,16 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .augmentation import (
-    AUGMENTATION_PROMPT_VERSION,
-    EpisodeSubtasks,
-    augment_episodes,
-    valid_augmented_text,
-)
+from .augmentation import EpisodeSubtasks, augment_episodes, valid_augmented_text
 from .config import AnnotationConfig
 from .constraints import validate_annotation
 from .lerobot import DatasetIndex, inspect_dataset
+from .publication_metadata import (
+    SelectedEpisode,
+    atomic_json as _atomic_json,
+    read_bounded_json as _read_source_json,
+    write_public_annotations,
+)
 from .release_validator import ReleaseReport, validate_release
 from .stats import iter_video_rgb_frames, recompute_stats, recompute_video_stats
 from .workspace import EpisodeRecord, RunManifest, WorkspaceStore, compute_run_fingerprint, compute_source_fingerprint
@@ -149,8 +150,23 @@ def convert_dataset(
         else:
             frame_count = manifest.total_frames
             _write_payload_sizes(staging)
-            _write_public_metadata(
-                staging, out, manifest, records, converted_at, augmented_texts
+            selected = [
+                SelectedEpisode(
+                    record=record,
+                    source_index=record.episode_index,
+                    output_index=record.episode_index,
+                    length=manifest.episode_lengths[record.episode_index],
+                )
+                for record in records
+            ]
+            write_public_annotations(
+                staging,
+                out,
+                manifest,
+                selected,
+                converted_at,
+                augmented_texts,
+                extend_info=manifest.dataset_version == "v2.1",
             )
         validation = validate_release(
             staging,
@@ -299,99 +315,6 @@ def _augment_selected(
     return validated
 
 
-def _write_public_metadata(
-    staging: Path,
-    output: Path,
-    manifest: RunManifest,
-    records: list,
-    converted_at: datetime,
-    augmented_texts: dict[int, list[str]] | None,
-) -> None:
-    selected = [
-        (record, record.episode_index, manifest.episode_lengths[record.episode_index])
-        for record in records
-    ]
-    _write_selection_metadata(
-        staging, output, manifest, selected, converted_at, augmented_texts
-    )
-
-
-def _write_selection_metadata(
-    staging: Path,
-    output: Path,
-    manifest: RunManifest,
-    selected: list[tuple[EpisodeRecord, int, int]],
-    converted_at: datetime,
-    augmented_texts: dict[int, list[str]] | None,
-) -> None:
-    info_path = staging / "meta/info.json"
-    info = _read_source_json(info_path)
-    template = [item.model_dump(mode="json") for item in manifest.subtasks]
-    instruction_map = {str(index): manifest.high_level_instruction for index in range(len(selected))}
-    info["subtask_template"] = template
-    info["high_level_instruction"] = instruction_map
-    _atomic_json(info_path, info)
-    episodes = {}
-    task_info = []
-    for record, output_index, length in selected:
-        annotation = record.final_annotation
-        entry = {"episode_index": output_index}
-        if manifest.mode == "dagger_patch":
-            entry["start_subtask_index"] = annotation.start_subtask_index
-        entry.update({
-            "boundaries": list(annotation.boundaries),
-            "high_level_instruction": manifest.high_level_instruction,
-            "saved_at": record.updated_at.astimezone(UTC).isoformat(),
-        })
-        episodes[str(output_index)] = entry
-        starts = [0, *annotation.boundaries]
-        ends = [*annotation.boundaries, length]
-        selected_subtasks = manifest.subtasks[
-            annotation.start_subtask_index:annotation.start_subtask_index + len(starts)
-        ]
-        action_texts = (
-            [subtask.text for subtask in selected_subtasks]
-            if augmented_texts is None else augmented_texts[record.episode_index]
-        )
-        actions = [
-            {
-                "start_frame": start,
-                "end_frame": end,
-                "action_text": action_text,
-                "skill": subtask.skill,
-            }
-            for start, end, subtask, action_text in zip(
-                starts, ends, selected_subtasks, action_texts, strict=True
-            )
-        ]
-        task_info.append({
-            "episode_id": output_index,
-            "task_id": 0,
-            "task_name": manifest.high_level_instruction,
-            "label_info": {"action_config": actions},
-        })
-    annotations = {
-        "source_root": str(manifest.dataset_root),
-        "work_dir": str(output / "meta"),
-        "subtask_template": template,
-        "episodes": episodes,
-        "primary_camera": manifest.effective_config["primary_camera"],
-        "updated_at": converted_at.isoformat(),
-    }
-    if augmented_texts is not None:
-        annotations["augmentation"] = {
-            "enabled": True,
-            "language": manifest.effective_config["augmentation"]["language"],
-            "model_repo": manifest.model_repo,
-            "model_revision": manifest.model_revision,
-            "prompt_version": AUGMENTATION_PROMPT_VERSION,
-        }
-    _atomic_json(staging / "meta/lerobot_annotations.json", annotations, sort_keys=False)
-    task_dir = staging / "meta/task_info"
-    task_dir.mkdir(exist_ok=True)
-    _atomic_json(task_dir / "task_0.json", task_info, sort_keys=False)
-
-
 def _rewrite_accepted_subset(
     staging: Path,
     source: Path,
@@ -475,11 +398,22 @@ def _rewrite_accepted_subset(
     })
     _atomic_json(info_path, info)
     selected = [
-        (record, remap.output_index, remap.length)
+        SelectedEpisode(
+            record=record,
+            source_index=remap.source_index,
+            output_index=remap.output_index,
+            length=remap.length,
+        )
         for record, remap in zip(selected_records, remaps, strict=True)
     ]
-    _write_selection_metadata(
-        staging, output, manifest, selected, converted_at, augmented_texts
+    write_public_annotations(
+        staging,
+        output,
+        manifest,
+        selected,
+        converted_at,
+        augmented_texts,
+        extend_info=manifest.dataset_version == "v2.1",
     )
     return offset
 
@@ -597,26 +531,6 @@ def _payload_size_mb(directory: Path, suffix: str) -> float:
     ) / (2**20)
 
 
-def _read_source_json(path: Path) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
-        raise ValueError("unsafe info.json")
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError(f"duplicate key {key}")
-            result[key] = value
-        return result
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique,
-                           parse_constant=lambda constant: (_ for _ in ()).throw(ValueError(constant)))
-    except Exception as exc:
-        raise ValueError("invalid source info.json") from exc
-    if not isinstance(value, dict):
-        raise ValueError("info.json must be an object")
-    return value
-
-
 def _read_source_jsonl(path: Path) -> list[dict[str, Any]]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
         raise ValueError(f"unsafe {path.name}")
@@ -645,30 +559,6 @@ def _unique_pairs(pairs: list[tuple[str, Any]], context: str) -> dict[str, Any]:
             raise ValueError(f"duplicate key {key} in {context}")
         result[key] = value
     return result
-
-
-def _atomic_json(path: Path, value: Any, *, sort_keys: bool = True) -> None:
-    encoded = (json.dumps(value, ensure_ascii=False, sort_keys=sort_keys, separators=(",", ":"), allow_nan=False) + "\n").encode()
-    directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
-    name = f".{path.name}.{secrets.token_hex(12)}.tmp"
-    fd = None
-    try:
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=directory_fd)
-        with os.fdopen(fd, "wb") as handle:
-            fd = None
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(name, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-        name = ""
-        os.fsync(directory_fd)
-    finally:
-        if fd is not None:
-            os.close(fd)
-        if name:
-            try: os.unlink(name, dir_fd=directory_fd)
-            except FileNotFoundError: pass
-        os.close(directory_fd)
 
 
 def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:

@@ -139,6 +139,7 @@ def test_full_conversion_preserves_payload_and_writes_reference_schema(tmp_path:
     assert set(annotations["episodes"]["0"]) == {"episode_index", "boundaries", "high_level_instruction", "saved_at"}
     assert annotations["work_dir"] == str(output.resolve() / "meta")
     assert info["subtask_template"] == annotations["subtask_template"]
+    assert info["high_level_instruction"] == {"0": "Arrange.", "1": "Arrange."}
     assert info["custom_key"] == {"preserved": True}
     assert report.payload_files == sorted(report.payload_files)
     for relative in report.payload_files:
