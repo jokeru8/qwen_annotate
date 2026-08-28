@@ -3,6 +3,8 @@ import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from robo_annotate.config import AnnotationConfig
 from robo_annotate.lerobot import inspect_dataset
 from robo_annotate.models import FinalAnnotation
@@ -11,7 +13,11 @@ from robo_annotate.publication_metadata import (
     write_public_annotations,
 )
 from robo_annotate.workspace import EpisodeRecord, RunManifest, WorkspaceStore
-from tests.v30_fixtures import make_lerobot_v30_fixture, make_v30_config
+from tests.v30_fixtures import (
+    make_lerobot_v30_fixture,
+    make_v30_config,
+    official_core_file_digests,
+)
 
 
 CONVERTED_AT = datetime(2026, 8, 28, tzinfo=UTC)
@@ -160,3 +166,71 @@ def test_public_annotations_map_output_identity_and_source_augmentation(
         action["action_text"]
         for action in task_info[0]["label_info"]["action_config"]
     ] == ["Lift the colored block.", "Set the colored block down."]
+
+
+def test_full_v30_conversion_preserves_core_payload_and_validates(
+    tmp_path: Path,
+) -> None:
+    from robo_annotate.converter import convert_dataset
+    from robo_annotate.release_validator import validate_release
+    from tests.test_release_validator_v30 import accepted_v30_workspace
+
+    work, source, services = accepted_v30_workspace(tmp_path)
+    source_files = official_core_file_digests(source)
+
+    report = convert_dataset(work, tmp_path / "out", services=services)
+
+    assert report.dataset_version == "v3.0"
+    assert report.annotation_schema_version == "reference-v3.0"
+    assert official_core_file_digests(report.output) == source_files
+    validation = validate_release(
+        report.output,
+        source=source,
+        services=services,
+    )
+    assert validation.dataset_version == "v3.0"
+
+
+def test_v30_accepted_only_waits_for_shared_shard_repacking(
+    tmp_path: Path,
+) -> None:
+    from robo_annotate.converter import convert_dataset
+    from tests.test_release_validator_v30 import accepted_v30_workspace
+
+    work, _, services = accepted_v30_workspace(tmp_path)
+    output = tmp_path / "accepted-only"
+
+    with pytest.raises(ValueError, match=r"shared-shard repacking"):
+        convert_dataset(work, output, accepted_only=True, services=services)
+
+    assert not output.exists()
+    assert not list(tmp_path.glob("accepted-only.staging-*"))
+
+
+def test_full_v30_conversion_rechecks_source_digest_before_publish(
+    tmp_path: Path,
+) -> None:
+    from robo_annotate.converter import convert_dataset
+    from tests.test_release_validator_v30 import accepted_v30_workspace
+
+    work, source, services = accepted_v30_workspace(tmp_path)
+    source_task_info = source / "meta/task_info"
+    source_task_info.mkdir()
+    excluded_from_core_comparison = source_task_info / "task_0.json"
+    excluded_from_core_comparison.write_text("source marker", encoding="utf-8")
+
+    def mutate_source_during_validation(ref, camera, indices):
+        excluded_from_core_comparison.write_text("changed marker", encoding="utf-8")
+        return [
+            type("Sample", (), {"frame_index": index, "camera_key": camera})()
+            for index in indices
+        ]
+
+    services["extract_frames"] = mutate_source_during_validation
+    output = tmp_path / "changed-source"
+
+    with pytest.raises(ValueError, match=r"source dataset changed during conversion"):
+        convert_dataset(work, output, services=services)
+
+    assert not output.exists()
+    assert not list(tmp_path.glob("changed-source.staging-*"))

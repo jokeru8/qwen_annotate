@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -70,6 +70,7 @@ class ConversionReport(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     output: Path
+    dataset_version: Literal["v2.1", "v3.0"]
     accepted_only: bool
     episode_count: int = Field(ge=0)
     frame_count: int = Field(ge=0)
@@ -91,8 +92,14 @@ class ConversionReport(BaseModel):
     def canonical_public_facts(self) -> "ConversionReport":
         if self.payload_files != sorted(set(self.payload_files)):
             raise ValueError("payload_files must be sorted and unique")
-        if self.annotation_path != "meta/lerobot_annotations.json" or self.annotation_schema_version != "reference-v2.1":
+        expected_schema = f"reference-{self.dataset_version}"
+        if (
+            self.annotation_path != "meta/lerobot_annotations.json"
+            or self.annotation_schema_version != expected_schema
+        ):
             raise ValueError("unsupported public annotation schema")
+        if self.validation.dataset_version != self.dataset_version:
+            raise ValueError("validation report version must match conversion")
         if not self.validation.valid or self.validation.episode_count != self.episode_count or self.validation.frame_count != self.frame_count:
             raise ValueError("validation report counts must match conversion")
         return self
@@ -143,39 +150,57 @@ def convert_dataset(
         _copy_tree(source, staging, include_payload=not accepted_only)
         converted_at = datetime.now(UTC)
         if accepted_only:
+            if manifest.dataset_version == "v3.0":
+                raise ValueError(
+                    "accepted-only LeRobot v3.0 publication requires shared-shard repacking"
+                )
             frame_count = _rewrite_accepted_subset(
                 staging, source, out, manifest, dataset, records, converted_at, services,
                 augmented_texts,
             )
         else:
             frame_count = manifest.total_frames
-            _write_payload_sizes(staging)
-            selected = [
-                SelectedEpisode(
-                    record=record,
-                    source_index=record.episode_index,
-                    output_index=record.episode_index,
-                    length=manifest.episode_lengths[record.episode_index],
+            if manifest.dataset_version == "v3.0":
+                from .converter_v30 import write_full_v30_release
+
+                write_full_v30_release(
+                    staging,
+                    out,
+                    manifest,
+                    records,
+                    converted_at,
+                    augmented_texts,
                 )
-                for record in records
-            ]
-            write_public_annotations(
-                staging,
-                out,
-                manifest,
-                selected,
-                converted_at,
-                augmented_texts,
-                extend_info=manifest.dataset_version == "v2.1",
-            )
+            else:
+                _write_payload_sizes(staging)
+                selected = [
+                    SelectedEpisode(
+                        record=record,
+                        source_index=record.episode_index,
+                        output_index=record.episode_index,
+                        length=manifest.episode_lengths[record.episode_index],
+                    )
+                    for record in records
+                ]
+                write_public_annotations(
+                    staging,
+                    out,
+                    manifest,
+                    selected,
+                    converted_at,
+                    augmented_texts,
+                    extend_info=True,
+                )
         validation = validate_release(
             staging,
             source=None if accepted_only else source,
             services=services,
             _expected_output_root=out,
             _expected_stats_source=source,
-            allow_legacy_sampled_image_stats=not accepted_only,
-            deep_video_stats=accepted_only,
+            allow_legacy_sampled_image_stats=(
+                manifest.dataset_version == "v2.1" and not accepted_only
+            ),
+            deep_video_stats=(manifest.dataset_version == "v3.0" or accepted_only),
         )
         if _tree_digest(source) != source_before:
             raise ValueError("source dataset changed during conversion")
@@ -188,9 +213,11 @@ def convert_dataset(
             os.close(parent_fd)
         published_validation = validation.model_copy(update={"path": out.resolve()})
         return ConversionReport(
-            output=out.resolve(), accepted_only=accepted_only, episode_count=len(records),
+            output=out.resolve(), dataset_version=manifest.dataset_version,
+            accepted_only=accepted_only, episode_count=len(records),
             frame_count=frame_count, payload_files=validation.payload_files,
-            annotation_path="meta/lerobot_annotations.json", annotation_schema_version="reference-v2.1",
+            annotation_path="meta/lerobot_annotations.json",
+            annotation_schema_version=f"reference-{manifest.dataset_version}",
             converted_at=converted_at, source_tree_digest=source_before,
             validation=published_validation,
         )

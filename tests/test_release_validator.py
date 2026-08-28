@@ -15,6 +15,7 @@ def test_release_validator_is_independent_and_strict(tmp_path: Path) -> None:
     convert_dataset(work, output, services=services)
     report = validate_release(output, source=source, services=services)
     assert report.valid is True and report.episode_count == 2 and report.frame_count == 40
+    assert report.dataset_version == "v2.1"
     assert report.validation_level == "strict_deep" and report.skipped_checks == ()
     assert report.payload_files == sorted(report.payload_files)
     assert report.payload_checksum
@@ -24,6 +25,28 @@ def test_release_validator_is_independent_and_strict(tmp_path: Path) -> None:
         ReleaseReport.model_validate(report.model_dump() | {"episode_count": "2"})
     with pytest.raises(ValidationError):
         ReleaseReport.model_validate(report.model_dump() | {"skipped_checks": ("invented",)})
+
+
+def test_release_dispatch_reads_bounded_info_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import robo_annotate.release_validator as validator
+
+    _, work, services = _fixture(tmp_path)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    original = validator._read_object
+    reads = []
+
+    def counting_reader(path: Path):
+        if path == output / "meta/info.json":
+            reads.append(path)
+        return original(path)
+
+    monkeypatch.setattr(validator, "_read_object", counting_reader)
+    assert validate_release(output, services=services).valid
+    assert reads == [output / "meta/info.json"]
 
 
 def test_release_validator_requires_both_stats_artifacts(tmp_path: Path) -> None:

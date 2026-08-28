@@ -132,6 +132,7 @@ def test_full_conversion_preserves_payload_and_writes_reference_schema(tmp_path:
     report = convert_dataset(work, output, services=services)
     annotations = json.loads((output / "meta/lerobot_annotations.json").read_text())
     info = json.loads((output / "meta/info.json").read_text())
+    assert report.dataset_version == "v2.1"
     assert report.episode_count == 2 and report.frame_count == 40
     assert annotations["episodes"]["0"]["boundaries"] == [10]
     assert "start_subtask_index" not in annotations["episodes"]["0"]

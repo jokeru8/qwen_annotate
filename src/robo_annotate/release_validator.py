@@ -1,4 +1,4 @@
-"""Independent, no-follow validation for publishable LeRobot v2.1 datasets."""
+"""Version-aware independent validation for publishable LeRobot datasets."""
 
 from __future__ import annotations
 
@@ -49,6 +49,7 @@ class BoundaryPreview(_Report):
 
 class ReleaseReport(_Report):
     path: Path
+    dataset_version: Literal["v2.1", "v3.0"]
     valid: Literal[True] = True
     episode_count: int = Field(ge=0)
     frame_count: int = Field(ge=0)
@@ -93,7 +94,7 @@ class ReleaseReport(_Report):
 
 
 @dataclass(frozen=True)
-class _Services:
+class ReleaseServices:
     probe_video: Callable[[Path], VideoProbe]
     extract_frames: Callable[[EpisodeVideoRef, str, list[int]], list[Any]]
     iter_video_rgb_frames: Callable[[Path], Any]
@@ -112,17 +113,55 @@ def validate_release(
     """Validate a converted release without consulting an annotation workspace."""
     if type(allow_legacy_sampled_image_stats) is not bool or type(deep_video_stats) is not bool:
         raise TypeError("statistics validation options must be bools")
-    if allow_legacy_sampled_image_stats and deep_video_stats:
-        raise ValueError("legacy sampled image stats are incompatible with deep video stats")
     root = _safe_root(path, "release")
     source_root = _safe_root(source, "source") if source is not None else None
     stats_source = _safe_root(_expected_stats_source, "stats source") if _expected_stats_source is not None else source_root
     svc = _services(services)
     _walk_regular(root)
-
     info = _read_object(root / "meta/info.json")
-    if _string(info, "codebase_version") != "v2.1":
-        raise ValueError("release must use LeRobot v2.1")
+    version = _string(info, "codebase_version")
+    if version == "v3.0":
+        if allow_legacy_sampled_image_stats:
+            raise ValueError("legacy sampled image stats apply only to LeRobot v2.1")
+        from .release_validator_v30 import _validate_v30_release_with_info
+
+        return _validate_v30_release_with_info(
+            root,
+            source_root=source_root,
+            services=svc,
+            expected_output_root=_expected_output_root,
+            deep_video_stats=deep_video_stats,
+            info=info,
+        )
+    if version != "v2.1":
+        raise ValueError(f"Unsupported LeRobot codebase_version: {version!r}")
+    if allow_legacy_sampled_image_stats and deep_video_stats:
+        raise ValueError("legacy sampled image stats are incompatible with deep video stats")
+    return _validate_v21_release(
+        root,
+        source_root=source_root,
+        stats_source=stats_source,
+        services=svc,
+        expected_output_root=_expected_output_root,
+        allow_legacy_sampled_image_stats=allow_legacy_sampled_image_stats,
+        deep_video_stats=deep_video_stats,
+        info=info,
+    )
+
+
+def _validate_v21_release(
+    root: Path,
+    *,
+    source_root: Path | None,
+    stats_source: Path | None,
+    services: ReleaseServices,
+    expected_output_root: Path | None,
+    allow_legacy_sampled_image_stats: bool,
+    deep_video_stats: bool,
+    info: dict[str, Any],
+) -> ReleaseReport:
+    """Retain the independent v2.1 validation path behind strict dispatch."""
+    svc = services
     total_episodes = _integer(info, "total_episodes", minimum=0)
     total_frames = _integer(info, "total_frames", minimum=0)
     total_tasks = _integer(info, "total_tasks", minimum=0)
@@ -239,15 +278,16 @@ def validate_release(
     declared_work = Path(annotations["work_dir"])
     if not declared_work.is_absolute() or declared_work.name != "meta":
         raise ValueError("annotation work_dir must be an absolute path ending in meta")
-    if _expected_output_root is not None:
-        if not isinstance(_expected_output_root, Path):
+    if expected_output_root is not None:
+        if not isinstance(expected_output_root, Path):
             raise TypeError("_expected_output_root must be a Path")
-        expected_work = _expected_output_root.resolve(strict=False) / "meta"
+        expected_work = expected_output_root.resolve(strict=False) / "meta"
         if declared_work.resolve(strict=False) != expected_work:
             raise ValueError("annotation work_dir does not match expected output/meta")
     _validate_optional_metadata(
         root, total_episodes, total_frames, lengths, features, cameras, stats_source,
         parquet_paths, video_paths, svc, allow_legacy_sampled_image_stats, deep_video_stats,
+        info,
     )
     primary = _string(annotations, "primary_camera")
     if primary not in cameras:
@@ -344,7 +384,8 @@ def validate_release(
         validation_level = "strict_structural"
         skipped_checks = ("video_payload_stat_equality",)
     return ReleaseReport(
-        path=root, episode_count=total_episodes, frame_count=total_frames, mode=mode,
+        path=root, dataset_version="v2.1", episode_count=total_episodes,
+        frame_count=total_frames, mode=mode,
         subtask_template=template, payload_files=sorted(expected_payload), payload_digests=digests,
         payload_checksum=aggregate, preview=first_preview,
         validation_level=validation_level, skipped_checks=skipped_checks,
@@ -352,16 +393,16 @@ def validate_release(
     )
 
 
-def _services(value: Any) -> _Services:
+def _services(value: Any) -> ReleaseServices:
     if value is None:
-        return _Services(probe_video, extract_frames, iter_video_rgb_frames)
+        return ReleaseServices(probe_video, extract_frames, iter_video_rgb_frames)
     getter = value.get if isinstance(value, dict) else lambda name, default: getattr(value, name, default)
     probe = getter("probe_video", probe_video)
     extractor = getter("extract_frames", extract_frames)
     frame_iterator = getter("iter_video_rgb_frames", iter_video_rgb_frames)
     if not callable(probe) or not callable(extractor) or not callable(frame_iterator):
         raise TypeError("release services must be callable")
-    return _Services(probe, extractor, frame_iterator)
+    return ReleaseServices(probe, extractor, frame_iterator)
 
 
 def _safe_root(path: Path | None, label: str) -> Path:
@@ -653,9 +694,10 @@ def _validate_optional_metadata(
     stats_source: Path | None,
     parquet_paths: list[Path],
     video_paths: dict[tuple[int, str], Path],
-    services: _Services,
+    services: ReleaseServices,
     allow_legacy_sampled_image_stats: bool,
     deep_video_stats: bool,
+    info: dict[str, Any],
 ) -> None:
     aggregate_path = root / "meta/stats.json"
     episode_path = root / "meta/episodes_stats.jsonl"
@@ -739,7 +781,7 @@ def _validate_optional_metadata(
             actual = recompute_video_stats(paths, lengths, shape, frame_iterator=frame_iterator)
             _compare_feature_stats(aggregate[camera], actual, _STAT_METRICS, f"stats {camera}")
 
-    _validate_payload_sizes(root, allow_legacy_sampled_image_stats)
+    _validate_payload_sizes(root, info, allow_legacy_sampled_image_stats)
 
 
 def _compare_feature_stats(
@@ -769,8 +811,9 @@ def _flatten_numbers(value: Any) -> list[float]:
     return [float(value)]
 
 
-def _validate_payload_sizes(root: Path, allow_legacy: bool) -> None:
-    info = _read_object(root / "meta/info.json")
+def _validate_payload_sizes(
+    root: Path, info: dict[str, Any], allow_legacy: bool
+) -> None:
     fields = ("data_files_size_in_mb", "video_files_size_in_mb")
     present = [field in info for field in fields]
     if not all(present):
