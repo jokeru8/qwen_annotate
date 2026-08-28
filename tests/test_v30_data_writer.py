@@ -1,3 +1,4 @@
+import errno
 import io
 import json
 import math
@@ -662,18 +663,32 @@ def test_component_replacement_during_publication_is_detected_and_rolled_back(
     (sink / "marker.txt").write_text("unchanged", encoding="utf-8")
     before_source = source_tree_digest(root)
     before_sink = _tree_digest(sink)
-    actual_replace = os.replace
+    actual_publish = v30_data_writer.rename_noreplace_at
     publications = 0
 
-    def replace_then_swap_meta(*args: object, **kwargs: object) -> None:
+    def publish_then_swap_meta(
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
+    ) -> None:
         nonlocal publications
-        actual_replace(*args, **kwargs)
+        actual_publish(
+            source_fd,
+            source_name,
+            destination_fd,
+            destination_name,
+        )
         publications += 1
         if publications == 1:
-            actual_replace(staging / "meta", staging / "displaced-meta")
+            os.replace(staging / "meta", staging / "displaced-meta")
             (staging / "meta").symlink_to(sink, target_is_directory=True)
 
-    monkeypatch.setattr(v30_data_writer.os, "replace", replace_then_swap_meta)
+    monkeypatch.setattr(
+        v30_data_writer,
+        "rename_noreplace_at",
+        publish_then_swap_meta,
+    )
     with pytest.raises(ValueError, match="changed during publication"):
         write_v30_data_subset(
             root,
@@ -698,17 +713,31 @@ def test_source_change_after_staging_publication_is_detected_and_rolled_back(
     staging = tmp_path / "staging"
     info_path = root / "meta/info.json"
     original_info = info_path.read_bytes()
-    actual_replace = os.replace
+    actual_publish = v30_data_writer.rename_noreplace_at
     publications = 0
 
-    def replace_then_change_source(*args: object, **kwargs: object) -> None:
+    def publish_then_change_source(
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
+    ) -> None:
         nonlocal publications
-        actual_replace(*args, **kwargs)
+        actual_publish(
+            source_fd,
+            source_name,
+            destination_fd,
+            destination_name,
+        )
         publications += 1
         if publications == 2:
             info_path.write_bytes(original_info + b" ")
 
-    monkeypatch.setattr(v30_data_writer.os, "replace", replace_then_change_source)
+    monkeypatch.setattr(
+        v30_data_writer,
+        "rename_noreplace_at",
+        publish_then_change_source,
+    )
     try:
         with pytest.raises(ValueError, match="source.*changed"):
             write_v30_data_subset(
@@ -722,6 +751,221 @@ def test_source_change_after_staging_publication_is_detected_and_rolled_back(
         assert not (staging / "meta/tasks.parquet").exists()
     finally:
         info_path.write_bytes(original_info)
+
+
+@pytest.mark.parametrize("destination", ["data", "tasks.parquet"])
+def test_publication_does_not_clobber_destination_created_at_publish_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    destination: str,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    (staging / "meta").mkdir(parents=True)
+    before_source = source_tree_digest(root)
+    original_verify = v30_data_writer._ChildDirectory.verify
+    meta_verifications = 0
+    injected = False
+    data_identity: tuple[int, int] | None = None
+
+    def verify_then_create_destination(
+        child: object,
+        phase: str,
+    ) -> None:
+        nonlocal meta_verifications, injected, data_identity
+        original_verify(child, phase)
+        context = getattr(child, "context")
+        if context == "staging meta":
+            meta_verifications += 1
+        if destination == "data" and context == "staging bundle" and not injected:
+            (staging / "data").mkdir()
+            value = (staging / "data").stat()
+            data_identity = value.st_dev, value.st_ino
+            injected = True
+        if (
+            destination == "tasks.parquet"
+            and context == "staging meta"
+            and meta_verifications == 2
+            and not injected
+        ):
+            (staging / "meta/tasks.parquet").write_bytes(b"competing tasks")
+            injected = True
+
+    monkeypatch.setattr(
+        v30_data_writer._ChildDirectory,
+        "verify",
+        verify_then_create_destination,
+    )
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert source_tree_digest(root) == before_source
+    if destination == "data":
+        value = (staging / "data").stat()
+        assert (value.st_dev, value.st_ino) == data_identity
+        assert not (staging / "meta/tasks.parquet").exists()
+    else:
+        assert (staging / "meta/tasks.parquet").read_bytes() == b"competing tasks"
+        assert not (staging / "data").exists()
+    assert list(staging.glob(".v30-data-*")) == []
+
+
+@pytest.mark.parametrize("replacement", ["directory", "symlink"])
+def test_replaced_published_data_is_removed_without_following_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    sink = tmp_path / "outside"
+    sink.mkdir()
+    (sink / "marker.txt").write_text("unchanged", encoding="utf-8")
+    before_source = source_tree_digest(root)
+    before_sink = _tree_digest(sink)
+    actual_entry_at = v30_data_writer._entry_at
+    injected = False
+
+    def entry_at_then_replace(parent_fd: int, name: str):
+        nonlocal injected
+        identity = actual_entry_at(parent_fd, name)
+        try:
+            parent_path = Path(os.readlink(f"/proc/self/fd/{parent_fd}"))
+        except OSError:
+            parent_path = Path()
+        if (
+            not injected
+            and name == "data"
+            and identity is not None
+            and parent_path == staging
+        ):
+            os.replace(staging / "data", staging / "displaced-data")
+            if replacement == "directory":
+                (staging / "data").mkdir()
+                (staging / "data/intruder.txt").write_text(
+                    "remove me",
+                    encoding="utf-8",
+                )
+            else:
+                (staging / "data").symlink_to(sink, target_is_directory=True)
+            injected = True
+        return identity
+
+    monkeypatch.setattr(v30_data_writer, "_entry_at", entry_at_then_replace)
+
+    with pytest.raises(ValueError, match="staging data changed during publication"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert source_tree_digest(root) == before_source
+    assert _tree_digest(sink) == before_sink
+    assert not (staging / "data").exists()
+    assert not (staging / "data").is_symlink()
+    assert not (staging / "displaced-data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert list(staging.glob(".v30-data-*")) == []
+
+
+def test_bundle_open_failure_removes_owned_bundle_and_new_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_open = os.open
+
+    def fail_private_bundle_open(path: object, *args: object, **kwargs: object) -> int:
+        if isinstance(path, str) and path.startswith(".v30-data-"):
+            raise OSError(errno.EMFILE, "injected bundle open failure")
+        return actual_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(v30_data_writer.os, "open", fail_private_bundle_open)
+
+    with pytest.raises(ValueError, match="unable to open staging bundle"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert source_tree_digest(root) == before_source
+    assert not staging.exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+@pytest.mark.parametrize("opening", ["anchored path", "child directory"])
+def test_identity_failure_closes_untracked_directory_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    opening: str,
+) -> None:
+    actual_open = os.open
+    actual_fstat = os.fstat
+    fail_descriptors: set[int] = set()
+
+    def capture_open(path: object, *args: object, **kwargs: object) -> int:
+        descriptor = actual_open(path, *args, **kwargs)
+        if path == "tracked":
+            fail_descriptors.add(descriptor)
+        return descriptor
+
+    def fail_identity(descriptor: int) -> os.stat_result:
+        if descriptor in fail_descriptors:
+            raise OSError(errno.EMFILE, "injected identity failure")
+        return actual_fstat(descriptor)
+
+    monkeypatch.setattr(v30_data_writer.os, "open", capture_open)
+    monkeypatch.setattr(v30_data_writer.os, "fstat", fail_identity)
+    before_fds = len(os.listdir("/proc/self/fd"))
+
+    if opening == "anchored path":
+        target = tmp_path / "tracked"
+        for _ in range(5):
+            with pytest.raises(ValueError, match="unable to anchor tracked path"):
+                v30_data_writer._AnchoredDirectoryPath.open(
+                    target,
+                    "tracked path",
+                    create_final=True,
+                )
+            assert not target.exists()
+    else:
+        parent = tmp_path / "parent"
+        parent.mkdir()
+        parent_fd = actual_open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for _ in range(5):
+                with pytest.raises(ValueError, match="unable to open tracked child"):
+                    v30_data_writer._open_or_create_child_directory(
+                        parent_fd,
+                        "tracked",
+                        "tracked child",
+                    )
+                assert not (parent / "tracked").exists()
+        finally:
+            os.close(parent_fd)
+
+    assert len(os.listdir("/proc/self/fd")) == before_fds
 
 
 def _add_second_task(

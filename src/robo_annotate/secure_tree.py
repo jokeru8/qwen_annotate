@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import os
 import stat
@@ -13,6 +15,37 @@ from typing import Iterator
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 _READ_BLOCK = 1024 * 1024
+_RENAME_NOREPLACE = 1
+
+
+def rename_noreplace_at(
+    source_dir_fd: int,
+    source_name: str,
+    destination_dir_fd: int,
+    destination_name: str,
+) -> None:
+    """Atomically rename one descriptor-relative entry without replacement."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError(
+            "atomic no-replace publication requires Linux renameat2"
+        )
+    result = renameat2(
+        source_dir_fd,
+        os.fsencode(source_name),
+        destination_dir_fd,
+        os.fsencode(destination_name),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(
+            f"output already exists: {destination_name}"
+        )
+    raise OSError(error, os.strerror(error), destination_name)
 
 
 @dataclass(frozen=True)

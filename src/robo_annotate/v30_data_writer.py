@@ -19,7 +19,7 @@ import pyarrow.parquet as pq
 from PIL import Image
 
 from .lerobot import DatasetIndex, EpisodeInfo
-from .secure_tree import SecureTree
+from .secure_tree import SecureTree, rename_noreplace_at
 
 
 _MAX_PARQUET_BYTES = 1024 * 1024 * 1024
@@ -702,9 +702,15 @@ class _AnchoredDirectoryPath:
         components = absolute.parts[1:]
         if not components:
             raise ValueError(f"{label} must not be the filesystem root")
-        descriptors = [os.open("/", _DIRECTORY_FLAGS)]
+        root_fd = os.open("/", _DIRECTORY_FLAGS)
+        try:
+            root_identity = _directory_identity(os.fstat(root_fd), label)
+        except BaseException:
+            os.close(root_fd)
+            raise
+        descriptors = [root_fd]
         names: list[str] = []
-        identities = [_directory_identity(os.fstat(descriptors[0]), label)]
+        identities = [root_identity]
         created_final_component = False
         created_parent_fd: int | None = None
         created_name = ""
@@ -732,19 +738,28 @@ class _AnchoredDirectoryPath:
                         follow_symlinks=False,
                     )
                 expected = _directory_identity(before, label)
-                child_fd = os.open(component, _DIRECTORY_FLAGS, dir_fd=parent_fd)
-                opened = _directory_identity(os.fstat(child_fd), label)
-                current = _directory_identity(
-                    os.stat(
+                child_fd = -1
+                try:
+                    child_fd = os.open(
                         component,
+                        _DIRECTORY_FLAGS,
                         dir_fd=parent_fd,
-                        follow_symlinks=False,
-                    ),
-                    label,
-                )
-                if expected != opened or opened != current:
-                    os.close(child_fd)
-                    raise ValueError(f"{label} changed while opening")
+                    )
+                    opened = _directory_identity(os.fstat(child_fd), label)
+                    current = _directory_identity(
+                        os.stat(
+                            component,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        ),
+                        label,
+                    )
+                    if expected != opened or opened != current:
+                        raise ValueError(f"{label} changed while opening")
+                except BaseException:
+                    if child_fd >= 0:
+                        os.close(child_fd)
+                    raise
                 descriptors.append(child_fd)
                 names.append(component)
                 identities.append(opened)
@@ -873,12 +888,48 @@ def _open_or_create_child_directory(
 ) -> _ChildDirectory:
     created = False
     try:
-        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        os.mkdir(name, 0o700, dir_fd=parent_fd)
-        created = True
-        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    expected = _directory_identity(before, context)
+        try:
+            before = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            created = True
+            before = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        expected = _directory_identity(before, context)
+        return _open_child_directory(
+            parent_fd,
+            name,
+            expected,
+            context,
+            created=created,
+        )
+    except (OSError, ValueError) as exc:
+        if created:
+            try:
+                _remove_entry_at(parent_fd, name)
+            except OSError:
+                pass
+        if isinstance(exc, ValueError):
+            raise
+        raise ValueError(f"unable to open {context}") from exc
+
+
+def _open_child_directory(
+    parent_fd: int,
+    name: str,
+    expected: _EntryIdentity,
+    context: str,
+    *,
+    created: bool,
+) -> _ChildDirectory:
+    descriptor = -1
     try:
         descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
         opened = _directory_identity(os.fstat(descriptor), context)
@@ -887,25 +938,19 @@ def _open_or_create_child_directory(
             context,
         )
         if expected != opened or opened != current:
-            os.close(descriptor)
             raise ValueError(f"{context} changed while opening")
-    except (OSError, ValueError) as exc:
-        if created:
-            try:
-                os.rmdir(name, dir_fd=parent_fd)
-            except OSError:
-                pass
-        if isinstance(exc, ValueError):
-            raise
-        raise ValueError(f"unable to open {context}") from exc
-    return _ChildDirectory(
-        parent_fd,
-        name,
-        descriptor,
-        expected,
-        context,
-        created,
-    )
+        return _ChildDirectory(
+            parent_fd,
+            name,
+            descriptor,
+            expected,
+            context,
+            created,
+        )
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
 
 
 def _create_private_child_directory(
@@ -919,7 +964,26 @@ def _create_private_child_directory(
             os.mkdir(name, 0o700, dir_fd=parent_fd)
         except FileExistsError:
             continue
-        return _open_or_create_child_directory(parent_fd, name, context)
+        try:
+            expected = _directory_identity(
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False),
+                context,
+            )
+            return _open_child_directory(
+                parent_fd,
+                name,
+                expected,
+                context,
+                created=True,
+            )
+        except BaseException as exc:
+            try:
+                _remove_entry_at(parent_fd, name)
+            except OSError:
+                pass
+            if isinstance(exc, OSError):
+                raise ValueError(f"unable to open {context}") from exc
+            raise
     raise ValueError(f"unable to create {context}")
 
 
@@ -980,6 +1044,47 @@ def _remove_tree_at(
         os.close(descriptor)
     if _entry_at(parent_fd, name) == expected:
         os.rmdir(name, dir_fd=parent_fd)
+
+
+def _remove_entry_at(parent_fd: int, name: str) -> None:
+    """Remove one descriptor-relative entry recursively without following links."""
+    for _ in range(3):
+        current = _entry_at(parent_fd, name)
+        if current is None:
+            return
+        try:
+            _remove_tree_at(parent_fd, name, current)
+        except OSError:
+            if stat.S_ISDIR(current.mode):
+                try:
+                    os.rmdir(name, dir_fd=parent_fd)
+                    return
+                except OSError:
+                    pass
+            continue
+    if _entry_at(parent_fd, name) is not None:
+        raise OSError(f"unable to remove staged entry: {name}")
+
+
+def _remove_identity_at(
+    parent_fd: int,
+    expected: _EntryIdentity,
+) -> None:
+    """Remove a renamed task-owned entry by identity below one anchored parent."""
+    for _ in range(3):
+        found = False
+        for name in os.listdir(parent_fd):
+            if _entry_at(parent_fd, name) != expected:
+                continue
+            found = True
+            _remove_tree_at(parent_fd, name, expected)
+        if not found:
+            return
+    if any(
+        _entry_at(parent_fd, name) == expected
+        for name in os.listdir(parent_fd)
+    ):
+        raise OSError("unable to remove renamed staged entry")
 
 
 def _publish(
@@ -1070,22 +1175,22 @@ def _publish(
         staging_anchor.verify("publication")
         meta.verify("publication")
         bundle.verify("publication")
-        os.replace(
+        rename_noreplace_at(
+            bundle.descriptor,
             "data",
+            staging_anchor.descriptor,
             "data",
-            src_dir_fd=bundle.descriptor,
-            dst_dir_fd=staging_anchor.descriptor,
         )
         data_published = True
         if _entry_at(staging_anchor.descriptor, "data") != data_identity:
             raise ValueError("staging data changed during publication")
         staging_anchor.verify("publication")
         meta.verify("publication")
-        os.replace(
+        rename_noreplace_at(
+            bundle.descriptor,
             "tasks.parquet",
+            meta.descriptor,
             "tasks.parquet",
-            src_dir_fd=bundle.descriptor,
-            dst_dir_fd=meta.descriptor,
         )
         tasks_published = True
         if _entry_at(meta.descriptor, "tasks.parquet") != tasks_identity:
@@ -1109,20 +1214,29 @@ def _publish(
     finally:
         if not success:
             if tasks_published and meta is not None and tasks_identity is not None:
-                if _entry_at(meta.descriptor, "tasks.parquet") == tasks_identity:
-                    try:
-                        os.unlink("tasks.parquet", dir_fd=meta.descriptor)
-                    except OSError:
-                        pass
+                try:
+                    _remove_entry_at(meta.descriptor, "tasks.parquet")
+                except OSError:
+                    pass
+                try:
+                    _remove_identity_at(meta.descriptor, tasks_identity)
+                except OSError:
+                    pass
             if (
                 data_published
                 and staging_anchor is not None
                 and data_identity is not None
             ):
                 try:
-                    _remove_tree_at(
+                    _remove_entry_at(
                         staging_anchor.descriptor,
                         "data",
+                    )
+                except OSError:
+                    pass
+                try:
+                    _remove_identity_at(
+                        staging_anchor.descriptor,
                         data_identity,
                     )
                 except OSError:
@@ -1131,9 +1245,15 @@ def _publish(
             bundle.close()
             if staging_anchor is not None:
                 try:
-                    _remove_tree_at(
+                    _remove_entry_at(
                         staging_anchor.descriptor,
                         bundle.name,
+                    )
+                except OSError:
+                    pass
+                try:
+                    _remove_identity_at(
+                        staging_anchor.descriptor,
                         bundle.identity,
                     )
                 except OSError:

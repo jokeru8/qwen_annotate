@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
-import errno
 import fcntl
 import hashlib
 import json
@@ -32,6 +30,7 @@ from .publication_metadata import (
     write_public_annotations,
 )
 from .release_validator import ReleaseReport, validate_release
+from .secure_tree import rename_noreplace_at
 from .stats import iter_video_rgb_frames, recompute_stats, recompute_video_stats
 from .workspace import EpisodeRecord, RunManifest, WorkspaceStore, compute_run_fingerprint, compute_source_fingerprint
 
@@ -671,16 +670,12 @@ def _open_lock(path: Path) -> int:
 
 
 def _rename_noreplace(source: Path, destination: Path) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise RuntimeError("atomic no-replace directory publication requires Linux renameat2")
-    result = renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
-    if result != 0:
-        error = ctypes.get_errno()
-        if error == errno.EEXIST:
-            raise FileExistsError(f"output already exists: {destination}")
-        raise OSError(error, os.strerror(error), destination)
+    rename_noreplace_at(
+        -100,
+        os.fspath(source),
+        -100,
+        os.fspath(destination),
+    )
 
 
 def _remove_owned_staging(staging: Path, parent: Path, output_name: str) -> None:
