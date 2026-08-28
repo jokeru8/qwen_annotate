@@ -30,6 +30,7 @@ Issues = "https://github.com/jokeru8/Robo-annotate/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.4,<9", "pytest-asyncio>=1,<2"]
+v3-validation = ["lerobot[dataset]==0.6.1"]
 
 [project.scripts]
 Robo-annotate = "robo_annotate.cli:app"
