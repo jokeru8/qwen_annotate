@@ -67,6 +67,9 @@ _MAX_JSON_BYTES = 16 * 1024 * 1024
 _MAX_PARQUET_BYTES = 1024 * 1024 * 1024
 _MAX_VIDEO_BYTES = 16 * 1024 * 1024 * 1024
 
+_VideoShardIdentity = tuple[str, int, int, str]
+_VideoRange = tuple[float, float, int]
+
 
 @dataclass(frozen=True)
 class _VideoSlice:
@@ -269,10 +272,10 @@ def _validate_v30_release_with_info(
     data_coverage: dict[str, set[int]] = defaultdict(set)
     video_files: dict[str, SecureFile] = {}
     video_probes: dict[str, Any] = {}
-    video_ranges: dict[tuple[str, str], list[tuple[float, float, int]]] = (
-        defaultdict(list)
-    )
+    video_ranges: dict[_VideoShardIdentity, list[_VideoRange]] = defaultdict(list)
     video_pairs: dict[str, set[tuple[int, int]]] = defaultdict(set)
+    video_pair_paths: dict[tuple[str, int, int], str] = {}
+    video_path_identities: dict[str, tuple[str, int, int]] = {}
     episodes: list[_Episode] = []
     expected_global = 0
     expected_payload: set[str] = set()
@@ -363,10 +366,10 @@ def _validate_v30_release_with_info(
             video_chunk = _strict_int(
                 row.get(f"videos/{camera}/chunk_index"), "chunk_index", 0
             )
-            video_file = _strict_int(
+            video_file_index = _strict_int(
                 row.get(f"videos/{camera}/file_index"), "file_index", 0
             )
-            if video_file >= chunks_size:
+            if video_file_index >= chunks_size:
                 raise ValueError(f"{camera_context} file_index exceeds chunks_size")
             from_timestamp = _nonnegative_number(
                 row.get(f"videos/{camera}/from_timestamp"), "from_timestamp"
@@ -386,23 +389,30 @@ def _validate_v30_release_with_info(
                 {
                     "video_key": camera,
                     "chunk_index": video_chunk,
-                    "file_index": video_file,
+                    "file_index": video_file_index,
                 },
                 "video_path",
                 "videos",
             )
             video_path = video_relative.as_posix()
-            video_pairs[camera].add((video_chunk, video_file))
+            video_pairs[camera].add((video_chunk, video_file_index))
+            identity = (camera, video_chunk, video_file_index)
+            prior_path = video_pair_paths.setdefault(identity, video_path)
+            if prior_path != video_path:
+                raise ValueError("one video shard number resolves to multiple paths")
+            prior_identity = video_path_identities.setdefault(video_path, identity)
+            if prior_identity != identity:
+                raise ValueError("video shard identities must resolve to unique canonical locations")
             expected_payload.add(video_relative.as_posix())
             if video_path not in video_probes:
-                video_file = release_tree.open_file(
+                opened_video = release_tree.open_file(
                     video_path, _MAX_VIDEO_BYTES, "video shard"
                 )
-                video_files[video_path] = video_file
+                video_files[video_path] = opened_video
                 try:
-                    video_probes[video_path] = services.probe_video(video_file.proc_path)
+                    video_probes[video_path] = services.probe_video(opened_video.proc_path)
                 finally:
-                    video_file.verify()
+                    opened_video.verify()
             probe = video_probes[video_path]
             width, height = camera_shapes[camera]
             if (
@@ -413,7 +423,7 @@ def _validate_v30_release_with_info(
                 raise ValueError(f"{camera_context} video fps or shape mismatch")
             if to_timestamp > probe.frames / probe.fps + 1.0 / fps + 1e-9:
                 raise ValueError(f"{camera_context} timestamp range exceeds video shard")
-            video_ranges[(camera, video_path)].append(
+            video_ranges[(camera, video_chunk, video_file_index, video_path)].append(
                 (from_timestamp, to_timestamp, episode_index)
             )
             episode_videos[camera] = _VideoSlice(
@@ -457,7 +467,7 @@ def _validate_v30_release_with_info(
     for path, table in data_tables.items():
         if data_coverage[path] != set(range(table.num_rows)):
             raise ValueError(f"data shard has unreferenced or multiply referenced rows: {path}")
-    _validate_video_coverage(video_ranges, video_probes, fps)
+    _validate_video_coverage(video_ranges, video_probes, fps, cameras)
 
     actual_payload = _payload_files_secure(release_tree)
     if actual_payload != expected_payload:
@@ -677,7 +687,7 @@ def _language_persistent_arrow_type() -> pa.ListType:
                 pa.field("style", pa.string()),
                 pa.field("timestamp", pa.float32()),
                 pa.field("camera", pa.string()),
-                pa.field("tool_calls", pa.list_(pa.string())),
+                pa.field("tool_calls", pa.list_(_json_arrow_type())),
             ]
         )
     )
@@ -691,10 +701,15 @@ def _language_events_arrow_type() -> pa.ListType:
                 pa.field("content", pa.string()),
                 pa.field("style", pa.string()),
                 pa.field("camera", pa.string()),
-                pa.field("tool_calls", pa.list_(pa.string())),
+                pa.field("tool_calls", pa.list_(_json_arrow_type())),
             ]
         )
     )
+
+
+def _json_arrow_type() -> pa.DataType:
+    """Match LeRobot v0.6.1's runtime JSON feature without importing it."""
+    return pa.json_() if hasattr(pa, "json_") else pa.string()
 
 
 def _image_arrow_type() -> pa.StructType:
@@ -737,7 +752,10 @@ def _validate_feature_values(array: pa.ChunkedArray, feature: _DataFeature) -> N
                     f"embedded image feature must contain bytes and a string/null path: {feature.name}"
                 )
         return
-    if feature.dtype in {"string", "language"} or feature.shape == (1,):
+    if feature.dtype == "language":
+        _validate_language_values(array, feature.name)
+        return
+    if feature.dtype == "string" or feature.shape == (1,):
         return
 
     def valid_shape(value: Any, dimensions: tuple[int, ...]) -> bool:
@@ -751,6 +769,51 @@ def _validate_feature_values(array: pa.ChunkedArray, feature: _DataFeature) -> N
 
     if any(not valid_shape(value, feature.shape) for value in array.to_pylist()):
         raise ValueError(f"data values disagree with declared feature shape: {feature.name}")
+
+
+def _validate_language_values(array: pa.ChunkedArray, feature_name: str) -> None:
+    persistent = feature_name == "language_persistent"
+    expected_fields = {
+        "role",
+        "content",
+        "style",
+        "camera",
+        "tool_calls",
+        *({"timestamp"} if persistent else set()),
+    }
+    for frame_rows in array.to_pylist():
+        if not isinstance(frame_rows, list):
+            raise ValueError(f"{feature_name} must contain lists of language rows")
+        for row in frame_rows:
+            if not isinstance(row, dict) or set(row) != expected_fields:
+                raise ValueError(f"{feature_name} has an invalid language row")
+            if not isinstance(row["role"], str) or not row["role"]:
+                raise ValueError(f"{feature_name} has an invalid language role")
+            for field in ("content", "style", "camera"):
+                if row[field] is not None and not isinstance(row[field], str):
+                    raise ValueError(f"{feature_name} has an invalid {field} value")
+            if persistent:
+                timestamp = row["timestamp"]
+                if (
+                    isinstance(timestamp, bool)
+                    or not isinstance(timestamp, (int, float))
+                    or not math.isfinite(float(timestamp))
+                ):
+                    raise ValueError(f"{feature_name} has an invalid timestamp")
+            tool_calls = row["tool_calls"]
+            if tool_calls is None:
+                continue
+            if not isinstance(tool_calls, list):
+                raise ValueError(f"{feature_name} has invalid tool_calls")
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, str):
+                    raise ValueError(f"{feature_name} has an invalid JSON tool call")
+                try:
+                    json.loads(tool_call)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"{feature_name} has an invalid JSON tool call"
+                    ) from exc
 
 
 def _validate_episode_arrow_schema(
@@ -926,14 +989,24 @@ def _validate_data_slice(
 
 
 def _validate_video_coverage(
-    ranges: Mapping[tuple[str, str], list[tuple[float, float, int]]],
+    ranges: Mapping[_VideoShardIdentity, list[_VideoRange]],
     probes: Mapping[str, Any],
     fps: float,
+    cameras: Sequence[str],
 ) -> None:
     tolerance = 1.0 / fps + 1e-9
     expected_episode: dict[str, int] = defaultdict(int)
-    for camera, path in sorted(ranges):
-        items = ranges[(camera, path)]
+    camera_order = {camera: index for index, camera in enumerate(cameras)}
+    ordered = sorted(
+        ranges,
+        key=lambda identity: (
+            camera_order[identity[0]],
+            identity[1],
+            identity[2],
+        ),
+    )
+    for camera, chunk_index, file_index, path in ordered:
+        items = ranges[(camera, chunk_index, file_index, path)]
         expected = 0.0
         for start, stop, episode_index in items:
             if episode_index != expected_episode[camera]:
@@ -999,17 +1072,23 @@ def _video_stats(
     episodes: Sequence[_Episode],
     cameras: Sequence[str],
     shapes: Mapping[str, tuple[int, int]],
-    ranges: Mapping[tuple[str, str], list[tuple[float, float, int]]],
+    ranges: Mapping[_VideoShardIdentity, list[_VideoRange]],
     services: ReleaseServices,
     fps: float,
     files: Mapping[str, SecureFile],
     profiles: Mapping[str, tuple[str, ...]],
 ) -> tuple[dict[str, dict[str, list[float]]], dict[int, dict[str, dict[str, list[float]]]]]:
     episode_values: dict[int, dict[str, np.ndarray]] = defaultdict(dict)
+    camera_order = {camera: index for index, camera in enumerate(cameras)}
     ordered_ranges = sorted(
-        ranges.items(), key=lambda item: (item[0][0], item[0][1])
+        ranges.items(),
+        key=lambda item: (
+            camera_order[item[0][0]],
+            item[0][1],
+            item[0][2],
+        ),
     )
-    for (camera, path), slices in ordered_ranges:
+    for (camera, _chunk_index, _file_index, path), slices in ordered_ranges:
         width, height = shapes[camera]
         requested: dict[int, int] = {}
         sampled_pixels: dict[int, list[np.ndarray]] = defaultdict(list)

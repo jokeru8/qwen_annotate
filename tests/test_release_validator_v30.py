@@ -14,7 +14,11 @@ from robo_annotate.lerobot import EpisodeVideoRef, inspect_dataset, probe_video
 from robo_annotate.models import FinalAnnotation
 from robo_annotate.release_validator import validate_release
 from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
-from tests.v30_fixtures import make_lerobot_v30_fixture, make_v30_config
+from tests.v30_fixtures import (
+    make_lerobot_v30_fixture,
+    make_official_language_array,
+    make_v30_config,
+)
 
 
 RECORDED_AT = datetime(2026, 8, 28, 12, tzinfo=UTC)
@@ -33,8 +37,15 @@ def accepted_v30_workspace(
     tmp_path: Path,
     *,
     lengths: tuple[int, ...] = (6, 8, 5),
+    video_shards_per_episode: bool = False,
+    non_padded_video_template: bool = False,
 ) -> tuple[Path, Path, dict]:
-    source = make_lerobot_v30_fixture(tmp_path, lengths=lengths)
+    source = make_lerobot_v30_fixture(
+        tmp_path,
+        lengths=lengths,
+        video_shards_per_episode=video_shards_per_episode,
+        non_padded_video_template=non_padded_video_template,
+    )
     work = tmp_path / "work"
     base = make_v30_config(source, work)
     payload = base.model_dump(mode="python")
@@ -73,8 +84,15 @@ def converted_v30_release(
     tmp_path: Path,
     *,
     lengths: tuple[int, ...] = (6, 8, 5),
+    video_shards_per_episode: bool = False,
+    non_padded_video_template: bool = False,
 ) -> Path:
-    work, _, services = accepted_v30_workspace(tmp_path, lengths=lengths)
+    work, _, services = accepted_v30_workspace(
+        tmp_path,
+        lengths=lengths,
+        video_shards_per_episode=video_shards_per_episode,
+        non_padded_video_template=non_padded_video_template,
+    )
     return convert_dataset(work, tmp_path / "converted", services=services).output
 
 
@@ -90,6 +108,75 @@ def test_v30_validator_accepts_pinned_v061_feature_and_stats_schema(
     assert info["features"]["language_persistent"]["dtype"] == "language"
     assert "q50" in json.loads((output / "meta/stats.json").read_text())["action"]
     assert validate_release(output, deep_video_stats=False).valid
+
+
+def test_v30_validator_accepts_hf_features_json_extension_language_columns(
+    tmp_path: Path,
+) -> None:
+    output = converted_v30_release(tmp_path)
+    table = pq.read_table(output / "data/chunk-000/file-000.parquet")
+    for name in ("language_persistent", "language_events"):
+        row_type = table.schema.field(name).type.value_type
+        json_type = row_type.field("tool_calls").type.value_type
+        assert isinstance(json_type, pa.BaseExtensionType)
+        assert json_type.extension_name == "arrow.json"
+    assert table["language_persistent"].to_pylist()[0][0]["tool_calls"]
+
+    assert validate_release(output, deep_video_stats=False).valid
+
+
+def test_v30_validator_rejects_string_tool_calls_when_json_extension_is_available(
+    tmp_path: Path,
+) -> None:
+    if not hasattr(pa, "json_"):
+        pytest.skip("the pinned fallback represents JSON tool calls as strings")
+    output = converted_v30_release(tmp_path)
+    path = output / "data/chunk-000/file-000.parquet"
+    table = pq.read_table(path)
+    name = "language_persistent"
+    string_type = pa.list_(
+        pa.struct(
+            [
+                pa.field("role", pa.string()),
+                pa.field("content", pa.string()),
+                pa.field("style", pa.string()),
+                pa.field("timestamp", pa.float32()),
+                pa.field("camera", pa.string()),
+                pa.field("tool_calls", pa.list_(pa.string())),
+            ]
+        )
+    )
+    position = table.schema.get_field_index(name)
+    table = table.set_column(
+        position,
+        name,
+        pa.array(table[name].to_pylist(), type=string_type),
+    )
+    pq.write_table(table, path)
+
+    with pytest.raises(ValueError, match=r"feature declaration: language_persistent"):
+        validate_release(output, deep_video_stats=False)
+
+
+def test_v30_validator_rejects_malformed_json_language_tool_call(
+    tmp_path: Path,
+) -> None:
+    output = converted_v30_release(tmp_path)
+    path = output / "data/chunk-000/file-000.parquet"
+    table = pq.read_table(path)
+    name = "language_persistent"
+    values = table[name].to_pylist()
+    values[0][0]["tool_calls"] = ["not-json"]
+    position = table.schema.get_field_index(name)
+    table = table.set_column(
+        position,
+        name,
+        make_official_language_array(values, persistent=True),
+    )
+    pq.write_table(table, path)
+
+    with pytest.raises(ValueError, match=r"language_persistent.*invalid JSON tool call"):
+        validate_release(output, deep_video_stats=False)
 
 
 @pytest.mark.parametrize(
@@ -740,6 +827,66 @@ def test_v30_validator_rejects_equal_length_video_range_swap(tmp_path: Path) -> 
     pq.write_table(table, path)
 
     with pytest.raises(ValueError, match=r"canonical physical video order"):
+        validate_release(output, deep_video_stats=False)
+
+
+def test_v30_validator_orders_nonpadded_video_shards_by_numeric_identity(
+    tmp_path: Path,
+) -> None:
+    output = converted_v30_release(
+        tmp_path,
+        lengths=(2,) * 11,
+        video_shards_per_episode=True,
+        non_padded_video_template=True,
+    )
+
+    assert (output / "videos/observation.images.main/chunk-000/file-10.mp4").is_file()
+    assert validate_release(output, deep_video_stats=False).valid
+
+
+def test_v30_validator_rejects_nonpadded_video_numeric_identity_swap(
+    tmp_path: Path,
+) -> None:
+    output = converted_v30_release(
+        tmp_path,
+        lengths=(2,) * 11,
+        video_shards_per_episode=True,
+        non_padded_video_template=True,
+    )
+    camera = "observation.images.main"
+    path = output / "meta/episodes/chunk-000/file-000.parquet"
+    table = pq.read_table(path)
+    name = f"videos/{camera}/file_index"
+    values = table[name].to_pylist()
+    values[2], values[10] = values[10], values[2]
+    position = table.schema.get_field_index(name)
+    table = table.set_column(
+        position,
+        table.schema.field(position),
+        pa.array(values, pa.int64()),
+    )
+    pq.write_table(table, path)
+
+    with pytest.raises(ValueError, match=r"canonical physical video order"):
+        validate_release(output, deep_video_stats=False)
+
+
+def test_v30_validator_rejects_video_identities_with_same_rendered_location(
+    tmp_path: Path,
+) -> None:
+    output = converted_v30_release(tmp_path)
+    info_path = output / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["video_path"] = (
+        "videos/{video_key:.0}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+    )
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    source = output / "videos/observation.images.main/chunk-000/file-000.mp4"
+    shared = output / "videos/chunk-000/file-000.mp4"
+    shared.parent.mkdir()
+    source.rename(shared)
+
+    with pytest.raises(ValueError, match=r"unique canonical locations"):
         validate_release(output, deep_video_stats=False)
 
 

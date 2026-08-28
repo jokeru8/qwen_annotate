@@ -25,6 +25,7 @@ _FRAME_HEIGHT = 24
 _TASK_TEXT = "Arrange the colored blocks."
 _STAT_METRICS = ("min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99")
 _COLOR_FRAME_CAPACITY = 1 + (255 - 16) // 20
+_COLOR_EPISODE_CAPACITY = 1 + (255 - 32) // 16
 
 
 def make_lerobot_v30_fixture(
@@ -33,8 +34,10 @@ def make_lerobot_v30_fixture(
     lengths: tuple[int, ...] = (6, 8, 5),
     fps: float = 5.0,
     cameras: tuple[str, ...] = ("observation.images.main", "observation.images.wrist"),
+    video_shards_per_episode: bool = False,
+    non_padded_video_template: bool = False,
 ) -> Path:
-    """Create a compact v3.0 dataset with one shared data and video shard.
+    """Create a compact v3.0 dataset with shared or episode-local video shards.
 
     Every camera video contains the concatenated frames of every episode.  RGB
     frame colors encode camera, episode, and episode-local frame indices so
@@ -45,6 +48,10 @@ def make_lerobot_v30_fixture(
     if any(length > _COLOR_FRAME_CAPACITY for length in lengths):
         raise ValueError(
             f"lengths must not exceed {_COLOR_FRAME_CAPACITY} frames for the fixture color encoding"
+        )
+    if len(lengths) > _COLOR_EPISODE_CAPACITY:
+        raise ValueError(
+            f"fixture color encoding supports at most {_COLOR_EPISODE_CAPACITY} episodes"
         )
     if not isinstance(fps, (int, float)) or isinstance(fps, bool) or fps <= 0:
         raise ValueError("fps must be positive")
@@ -102,8 +109,44 @@ def make_lerobot_v30_fixture(
                     "observation.matrix": matrix,
                     "observation.enabled": enabled,
                     "note": f"episode {episode_index}, frame {frame_index}",
-                    "language_persistent": [],
-                    "language_events": [],
+                    "language_persistent": (
+                        [
+                            {
+                                "role": "system",
+                                "content": "Track the active manipulation plan.",
+                                "style": "plan",
+                                "timestamp": frame_index / fps,
+                                "camera": None,
+                                "tool_calls": [
+                                    json.dumps(
+                                        {
+                                            "type": "function",
+                                            "function": {
+                                                "name": "remember",
+                                                "arguments": {"episode": episode_index},
+                                            },
+                                        },
+                                        separators=(",", ":"),
+                                    )
+                                ],
+                            }
+                        ]
+                        if frame_index == 0
+                        else []
+                    ),
+                    "language_events": (
+                        [
+                            {
+                                "role": "user",
+                                "content": "Begin the episode.",
+                                "style": None,
+                                "camera": None,
+                                "tool_calls": None,
+                            }
+                        ]
+                        if frame_index == 0
+                        else []
+                    ),
                     "timestamp": frame_index / fps,
                     "frame_index": frame_index,
                     "episode_index": episode_index,
@@ -122,10 +165,12 @@ def make_lerobot_v30_fixture(
             "dataset_to_index": global_offset + length,
         }
         for camera in cameras:
+            video_index = episode_index if video_shards_per_episode else 0
+            video_from = 0.0 if video_shards_per_episode else global_offset / fps
             row[f"videos/{camera}/chunk_index"] = 0
-            row[f"videos/{camera}/file_index"] = 0
-            row[f"videos/{camera}/from_timestamp"] = global_offset / fps
-            row[f"videos/{camera}/to_timestamp"] = (global_offset + length) / fps
+            row[f"videos/{camera}/file_index"] = video_index
+            row[f"videos/{camera}/from_timestamp"] = video_from
+            row[f"videos/{camera}/to_timestamp"] = video_from + length / fps
         episode_rows.append(row)
         episode_numeric_values.append(numeric_values)
         global_offset += length
@@ -146,13 +191,13 @@ def make_lerobot_v30_fixture(
                 [row["observation.enabled"] for row in all_rows], type=pa.bool_()
             ),
             "note": pa.array([row["note"] for row in all_rows], type=pa.string()),
-            "language_persistent": pa.array(
+            "language_persistent": make_official_language_array(
                 [row["language_persistent"] for row in all_rows],
-                type=_language_persistent_arrow_type(),
+                persistent=True,
             ),
-            "language_events": pa.array(
+            "language_events": make_official_language_array(
                 [row["language_events"] for row in all_rows],
-                type=_language_events_arrow_type(),
+                persistent=False,
             ),
             "timestamp": pa.array([row["timestamp"] for row in all_rows], type=pa.float32()),
             "frame_index": pa.array([row["frame_index"] for row in all_rows], type=pa.int64()),
@@ -172,23 +217,43 @@ def make_lerobot_v30_fixture(
 
     video_values: list[dict[str, list[tuple[float, ...]]]] = [dict() for _ in lengths]
     for camera_index, camera in enumerate(cameras):
-        video_path = root / f"videos/{camera}/chunk-000/file-000.mp4"
-        video_path.parent.mkdir(parents=True)
-        colors = tuple(
-            expected_color(camera_index, episode_index, frame_index)
-            for episode_index, length in enumerate(lengths)
-            for frame_index in range(length)
-        )
-        _write_video(video_path, colors, fps)
-        offset = 0
-        decoded = decoded_colors(video_path)
-        if len(decoded) != len(colors):
-            raise RuntimeError("fixture video encoder produced an unexpected frame count")
-        for episode_index, length in enumerate(lengths):
-            video_values[episode_index][camera] = [
-                tuple(channel / 255.0 for channel in color) for color in decoded[offset : offset + length]
-            ]
-            offset += length
+        if video_shards_per_episode:
+            for episode_index, length in enumerate(lengths):
+                filename = (
+                    f"file-{episode_index}.mp4"
+                    if non_padded_video_template
+                    else f"file-{episode_index:03d}.mp4"
+                )
+                video_path = root / f"videos/{camera}/chunk-000/{filename}"
+                video_path.parent.mkdir(parents=True, exist_ok=True)
+                colors = colors_for_episode(camera_index, episode_index, length)
+                _write_video(video_path, colors, fps)
+                decoded = decoded_colors(video_path)
+                if len(decoded) != len(colors):
+                    raise RuntimeError("fixture video encoder produced an unexpected frame count")
+                video_values[episode_index][camera] = [
+                    tuple(channel / 255.0 for channel in color) for color in decoded
+                ]
+        else:
+            filename = "file-0.mp4" if non_padded_video_template else "file-000.mp4"
+            video_path = root / f"videos/{camera}/chunk-000/{filename}"
+            video_path.parent.mkdir(parents=True)
+            colors = tuple(
+                expected_color(camera_index, episode_index, frame_index)
+                for episode_index, length in enumerate(lengths)
+                for frame_index in range(length)
+            )
+            _write_video(video_path, colors, fps)
+            offset = 0
+            decoded = decoded_colors(video_path)
+            if len(decoded) != len(colors):
+                raise RuntimeError("fixture video encoder produced an unexpected frame count")
+            for episode_index, length in enumerate(lengths):
+                video_values[episode_index][camera] = [
+                    tuple(channel / 255.0 for channel in color)
+                    for color in decoded[offset : offset + length]
+                ]
+                offset += length
 
     episode_stats: list[dict[str, dict[str, list[float]]]] = []
     for episode_index in range(len(lengths)):
@@ -286,7 +351,11 @@ def make_lerobot_v30_fixture(
         "data_files_size_in_mb": 100,
         "video_files_size_in_mb": 200,
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
-        "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
+        "video_path": (
+            "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index}.mp4"
+            if non_padded_video_template
+            else "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+        ),
         "splits": {"train": f"0:{len(lengths)}"},
     }
     (meta / "info.json").write_text(json.dumps(info), encoding="utf-8")
@@ -317,7 +386,7 @@ def expected_color(camera_index: int, episode_index: int, frame_index: int) -> t
     """Return the stable RGB code used for one episode-local fixture frame."""
     if min(camera_index, episode_index, frame_index) < 0:
         raise ValueError("color indices must be nonnegative")
-    color = (32 + camera_index * 96, 32 + episode_index * 64, 16 + frame_index * 20)
+    color = (32 + camera_index * 96, 32 + episode_index * 16, 16 + frame_index * 20)
     if any(channel > 255 for channel in color):
         raise ValueError("fixture color encoding supports only small test indices")
     return color
@@ -481,9 +550,65 @@ def _official_histogram_quantile(values: tuple[float, ...], quantile: float) -> 
 
 
 def _json_arrow_type() -> pa.DataType:
-    # Hugging Face ``datasets.Json`` persists through Parquet as its string
-    # storage type; LeRobot also explicitly falls back to string on older Arrow.
-    return pa.string()
+    return pa.json_() if hasattr(pa, "json_") else pa.string()
+
+
+def make_official_language_array(
+    rows: list[object],
+    *,
+    persistent: bool,
+) -> pa.ListArray:
+    """Build the nested JSON-extension array emitted by HF ``datasets``.
+
+    PyArrow cannot construct nested extension arrays directly from Python
+    values, so the fixture assembles the official representation bottom-up.
+    """
+    flattened: list[dict[str, object]] = []
+    offsets = [0]
+    for value in rows:
+        if not isinstance(value, list):
+            raise TypeError("language fixture rows must be lists")
+        flattened.extend(value)
+        offsets.append(len(flattened))
+
+    tool_call_values: list[str] = []
+    tool_call_offsets = [0]
+    tool_call_validity: list[bool] = []
+    for row in flattened:
+        calls = row.get("tool_calls")
+        tool_call_validity.append(calls is not None)
+        if calls is not None:
+            tool_call_values.extend(calls)
+        tool_call_offsets.append(len(tool_call_values))
+
+    json_type = _json_arrow_type()
+    json_storage = pa.array(tool_call_values, type=pa.string())
+    json_values = (
+        pa.ExtensionArray.from_storage(json_type, json_storage)
+        if isinstance(json_type, pa.BaseExtensionType)
+        else json_storage
+    )
+    tool_calls = pa.ListArray.from_arrays(
+        pa.array(tool_call_offsets, type=pa.int32()),
+        json_values,
+        mask=pa.array([not valid for valid in tool_call_validity], type=pa.bool_()),
+    )
+    language_type = (
+        _language_persistent_arrow_type()
+        if persistent
+        else _language_events_arrow_type()
+    )
+    fields = list(language_type.value_type)
+    arrays = []
+    for field in fields:
+        if field.name == "tool_calls":
+            arrays.append(tool_calls)
+        else:
+            arrays.append(
+                pa.array([row.get(field.name) for row in flattened], type=field.type)
+            )
+    values = pa.StructArray.from_arrays(arrays, fields=fields)
+    return pa.ListArray.from_arrays(pa.array(offsets, type=pa.int32()), values)
 
 
 def _language_persistent_arrow_type() -> pa.ListType:
@@ -520,7 +645,7 @@ def _normalized_rgb(rgb: object) -> tuple[int, int, int]:
     means = rgb.mean(axis=(0, 1))  # PyAV supplies the RGB ndarray.
     return (
         _nearest_palette_value(float(means[0]), 32, 96),
-        _nearest_palette_value(float(means[1]), 32, 64),
+        _nearest_palette_value(float(means[1]), 32, 16),
         _nearest_palette_value(float(means[2]), 16, 20),
     )
 
