@@ -457,7 +457,8 @@ def _sample(service, episode, camera, indices, fps):
         raise ValueError(f"review camera {camera!r} is absent from episode")
     if indices != sorted(set(indices)) or any(type(item) is not int or not 0 <= item < episode.length for item in indices):
         raise ValueError("review sampling indices are invalid")
-    samples = service.sampler(episode.videos[camera], camera, indices, fps)
+    video = episode.videos[camera]
+    samples = service.sampler(video.path, camera, indices, video.fps)
     if not isinstance(samples, list) or len(samples) != len(indices):
         raise ValueError("review sampler must return exactly the requested frames")
     if [item.frame_index for item in samples] != indices:
@@ -465,7 +466,7 @@ def _sample(service, episode, camera, indices, fps):
     for item in samples:
         if not isinstance(item, FrameSample) or item.camera_key != camera:
             raise ValueError("review sampler camera metadata is invalid")
-        if not math.isclose(item.timestamp_seconds, item.frame_index / fps, abs_tol=1e-7):
+        if not math.isclose(item.timestamp_seconds, item.frame_index / video.fps, abs_tol=1e-7):
             raise ValueError("review sampler timestamp is invalid")
     return samples
 

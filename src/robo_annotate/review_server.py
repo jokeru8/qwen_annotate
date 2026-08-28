@@ -109,7 +109,7 @@ class ReviewRuntime:
         episode = self.dataset.episodes[index]
         if camera not in self.manifest.camera_keys or camera not in episode.videos:
             raise KeyError(camera)
-        path = episode.videos[camera]
+        path = episode.videos[camera].path
         if path.is_symlink():
             raise ValueError("video is not a regular file")
         resolved = path.resolve()

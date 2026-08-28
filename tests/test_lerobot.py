@@ -9,7 +9,15 @@ import pyarrow.parquet as pq
 import pytest
 from pydantic import ValidationError
 
-from robo_annotate.lerobot import DatasetIndex, VideoProbe, inspect_dataset, probe_video
+from robo_annotate.lerobot import (
+    DatasetIndex,
+    EpisodeDataRef,
+    EpisodeVideoRef,
+    VideoProbe,
+    detect_dataset_version,
+    inspect_dataset,
+    probe_video,
+)
 from tests.fixtures import make_config, make_lerobot_fixture
 
 
@@ -34,10 +42,42 @@ def test_inspects_valid_v21_dataset_with_resolved_paths(tmp_path: Path) -> None:
     assert index.fps == 5.0
     assert index.camera_keys == ["cam.eye"]
     assert [episode.length for episode in index.episodes] == [12, 12]
-    assert index.episodes[1].parquet == root / "data/chunk-000/episode_000001.parquet"
-    assert index.episodes[0].videos == {
-        "cam.eye": root / "videos/chunk-000/cam.eye/episode_000000.mp4"
-    }
+    assert index.episodes[1].data.path == root / "data/chunk-000/episode_000001.parquet"
+    assert index.episodes[0].videos["cam.eye"].path == (
+        root / "videos/chunk-000/cam.eye/episode_000000.mp4"
+    )
+
+
+def test_v21_is_exposed_through_local_slice_references(tmp_path: Path) -> None:
+    root = make_lerobot_fixture(tmp_path, [12], 5.0, ["cam.eye"])
+    dataset = inspect_dataset(make_config(root, tmp_path / "work"), fixed_probe)
+    episode = dataset.episodes[0]
+
+    assert dataset.version == "v2.1"
+    assert episode.data == EpisodeDataRef(
+        path=root / "data/chunk-000/episode_000000.parquet",
+        dataset_from_index=0,
+        dataset_to_index=12,
+    )
+    assert episode.videos["cam.eye"] == EpisodeVideoRef(
+        path=root / "videos/chunk-000/cam.eye/episode_000000.mp4",
+        from_timestamp=0.0,
+        to_timestamp=12 / 5.0,
+        fps=5.0,
+    )
+
+
+def test_version_detector_rejects_missing_and_unknown_versions(tmp_path: Path) -> None:
+    root = make_lerobot_fixture(tmp_path, [12], 5.0, ["cam.eye"])
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    for value in (None, "v4.0"):
+        mutated = {key: item for key, item in info.items() if key != "codebase_version"}
+        if value is not None:
+            mutated["codebase_version"] = value
+        info_path.write_text(json.dumps(mutated))
+        with pytest.raises(ValueError, match="Unsupported LeRobot codebase_version"):
+            detect_dataset_version(root)
 
 
 def test_rejects_missing_refine_camera_with_key(tmp_path: Path) -> None:
@@ -50,7 +90,10 @@ def test_rejects_missing_refine_camera_with_key(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
-        (lambda root: metadata(root) | {"codebase_version": "v2.0"}, "v2.1"),
+        (
+            lambda root: metadata(root) | {"codebase_version": "v2.0"},
+            "Unsupported LeRobot codebase_version",
+        ),
         (lambda root: metadata(root) | {"total_episodes": 3}, "total_episodes"),
         (lambda root: metadata(root) | {"total_frames": 99}, "total_frames"),
         (lambda root: metadata(root) | {"total_videos": 99}, "total_videos"),

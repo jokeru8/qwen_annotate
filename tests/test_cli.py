@@ -9,8 +9,8 @@ from robo_annotate.model_manager import ModelInstall
 from datetime import UTC, datetime
 from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
 from robo_annotate.pipeline import WorkspaceSummary
-from robo_annotate.lerobot import DatasetIndex, EpisodeInfo
-from tests.fixtures import make_legacy_v4_workspace
+from robo_annotate.lerobot import DatasetIndex
+from tests.fixtures import make_episode_info, make_legacy_v4_workspace
 
 
 runner = CliRunner()
@@ -108,7 +108,14 @@ def test_malformed_yaml_is_invalid_config_exit_two(tmp_path: Path) -> None:
 def test_inspect_prints_dataset_metadata(monkeypatch, tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
-    episode = EpisodeInfo(episode_index=0, length=12, task="task", parquet=source / "x", videos={"cam.eye": source / "v"})
+    episode = make_episode_info(
+        episode_index=0,
+        length=12,
+        task="task",
+        parquet=source / "x",
+        videos={"cam.eye": source / "v"},
+        fps=28.0,
+    )
     dataset = DatasetIndex(root=source, version="v2.1", fps=28.0, camera_keys=["cam.eye"], episodes=[episode])
     monkeypatch.setattr("robo_annotate.cli._config", lambda path: object())
     monkeypatch.setattr("robo_annotate.cli.inspect_dataset", lambda config: dataset)

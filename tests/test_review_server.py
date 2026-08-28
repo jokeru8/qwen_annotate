@@ -163,7 +163,7 @@ def test_open_video_descriptor_keeps_verified_bytes_after_path_replacement(tmp_p
     client, _, _, _, _ = _client(tmp_path)
     runtime = client.app.state.review_runtime
     descriptor, size = runtime.open_video(0, "cam.eye")
-    path = runtime.dataset.episodes[0].videos["cam.eye"]
+    path = runtime.dataset.episodes[0].videos["cam.eye"].path
     replacement = path.with_suffix(".replacement")
     replacement.write_bytes(b"other")
     replacement.replace(path)

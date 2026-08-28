@@ -1,19 +1,20 @@
-"""Read-only inspection of LeRobot v2.1 datasets."""
+"""Version-neutral models and read-only inspection facade for LeRobot datasets."""
 
 import json
 import math
 from collections.abc import Callable
 from pathlib import Path
 from string import Formatter
-from typing import Any
+from typing import Any, Literal, Self, cast
 
 import pyarrow.parquet as pq
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from robo_annotate.config import AnnotationConfig
 
 
 VIDEO_FPS_TOLERANCE = 0.01
+DatasetVersion = Literal["v2.1", "v3.0"]
 
 
 def video_fps_matches(measured: float, expected: float) -> bool:
@@ -45,17 +46,40 @@ class VideoProbe(BaseModel):
         return value
 
 
+class _Reference(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", allow_inf_nan=False)
+
+
+class EpisodeDataRef(_Reference):
+    path: Path
+    dataset_from_index: int = Field(ge=0, strict=True)
+    dataset_to_index: int = Field(gt=0, strict=True)
+
+    @model_validator(mode="after")
+    def ordered(self) -> Self:
+        if self.dataset_to_index <= self.dataset_from_index:
+            raise ValueError("dataset_to_index must exceed dataset_from_index")
+        return self
+
+
+class EpisodeVideoRef(_Reference):
+    path: Path
+    from_timestamp: float = Field(ge=0)
+    to_timestamp: float = Field(gt=0)
+    fps: float = Field(gt=0)
+
+
 class EpisodeInfo(BaseModel):
     episode_index: int
     length: int
     task: str
-    parquet: Path
-    videos: dict[str, Path]
+    data: EpisodeDataRef
+    videos: dict[str, EpisodeVideoRef]
 
 
 class DatasetIndex(BaseModel):
     root: Path
-    version: str
+    version: DatasetVersion
     fps: float = Field(gt=0)
     camera_keys: list[str]
     episodes: list[EpisodeInfo]
@@ -112,121 +136,28 @@ def inspect_dataset(
     config: AnnotationConfig,
     probe: Callable[[Path], VideoProbe] = probe_video,
 ) -> DatasetIndex:
-    """Validate and index a local LeRobot v2.1 dataset without writing to it."""
+    """Validate and index a supported local LeRobot dataset without writing to it."""
     root = config.source.resolve()
     info = _read_json_object(root / "meta" / "info.json")
-    version = _required_string(info, "codebase_version", "info.json")
-    if version != "v2.1":
-        raise ValueError(f"LeRobot codebase_version must be v2.1, got {version!r}")
+    version = _dataset_version(info)
+    if version == "v2.1":
+        from .lerobot_v21 import inspect_v21_dataset
 
-    fps = _positive_number(info, "fps", "info.json")
-    chunks_size = _positive_int(info, "chunks_size", "info.json")
-    total_episodes = _nonnegative_int(info, "total_episodes", "info.json")
-    expected_total_frames = _nonnegative_int(info, "total_frames", "info.json")
-    data_path_format = _required_string(info, "data_path", "info.json")
-    video_path_format = _required_string(info, "video_path", "info.json")
-    _validate_path_template(data_path_format, "data_path", {"episode_index"})
-    _validate_path_template(video_path_format, "video_path", {"episode_index", "video_key"})
-    camera_keys = _camera_keys(info)
-    _require_configured_cameras(config, camera_keys)
-    task_texts = _task_texts(root / "meta" / "tasks.jsonl")
-    total_tasks = _nonnegative_int(info, "total_tasks", "info.json")
-    if len(task_texts) != total_tasks:
-        raise ValueError(f"info.total_tasks is {total_tasks}, but tasks.jsonl has {len(task_texts)} rows")
-    episode_rows = _read_jsonl(root / "meta" / "episodes.jsonl")
+        return inspect_v21_dataset(config, info, probe)
+    raise NotImplementedError("LeRobot v3.0 inspection is not implemented")
 
-    if len(episode_rows) != total_episodes:
-        raise ValueError(
-            f"info.total_episodes is {total_episodes}, but episodes.jsonl has {len(episode_rows)} rows"
-        )
-    total_chunks = _nonnegative_int(info, "total_chunks", "info.json")
-    expected_chunks = (total_episodes + chunks_size - 1) // chunks_size
-    if total_chunks != expected_chunks:
-        raise ValueError(f"info.total_chunks is {total_chunks}, expected {expected_chunks}")
 
-    episodes: list[EpisodeInfo] = []
-    total_frames = 0
-    seen_parquets: set[Path] = set()
-    seen_videos: set[Path] = set()
-    for expected_index, row in enumerate(episode_rows):
-        episode_index = _required_int(row, "episode_index", f"episodes.jsonl row {expected_index}")
-        if episode_index != expected_index:
-            raise ValueError("Episode indices must be contiguous from 0 through N-1")
-        length = _positive_int(row, "length", f"episodes.jsonl row {expected_index}")
-        episode_tasks = _episode_tasks(row, expected_index)
-        for task in episode_tasks:
-            if task not in task_texts.values():
-                raise ValueError(
-                    f"Episode {episode_index} references task {task!r}, absent from meta/tasks.jsonl"
-                )
-        if len(episode_tasks) != 1:
-            raise ValueError(
-                "First release supports exactly one task per episode; "
-                f"episode {episode_index} has {len(episode_tasks)}"
-            )
-        task = episode_tasks[0]
-        values = {
-            "episode_chunk": episode_index // chunks_size,
-            "episode_index": episode_index,
-        }
-        parquet = _resolve_dataset_path(root, _format_path(data_path_format, values, "data_path"), "data_path")
-        if parquet in seen_parquets:
-            raise ValueError(f"data_path resolves duplicate parquet path: {parquet}")
-        seen_parquets.add(parquet)
-        _verify_parquet_rows(parquet, length, episode_index)
-        videos: dict[str, Path] = {}
-        for video_key in camera_keys:
-            video = _resolve_dataset_path(
-                root,
-                _format_path(video_path_format, values | {"video_key": video_key}, "video_path"),
-                "video_path",
-            )
-            if video in seen_videos:
-                raise ValueError(f"video_path resolves duplicate video path: {video}")
-            seen_videos.add(video)
-            if not video.is_file():
-                raise FileNotFoundError(f"Missing video for episode {episode_index}: {video}")
-            video_probe = probe(video)
-            if video_probe.frames != length:
-                raise ValueError(
-                    f"Video frame count for episode {episode_index}, camera {video_key!r} "
-                    f"is {video_probe.frames}, expected {length}"
-                )
-            if not video_fps_matches(video_probe.fps, fps):
-                raise ValueError(
-                    f"Video fps for episode {episode_index}, camera {video_key!r} "
-                    f"is {video_probe.fps}, expected {fps}"
-                )
-            videos[video_key] = video
-        episodes.append(
-            EpisodeInfo(
-                episode_index=episode_index,
-                length=length,
-                task=task,
-                parquet=parquet,
-                videos=videos,
-            )
-        )
-        total_frames += length
+def detect_dataset_version(root: Path) -> DatasetVersion:
+    """Return the declared supported LeRobot version without guessing from layout."""
+    info = _read_json_object(root.resolve() / "meta" / "info.json")
+    return _dataset_version(info)
 
-    if total_frames != expected_total_frames:
-        raise ValueError(
-            f"info.total_frames is {expected_total_frames}, but episode lengths total {total_frames}"
-        )
-    if "total_videos" in info:
-        total_videos = _nonnegative_int(info, "total_videos", "info.json")
-        expected_total_videos = total_episodes * len(camera_keys)
-        if total_videos != expected_total_videos:
-            raise ValueError(
-                f"info.total_videos is {total_videos}, expected {expected_total_videos}"
-            )
-    return DatasetIndex(
-        root=root,
-        version=version,
-        fps=fps,
-        camera_keys=camera_keys,
-        episodes=episodes,
-    )
+
+def _dataset_version(info: dict[str, Any]) -> DatasetVersion:
+    version = info.get("codebase_version")
+    if version not in ("v2.1", "v3.0"):
+        raise ValueError(f"Unsupported LeRobot codebase_version: {version!r}")
+    return cast(DatasetVersion, version)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:

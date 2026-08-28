@@ -16,6 +16,7 @@ from robo_annotate.lerobot import EpisodeInfo
 from robo_annotate.models import CoarseBoundary, CoarseResult
 from robo_annotate.video import FrameSample
 from robo_annotate.workspace import compute_source_fingerprint
+from tests.fixtures import make_episode_info
 
 
 def make_config(tmp_path: Path, *, mode: str = "complete", subtask_count: int = 3) -> AnnotationConfig:
@@ -49,12 +50,13 @@ def make_episode(tmp_path: Path, *, length: int = 101, camera: str = "cam.eye") 
         parquet.touch()
     if not video.exists():
         video.touch()
-    return EpisodeInfo(
+    return make_episode_info(
         episode_index=7,
         length=length,
         task="arrange objects",
         parquet=parquet,
         videos={camera: video},
+        fps=20.0,
     )
 
 
@@ -389,7 +391,7 @@ async def test_sampler_receives_exact_video_camera_grid_and_source_fps(tmp_path:
     decision = await run_coarse(make_config(tmp_path), episode, sampler, client)
 
     assert len(sampler.calls) == 1
-    assert sampler.calls[0][0] == episode.videos["cam.eye"].resolve()
+    assert sampler.calls[0][0] == episode.videos["cam.eye"].path.resolve()
     assert sampler.calls[0][1] == "cam.eye"
     assert sampler.calls[0][2] == sorted(set().union(*decision.sampled_frame_indices))
     assert sampler.calls[0][3] == 20.0
@@ -474,13 +476,7 @@ async def test_missing_primary_camera_and_invalid_episode_are_rejected(tmp_path:
             RecordingSampler(),
             RecordingClient([]),
         )
-    bad_episode = make_episode(tmp_path).model_construct(
-        episode_index=7,
-        length=0,
-        task="arrange",
-        parquet=tmp_path / "episode.parquet",
-        videos={"cam.eye": tmp_path / "cam.eye.mp4"},
-    )
+    bad_episode = make_episode(tmp_path).model_copy(update={"length": 0})
     with pytest.raises(ValueError, match="length"):
         await run_coarse(make_config(tmp_path), bad_episode, RecordingSampler(), RecordingClient([]))
 
@@ -913,11 +909,17 @@ async def test_primary_video_must_be_regular_contained_source_file(tmp_path: Pat
     contained = make_episode(tmp_path)
     outside = tmp_path / "outside.mp4"
     outside.touch()
-    external = contained.model_copy(update={"videos": {"cam.eye": outside}})
+    external = contained.model_copy(
+        update={
+            "videos": {
+                "cam.eye": contained.videos["cam.eye"].model_copy(update={"path": outside})
+            }
+        }
+    )
     with pytest.raises(ValueError, match="inside source"):
         await run_coarse(config, external, RecordingSampler(), RecordingClient([]))
 
-    link = contained.videos["cam.eye"]
+    link = contained.videos["cam.eye"].path
     link.unlink()
     link.symlink_to(outside)
     with pytest.raises(ValueError, match="symlink"):
@@ -936,7 +938,7 @@ async def test_source_change_during_sampling_is_detected(tmp_path: Path, changed
         if changed == "metadata":
             (config.source / "meta" / "info.json").write_text('{"fps":20.0,"changed":true}', encoding="utf-8")
         else:
-            episode.videos["cam.eye"].write_bytes(b"changed")
+            episode.videos["cam.eye"].path.write_bytes(b"changed")
         return samples
 
     with pytest.raises(ValueError, match="changed during coarse"):
@@ -953,8 +955,8 @@ async def test_primary_video_symlink_swap_during_sampling_is_detected(tmp_path: 
 
     def swapping_sampler(*args):
         samples = base(*args)
-        episode.videos["cam.eye"].unlink()
-        episode.videos["cam.eye"].symlink_to(outside)
+        episode.videos["cam.eye"].path.unlink()
+        episode.videos["cam.eye"].path.symlink_to(outside)
         return samples
 
     with pytest.raises(ValueError, match="changed during coarse"):
@@ -990,7 +992,7 @@ async def test_expected_source_fingerprint_is_checked_before_sampling(tmp_path: 
 @pytest.mark.asyncio
 async def test_source_files_are_not_modified(tmp_path: Path) -> None:
     config = make_config(tmp_path)
-    video = make_episode(tmp_path).videos["cam.eye"]
+    video = make_episode(tmp_path).videos["cam.eye"].path
     video.write_bytes(b"source video")
     before = recursive_source_snapshot(config.source)
 

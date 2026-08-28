@@ -8,6 +8,38 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from robo_annotate.config import AnnotationConfig
+from robo_annotate.lerobot import EpisodeDataRef, EpisodeInfo, EpisodeVideoRef
+
+
+def make_episode_info(
+    *,
+    episode_index: int,
+    length: int,
+    task: str,
+    parquet: Path,
+    videos: dict[str, Path],
+    fps: float,
+) -> EpisodeInfo:
+    """Build a v2.1 episode with whole-file, zero-origin references."""
+    return EpisodeInfo(
+        episode_index=episode_index,
+        length=length,
+        task=task,
+        data=EpisodeDataRef(
+            path=parquet,
+            dataset_from_index=0,
+            dataset_to_index=length,
+        ),
+        videos={
+            camera: EpisodeVideoRef(
+                path=path,
+                from_timestamp=0.0,
+                to_timestamp=length / fps,
+                fps=fps,
+            )
+            for camera, path in videos.items()
+        },
+    )
 
 
 def make_legacy_v4_workspace(tmp_path: Path) -> Path:

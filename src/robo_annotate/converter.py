@@ -434,7 +434,7 @@ def _rewrite_accepted_subset(
         }
         parquet_relative = _render_payload_path(data_template, values, "data_path", "data")
         parquet_destination = staging / parquet_relative
-        rewrite_episode_parquet(episode.parquet, parquet_destination, remap)
+        rewrite_episode_parquet(episode.data.path, parquet_destination, remap)
         rewritten_parquets.append(parquet_destination)
         for camera in manifest.camera_keys:
             video_relative = _render_payload_path(
@@ -442,7 +442,7 @@ def _rewrite_accepted_subset(
             )
             destination = staging / video_relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(episode.videos[camera], destination, follow_symlinks=False)
+            shutil.copy2(episode.videos[camera].path, destination, follow_symlinks=False)
             rewritten_videos[camera].append(destination)
 
     source_episode_rows = _read_source_jsonl(source / "meta/episodes.jsonl")

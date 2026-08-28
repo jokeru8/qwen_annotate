@@ -9,14 +9,14 @@ from pydantic import ValidationError
 
 from robo_annotate.coarse import CoarseDecision
 from robo_annotate.config import AnnotationConfig, Subtask
-from robo_annotate.lerobot import DatasetIndex, EpisodeInfo
+from robo_annotate.lerobot import DatasetIndex
 from robo_annotate.model_manager import ModelInstall
 from robo_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation
 from robo_annotate.pipeline import AuditPersistenceError, PipelineServices, WorkspaceSummary, _installed_model, annotate_dataset
 from robo_annotate.refine import CameraSampling, RefineDecision, SamplingProvenance
 from robo_annotate.qwen_client import InvalidModelResponse, ModelCallError, ModelOutOfMemory
 from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
-from tests.fixtures import make_config
+from tests.fixtures import make_config, make_episode_info
 
 
 SHA = "a" * 40
@@ -45,7 +45,14 @@ def _dataset(tmp_path: Path, count: int = 2) -> DatasetIndex:
         video = root / f"episode-{index}.mp4"
         parquet.write_bytes(b"parquet")
         video.write_bytes(b"video")
-        episodes.append(EpisodeInfo(episode_index=index, length=10, task="task", parquet=parquet, videos={"cam.eye": video}))
+        episodes.append(make_episode_info(
+            episode_index=index,
+            length=10,
+            task="task",
+            parquet=parquet,
+            videos={"cam.eye": video},
+            fps=5.0,
+        ))
     return DatasetIndex(root=root.resolve(), version="v2.1", fps=5.0, camera_keys=["cam.eye"], episodes=episodes)
 
 

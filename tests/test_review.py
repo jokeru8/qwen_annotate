@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from robo_annotate.cli import app
 from robo_annotate.config import AnnotationConfig
-from robo_annotate.lerobot import DatasetIndex, EpisodeInfo
+from robo_annotate.lerobot import DatasetIndex
 from robo_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
 from robo_annotate.prompts import PROMPT_VERSION
 from robo_annotate.review import (
@@ -23,6 +23,7 @@ from robo_annotate.review import (
 )
 from robo_annotate.video import FrameSample
 from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
+from tests.fixtures import make_episode_info
 
 
 NOW = datetime(2026, 8, 22, tzinfo=UTC)
@@ -38,7 +39,14 @@ def _workspace(tmp_path: Path, *, mode: str = "dagger_patch", reasons=None, issu
         path = source / f"{camera.replace('/', '_')}.mp4"
         path.write_bytes(b"video")
         videos[camera] = path
-    episode = EpisodeInfo(episode_index=0, length=240, task="task", parquet=parquet, videos=videos)
+    episode = make_episode_info(
+        episode_index=0,
+        length=240,
+        task="task",
+        parquet=parquet,
+        videos=videos,
+        fps=20.0,
+    )
     dataset = DatasetIndex(root=source, version="v2.1", fps=20.0, camera_keys=list(videos), episodes=[episode])
     config = AnnotationConfig.model_validate({
         "source": source, "work_dir": tmp_path / "work", "mode": mode,

@@ -19,6 +19,7 @@ from robo_annotate.refine import (
 )
 from robo_annotate.video import FrameSample
 from robo_annotate.workspace import compute_source_fingerprint
+from tests.fixtures import make_episode_info
 
 
 def make_config(
@@ -65,7 +66,14 @@ def make_episode(tmp_path: Path, *, length: int = 41, cameras=("cam.eye", "cam.w
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
         videos[camera] = path
-    return EpisodeInfo(episode_index=7, length=length, task="arrange", parquet=parquet, videos=videos)
+    return make_episode_info(
+        episode_index=7,
+        length=length,
+        task="arrange",
+        parquet=parquet,
+        videos=videos,
+        fps=10.0,
+    )
 
 
 def coarse_result(observed, centers):
@@ -648,7 +656,7 @@ async def test_expected_fingerprint_duplicate_metadata_and_symlink_are_rejected(
         await run_refine(config, episode, coarse_decision(), RecordingSampler(), RecordingClient([]))
 
     (config.source / "meta" / "info.json").write_text('{"fps":10}', encoding="utf-8")
-    target = episode.videos["cam.wrist"]
+    target = episode.videos["cam.wrist"].path
     target.unlink()
     real = target.with_suffix(".real.mp4")
     real.touch()

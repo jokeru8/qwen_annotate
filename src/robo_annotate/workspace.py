@@ -328,11 +328,11 @@ class RunManifest(_StrictModel):
 def compute_source_fingerprint(dataset_root: Path, episode: EpisodeInfo) -> str:
     """Hash source metadata needed to determine whether cached evidence is stale."""
     root = _absolute_root(dataset_root)
-    parquet, parquet_relative = _contained_file(root, episode.parquet, "parquet")
+    parquet, parquet_relative = _contained_file(root, episode.data.path, "parquet")
     parquet_stat = parquet.stat()
     videos: list[dict[str, object]] = []
-    for camera, path in sorted(episode.videos.items()):
-        video, relative = _contained_file(root, path, f"video {camera!r}")
+    for camera, reference in sorted(episode.videos.items()):
+        video, relative = _contained_file(root, reference.path, f"video {camera!r}")
         stat = video.stat()
         videos.append(
             {

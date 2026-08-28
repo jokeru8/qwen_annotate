@@ -12,10 +12,11 @@ import pytest
 
 from robo_annotate.config import AnnotationConfig
 from robo_annotate.converter import ConversionReport, convert_dataset
-from robo_annotate.lerobot import DatasetIndex, EpisodeInfo, VideoProbe
+from robo_annotate.lerobot import DatasetIndex, VideoProbe
 from robo_annotate.models import FinalAnnotation
 from robo_annotate.release_validator import validate_release
 from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
+from tests.fixtures import make_episode_info
 
 
 NOW = datetime(2026, 8, 22, 12, tzinfo=UTC)
@@ -61,10 +62,17 @@ def _fixture(
         video = source / f"videos/chunk-000/cam.eye/episode_{i:06d}.mp4"
         video.parent.mkdir(parents=True, exist_ok=True)
         video.write_bytes((f"video-{i}").encode())
-        episodes.append(EpisodeInfo(episode_index=i, length=length, task="Arrange.", parquet=parquet, videos={"cam.eye": video}))
+        episodes.append(make_episode_info(
+            episode_index=i,
+            length=length,
+            task="Arrange.",
+            parquet=parquet,
+            videos={"cam.eye": video},
+            fps=10.0,
+        ))
     (source / "meta/episodes.jsonl").write_text("\n".join(rows) + "\n")
     from robo_annotate.stats import recompute_stats
-    aggregate_stats = recompute_stats([episode.parquet for episode in episodes])
+    aggregate_stats = recompute_stats([episode.data.path for episode in episodes])
     image_values = (
         {"min": 0.0, "max": 1.0, "mean": 0.5, "std": 0.1,
          "q01": 0.0, "q10": 0.1, "q50": 0.5, "q90": 0.9, "q99": 1.0}
@@ -77,7 +85,7 @@ def _fixture(
     } | {"count": [24 if legacy_stats else 40 * 4 * 6]}
     (source / "meta/stats.json").write_text(json.dumps(aggregate_stats))
     episode_stats = [
-        {"episode_index": i, "stats": recompute_stats([episode.parquet])}
+        {"episode_index": i, "stats": recompute_stats([episode.data.path])}
         for i, episode in enumerate(episodes)
     ]
     (source / "meta/episodes_stats.jsonl").write_text(

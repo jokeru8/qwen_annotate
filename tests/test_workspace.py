@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from robo_annotate.coarse import CoarseDecision
 from robo_annotate.config import Subtask
-from robo_annotate.lerobot import DatasetIndex, EpisodeInfo
+from robo_annotate.lerobot import DatasetIndex
 from robo_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
 from robo_annotate.prompts import PROMPT_VERSION
 from robo_annotate.refine import RefineDecision
@@ -20,7 +20,7 @@ from robo_annotate.workspace import (
     compute_run_fingerprint,
     compute_source_fingerprint,
 )
-from tests.fixtures import make_config, make_legacy_v4_workspace
+from tests.fixtures import make_config, make_episode_info, make_legacy_v4_workspace
 
 
 SHA = "a" * 40
@@ -44,7 +44,14 @@ def make_index(tmp_path: Path, lengths: list[int] = [10, 12]) -> DatasetIndex:
         video.parent.mkdir(parents=True, exist_ok=True)
         parquet.write_bytes(bytes([index + 1]) * 7)
         video.write_bytes(bytes([index + 2]) * 11)
-        episodes.append(EpisodeInfo(episode_index=index, length=length, task="arrange", parquet=parquet, videos={"cam.eye": video}))
+        episodes.append(make_episode_info(
+            episode_index=index,
+            length=length,
+            task="arrange",
+            parquet=parquet,
+            videos={"cam.eye": video},
+            fps=5.0,
+        ))
     return DatasetIndex(root=root.resolve(), version="v2.1", fps=5.0, camera_keys=["cam.eye"], episodes=episodes)
 
 
@@ -598,7 +605,7 @@ def test_manifest_invalidation_recomputes_source_and_enforces_run_integrity(tmp_
     store = WorkspaceStore(config.work_dir, clock=lambda: NOW)
     manifest = store.initialize(config, index, SHA)
     episode = index.episodes[0]
-    video = next(iter(episode.videos.values()))
+    video = next(iter(episode.videos.values())).path
     video.write_bytes(b"source changed to a different size")
     reset = store.invalidate_episode(0, episode=episode)
     assert reset.source_fingerprint == compute_source_fingerprint(index.root, episode)
@@ -631,7 +638,7 @@ def test_source_fingerprint_is_stable_and_tracks_required_dimensions(tmp_path: P
     episode = index.episodes[0]
     first = compute_source_fingerprint(index.root, episode)
     assert first == compute_source_fingerprint(index.root, episode)
-    video = next(iter(episode.videos.values()))
+    video = next(iter(episode.videos.values())).path
     stat = video.stat()
     os.utime(video, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
     assert compute_source_fingerprint(index.root, episode) != first
@@ -639,7 +646,7 @@ def test_source_fingerprint_is_stable_and_tracks_required_dimensions(tmp_path: P
     video.write_bytes(b"different-size")
     assert compute_source_fingerprint(index.root, episode) != first
     video.write_bytes(bytes([2]) * 11)
-    episode.parquet.write_bytes(b"different")
+    episode.data.path.write_bytes(b"different")
     assert compute_source_fingerprint(index.root, episode) != first
     changed_length = episode.model_copy(update={"length": 11})
     assert compute_source_fingerprint(index.root, changed_length) != compute_source_fingerprint(index.root, episode)
@@ -651,7 +658,19 @@ def test_source_fingerprint_rejects_escape_missing_and_nonfile(tmp_path: Path, k
     episode = index.episodes[0]
     outside = tmp_path / "outside"
     outside.write_bytes(b"x")
-    bad = episode.model_copy(update={"videos": {"cam.eye": outside}}) if kind == "video" else episode.model_copy(update={"parquet": outside})
+    bad = (
+        episode.model_copy(
+            update={
+                "videos": {
+                    "cam.eye": episode.videos["cam.eye"].model_copy(update={"path": outside})
+                }
+            }
+        )
+        if kind == "video"
+        else episode.model_copy(
+            update={"data": episode.data.model_copy(update={"path": outside})}
+        )
+    )
     with pytest.raises(ValueError, match="dataset root"):
         compute_source_fingerprint(index.root, bad)
     outside.unlink()
