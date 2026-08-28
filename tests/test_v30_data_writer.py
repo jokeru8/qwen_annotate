@@ -3,7 +3,11 @@ import io
 import json
 import math
 import os
+import select
 import stat
+import subprocess
+import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +28,727 @@ from tests.v30_fixtures import (
 
 
 _SECOND_TASK = "Stack the colored blocks."
+
+
+def _open_test_retirement_namespace(
+    parent: Path,
+    registry: writer_publication._OwnershipRegistry,
+) -> tuple[
+    writer_publication._AnchoredDirectoryPath,
+    writer_publication._WriterLock,
+    writer_publication._RetirementNamespace,
+]:
+    anchor = writer_publication._AnchoredDirectoryPath.open(
+        parent,
+        "test retirement parent",
+        create_final=False,
+    )
+    lock = writer_publication._WriterLock.acquire(anchor)
+
+    def locked_parent_is_attached() -> bool:
+        try:
+            lock.verify("test retirement namespace")
+        except (OSError, ValueError):
+            return False
+        return True
+
+    directory = writer_publication._create_private_child_directory(
+        anchor.descriptor,
+        writer_publication._RETIREMENT_NAMESPACE_PREFIX,
+        "test retirement quarantine",
+        locked_parent_is_attached,
+        None,
+    )
+    namespace = writer_publication._RetirementNamespace(directory, lock)
+    namespace.verify_clean()
+    registry.bind_retirement_namespace(namespace)
+    return anchor, lock, namespace
+
+
+def test_writer_transactions_serialize_on_the_staging_parent_lock(
+    tmp_path: Path,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    staging = tmp_path / "staging"
+    before_fds = len(os.listdir("/proc/self/fd"))
+    second_opened = threading.Event()
+    release_second = threading.Event()
+    second_done = threading.Event()
+    second_errors: list[BaseException] = []
+
+    with (
+        secure_tree.SecureTree(root, "first source") as first_tree,
+        secure_tree.SecureTree(root, "second source") as second_tree,
+    ):
+        first_tree.scan()
+        second_tree.scan()
+        first = writer_publication.WriterPublication.open(
+            staging,
+            first_tree,
+            ".first-writer-",
+            "first writer",
+        )
+
+        def run_second_writer() -> None:
+            second = None
+            try:
+                second = writer_publication.WriterPublication.open(
+                    staging,
+                    second_tree,
+                    ".second-writer-",
+                    "second writer",
+                )
+                second_opened.set()
+                if not release_second.wait(5):
+                    raise TimeoutError("second writer release was not signaled")
+            except BaseException as exc:
+                second_errors.append(exc)
+            finally:
+                if second is not None:
+                    try:
+                        second.finish(None, committed=False)
+                    except BaseException as exc:
+                        second_errors.append(exc)
+                second_done.set()
+
+        thread = threading.Thread(target=run_second_writer)
+        thread.start()
+        serialized = not second_opened.wait(0.25)
+        if not serialized:
+            release_second.set()
+            assert second_done.wait(5)
+        first.finish(None, committed=False)
+        release_second.set()
+        assert second_done.wait(5)
+        thread.join(timeout=5)
+
+    assert serialized
+    assert not thread.is_alive()
+    assert second_errors == []
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_writer_lock_serializes_a_separate_process(
+    tmp_path: Path,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    staging = tmp_path / "staging"
+    before_fds = len(os.listdir("/proc/self/fd"))
+    child_code = """
+import sys
+from pathlib import Path
+from robo_annotate.secure_tree import SecureTree
+from robo_annotate.writer_publication import WriterPublication
+
+source = Path(sys.argv[1])
+staging = Path(sys.argv[2])
+with SecureTree(source, "child source") as tree:
+    tree.scan()
+    print("attempting", flush=True)
+    publication = WriterPublication.open(
+        staging,
+        tree,
+        ".child-writer-",
+        "child writer",
+    )
+    print("opened", flush=True)
+    sys.stdin.readline()
+    publication.finish(None, committed=False)
+"""
+
+    with secure_tree.SecureTree(root, "parent source") as tree:
+        tree.scan()
+        first = writer_publication.WriterPublication.open(
+            staging,
+            tree,
+            ".parent-writer-",
+            "parent writer",
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-c", child_code, str(root), str(staging)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        assert child.stdout is not None
+        assert child.stdin is not None
+        assert child.stderr is not None
+        assert child.stdout.readline().strip() == "attempting"
+        readable, _, _ = select.select([child.stdout], [], [], 0.25)
+        opened_early = bool(readable)
+        if opened_early:
+            assert child.stdout.readline().strip() == "opened"
+            child.stdin.write("continue\n")
+            child.stdin.flush()
+            assert child.wait(timeout=5) == 0
+        first.finish(None, committed=False)
+        if not opened_early:
+            assert child.stdout.readline().strip() == "opened"
+            child.stdin.write("continue\n")
+            child.stdin.flush()
+            assert child.wait(timeout=5) == 0
+        error_output = child.stderr.read()
+        child.stdin.close()
+        child.stdout.close()
+        child.stderr.close()
+
+    assert not opened_early
+    assert error_output == ""
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_writer_lock_acquisition_failure_precedes_every_staging_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_flock = writer_publication.fcntl.flock
+    injected = False
+
+    def fail_lock_acquisition(descriptor: int, operation: int) -> None:
+        nonlocal injected
+        if operation == writer_publication.fcntl.LOCK_EX:
+            injected = True
+            raise OSError(errno.EIO, "injected writer lock acquisition failure")
+        actual_flock(descriptor, operation)
+
+    monkeypatch.setattr(
+        writer_publication.fcntl,
+        "flock",
+        fail_lock_acquisition,
+    )
+
+    with pytest.raises(ValueError, match="writer lock acquisition"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert not staging.exists()
+    assert source_tree_digest(root) == before_source
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_changed_staging_parent_lock_topology_fails_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging_parent = tmp_path / "output-parent"
+    staging_parent.mkdir()
+    staging = staging_parent / "staging"
+    displaced = tmp_path / "displaced-output-parent"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_acquire = writer_publication._WriterLock.acquire
+    injected = False
+
+    def acquire_then_replace_parent(
+        cls: type[writer_publication._WriterLock],
+        parent: writer_publication._AnchoredDirectoryPath,
+    ) -> writer_publication._WriterLock:
+        nonlocal injected
+        lock = actual_acquire(parent)
+        if not injected:
+            os.replace(staging_parent, displaced)
+            staging_parent.mkdir()
+            (staging_parent / "competitor.bin").write_bytes(
+                b"preserve replacement staging parent"
+            )
+            injected = True
+        return lock
+
+    monkeypatch.setattr(
+        writer_publication._WriterLock,
+        "acquire",
+        classmethod(acquire_then_replace_parent),
+    )
+
+    with pytest.raises(ValueError, match="parent changed"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert (staging_parent / "competitor.bin").read_bytes() == (
+        b"preserve replacement staging parent"
+    )
+    assert list(displaced.iterdir()) == []
+    assert source_tree_digest(root) == before_source
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_writer_lock_release_failure_rolls_back_every_published_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_flock = writer_publication.fcntl.flock
+    injected = False
+
+    def fail_first_lock_release(descriptor: int, operation: int) -> None:
+        nonlocal injected
+        if operation == writer_publication.fcntl.LOCK_UN and not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected writer lock release failure")
+        actual_flock(descriptor, operation)
+
+    monkeypatch.setattr(
+        writer_publication.fcntl,
+        "flock",
+        fail_first_lock_release,
+    )
+
+    with pytest.raises(ValueError, match="writer lock"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_staging_parent_lock_anchor_close_failure_rolls_back_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_close = writer_publication._AnchoredDirectoryPath.close
+    injected = False
+    lock_was_held = False
+
+    def close_then_fail_parent_anchor(
+        anchor: writer_publication._AnchoredDirectoryPath,
+    ) -> None:
+        nonlocal injected, lock_was_held
+        if anchor.label == "staging parent path" and not injected:
+            competing_descriptor = os.open(
+                staging.parent,
+                os.O_RDONLY | os.O_DIRECTORY,
+            )
+            try:
+                try:
+                    writer_publication.fcntl.flock(
+                        competing_descriptor,
+                        writer_publication.fcntl.LOCK_EX
+                        | writer_publication.fcntl.LOCK_NB,
+                    )
+                except BlockingIOError:
+                    lock_was_held = True
+                else:
+                    writer_publication.fcntl.flock(
+                        competing_descriptor,
+                        writer_publication.fcntl.LOCK_UN,
+                    )
+            finally:
+                os.close(competing_descriptor)
+        actual_close(anchor)
+        if anchor.label == "staging parent path" and not injected:
+            injected = True
+            raise OSError(
+                errno.EIO,
+                "injected staging parent lock anchor close failure",
+            )
+
+    monkeypatch.setattr(
+        writer_publication._AnchoredDirectoryPath,
+        "close",
+        close_then_fail_parent_anchor,
+    )
+
+    with pytest.raises(ValueError, match="cleanup failed"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert lock_was_held
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_writer_lock_descriptor_close_failure_rolls_back_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_close = writer_publication._WriterLock.close
+    injected = False
+
+    def close_then_fail_lock(lock: writer_publication._WriterLock) -> None:
+        nonlocal injected
+        actual_close(lock)
+        if not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected writer lock descriptor close failure")
+
+    monkeypatch.setattr(
+        writer_publication._WriterLock,
+        "close",
+        close_then_fail_lock,
+    )
+
+    with pytest.raises(ValueError, match="cleanup failed"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+@pytest.mark.parametrize("failure_timing", ["before", "after"])
+def test_retirement_quarantine_close_failure_rolls_back_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_timing: str,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_close = writer_publication._RetirementNamespace.close
+    injected = False
+
+    def close_then_fail_quarantine(
+        namespace: writer_publication._RetirementNamespace,
+    ) -> None:
+        nonlocal injected
+        if not injected:
+            injected = True
+            if failure_timing == "before":
+                raise OSError(
+                    errno.EIO,
+                    "injected retirement quarantine descriptor close failure",
+                )
+            actual_close(namespace)
+            raise OSError(
+                errno.EIO,
+                "injected retirement quarantine descriptor close failure",
+            )
+        actual_close(namespace)
+
+    monkeypatch.setattr(
+        writer_publication._RetirementNamespace,
+        "close",
+        close_then_fail_quarantine,
+    )
+
+    with pytest.raises(ValueError, match="cleanup failed"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_retirement_quarantine_removal_failure_rolls_back_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_remove = writer_publication._RetirementNamespace.remove
+    injected = False
+
+    def remove_then_fail_quarantine(
+        namespace: writer_publication._RetirementNamespace,
+    ) -> None:
+        nonlocal injected
+        actual_remove(namespace)
+        if not injected:
+            injected = True
+            raise OSError(
+                errno.EIO,
+                "injected retirement quarantine removal failure",
+            )
+
+    monkeypatch.setattr(
+        writer_publication._RetirementNamespace,
+        "remove",
+        remove_then_fail_quarantine,
+    )
+
+    with pytest.raises(ValueError, match="cleanup failed"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_unexpected_retirement_quarantine_entry_is_preserved_on_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_publish = writer_publication.WriterPublication.publish
+    quarantine: Path | None = None
+
+    def publish_then_contaminate_quarantine(
+        publication: writer_publication.WriterPublication,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal quarantine
+        actual_publish(publication, *args, **kwargs)
+        if quarantine is None:
+            candidates = list(staging.parent.glob(".writer-quarantine-*"))
+            assert len(candidates) == 1
+            quarantine = candidates[0]
+            (quarantine / "unexpected.bin").write_bytes(
+                b"preserve unexpected quarantine bytes"
+            )
+
+    monkeypatch.setattr(
+        writer_publication.WriterPublication,
+        "publish",
+        publish_then_contaminate_quarantine,
+    )
+
+    with pytest.raises(ValueError, match="retirement quarantine"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert quarantine is not None
+    assert (quarantine / "unexpected.bin").read_bytes() == (
+        b"preserve unexpected quarantine bytes"
+    )
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_supported_writer_waits_while_another_writer_retires_a_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    info = read_v30_info(root)
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_rmdir = writer_publication.os.rmdir
+    actual_open = writer_publication.WriterPublication.open
+    retirement_entered = threading.Event()
+    continue_retirement = threading.Event()
+    second_reached_publication = threading.Event()
+    first_errors: list[BaseException] = []
+    second_errors: list[BaseException] = []
+    second_done = threading.Event()
+    paused = False
+
+    def pause_child_retirement(
+        name: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal paused
+        parent_fd = kwargs.get("dir_fd")
+        if (
+            not paused
+            and isinstance(name, str)
+            and name.startswith(".writer-retire-")
+            and isinstance(parent_fd, int)
+            and Path(os.readlink(f"/proc/self/fd/{parent_fd}")).name.startswith(
+                ".writer-quarantine-"
+            )
+        ):
+            paused = True
+            retirement_entered.set()
+            if not continue_retirement.wait(5):
+                raise TimeoutError("child retirement was not released")
+        actual_rmdir(name, *args, **kwargs)
+
+    def mark_publication_open(
+        cls: type[writer_publication.WriterPublication],
+        *args: object,
+        **kwargs: object,
+    ) -> writer_publication.WriterPublication:
+        if threading.current_thread().name == "second-supported-writer":
+            second_reached_publication.set()
+        return actual_open(*args, **kwargs)
+
+    monkeypatch.setattr(writer_publication.os, "rmdir", pause_child_retirement)
+    monkeypatch.setattr(
+        writer_publication.WriterPublication,
+        "open",
+        classmethod(mark_publication_open),
+    )
+
+    def run_first() -> None:
+        try:
+            write_v30_data_subset(root, staging, dataset, [0], info)
+        except BaseException as exc:
+            first_errors.append(exc)
+
+    def run_second() -> None:
+        try:
+            write_v30_data_subset(root, staging, dataset, [0], info)
+        except BaseException as exc:
+            second_errors.append(exc)
+        finally:
+            second_done.set()
+
+    first_thread = threading.Thread(target=run_first, name="first-writer")
+    second_thread = threading.Thread(
+        target=run_second,
+        name="second-supported-writer",
+    )
+    first_thread.start()
+    assert retirement_entered.wait(5)
+    second_thread.start()
+    assert second_reached_publication.wait(5)
+    assert not second_done.wait(0.25)
+    continue_retirement.set()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+
+    assert paused
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert first_errors == []
+    assert len(second_errors) == 1
+    assert isinstance(second_errors[0], ValueError)
+    assert "unsafe staging data entry already exists" in str(second_errors[0])
+    assert (staging / "data").is_dir()
+    assert (staging / "meta/tasks.parquet").is_file()
+    assert source_tree_digest(root) == before_source
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_changed_retirement_quarantine_is_preserved_and_recovered_for_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    displaced = tmp_path / "displaced-retirement-quarantine"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_publish = writer_publication.WriterPublication.publish
+    replacement: Path | None = None
+
+    def publish_then_replace_quarantine(
+        publication: writer_publication.WriterPublication,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal replacement
+        actual_publish(publication, *args, **kwargs)
+        if replacement is None:
+            candidates = list(staging.parent.glob(".writer-quarantine-*"))
+            assert len(candidates) == 1
+            replacement = candidates[0]
+            os.replace(replacement, displaced)
+            replacement.mkdir(mode=0o700)
+            (replacement / "competitor.bin").write_bytes(
+                b"preserve replacement quarantine"
+            )
+
+    monkeypatch.setattr(
+        writer_publication.WriterPublication,
+        "publish",
+        publish_then_replace_quarantine,
+    )
+
+    with pytest.raises(ValueError, match="retirement quarantine"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert replacement is not None
+    assert (replacement / "competitor.bin").read_bytes() == (
+        b"preserve replacement quarantine"
+    )
+    assert displaced.is_dir()
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
 
 
 def test_rewrites_selected_shared_parquet_and_compacts_tasks(tmp_path: Path) -> None:
@@ -1629,431 +2354,6 @@ def test_private_directory_birth_rejects_replacement_before_first_open(
     assert source_tree_digest(root) == before_source
 
 
-@pytest.mark.parametrize(
-    "replacement_kind",
-    ["file", "empty_directory", "nonempty_directory"],
-)
-def test_retirement_quarantines_before_deleting_and_preserves_a_swap(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    replacement_kind: str,
-) -> None:
-    parent = tmp_path / "parent"
-    parent.mkdir()
-    target = parent / "owned"
-    if replacement_kind == "file":
-        target.write_bytes(b"owned bytes")
-    else:
-        target.mkdir()
-    displaced = parent / "displaced-owned"
-    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-    identity = writer_publication._EntryIdentity.from_stat(
-        os.stat("owned", dir_fd=parent_fd, follow_symlinks=False)
-    )
-    registry = writer_publication._OwnershipRegistry()
-    registry.register(identity)
-    actual_rename = writer_publication.rename_noreplace_at
-    injected = False
-
-    def swap_at_quarantine_move(
-        source_fd: int,
-        source_name: str,
-        destination_fd: int,
-        destination_name: str,
-    ) -> None:
-        nonlocal injected
-        if (
-            not injected
-            and source_fd == parent_fd
-            and source_name == "owned"
-            and destination_fd == parent_fd
-            and destination_name.startswith(".writer-retire-")
-        ):
-            os.replace(target, displaced)
-            if replacement_kind == "file":
-                target.write_bytes(b"preserve replacement bytes")
-            else:
-                target.mkdir()
-                if replacement_kind == "nonempty_directory":
-                    (target / "competitor.txt").write_bytes(
-                        b"preserve replacement directory"
-                    )
-            injected = True
-        actual_rename(
-            source_fd,
-            source_name,
-            destination_fd,
-            destination_name,
-        )
-
-    monkeypatch.setattr(
-        writer_publication,
-        "rename_noreplace_at",
-        swap_at_quarantine_move,
-    )
-    try:
-        with pytest.raises(ValueError, match="changed during retirement"):
-            writer_publication._retire_and_delete_owned_entry_at(
-                parent_fd,
-                "owned",
-                identity,
-                registry,
-                lambda: True,
-            )
-    finally:
-        os.close(parent_fd)
-
-    assert injected
-    assert displaced.exists()
-    assert target.exists()
-    if replacement_kind == "file":
-        assert target.read_bytes() == b"preserve replacement bytes"
-    elif replacement_kind == "nonempty_directory":
-        assert (target / "competitor.txt").read_bytes() == (
-            b"preserve replacement directory"
-        )
-    assert registry.is_owned(identity)
-    assert list(parent.glob(".writer-retire-*")) == []
-
-
-@pytest.mark.parametrize(
-    "replacement_kind",
-    ["file", "empty_directory", "nonempty_directory"],
-)
-def test_retirement_boundary_witness_preserves_post_pin_replacement(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    replacement_kind: str,
-) -> None:
-    root = make_lerobot_v30_fixture(tmp_path)
-    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
-    staging = tmp_path / "staging"
-    before_source = source_tree_digest(root)
-    before_fds = len(os.listdir("/proc/self/fd"))
-    actual_unlinkat = writer_publication._raw_unlinkat
-    actual_publish = writer_publication.WriterPublication.publish
-    injected_identity: writer_publication._EntryIdentity | None = None
-    competitor_identity: writer_publication._EntryIdentity | None = None
-    forced_rollback = False
-
-    def replace_at_removal_boundary(
-        parent_fd: int,
-        name: str,
-        *,
-        is_directory: bool,
-        **kwargs: object,
-    ) -> None:
-        nonlocal competitor_identity, injected_identity
-        target_kind = (
-            replacement_kind == "file" and not is_directory
-        ) or (
-            replacement_kind != "file" and is_directory
-        )
-        if (
-            injected_identity is None
-            and name.startswith(".writer-retire-")
-            and target_kind
-        ):
-            current = writer_publication._entry_at(parent_fd, name)
-            assert current is not None
-            injected_identity = current
-            if is_directory:
-                os.rmdir(name, dir_fd=parent_fd)
-                os.mkdir(name, 0o700, dir_fd=parent_fd)
-                if replacement_kind == "nonempty_directory":
-                    competitor = os.open(
-                        name,
-                        os.O_RDONLY | os.O_DIRECTORY,
-                        dir_fd=parent_fd,
-                    )
-                    try:
-                        marker = os.open(
-                            "competitor.txt",
-                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                            0o600,
-                            dir_fd=competitor,
-                        )
-                        try:
-                            os.write(marker, b"preserve retirement competitor")
-                        finally:
-                            os.close(marker)
-                    finally:
-                        os.close(competitor)
-            else:
-                os.unlink(name, dir_fd=parent_fd)
-                competitor = os.open(
-                    name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                    dir_fd=parent_fd,
-                )
-                try:
-                    os.write(competitor, b"preserve retirement competitor")
-                finally:
-                    os.close(competitor)
-            competitor_identity = writer_publication._EntryIdentity.from_stat(
-                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            )
-        actual_unlinkat(
-            parent_fd,
-            name,
-            is_directory=is_directory,
-            **kwargs,
-        )
-
-    def fail_before_first_publish(
-        publication: writer_publication.WriterPublication,
-        *args: object,
-        **kwargs: object,
-    ) -> None:
-        nonlocal forced_rollback
-        if replacement_kind == "file" and not forced_rollback:
-            forced_rollback = True
-            raise RuntimeError("force private file rollback")
-        actual_publish(publication, *args, **kwargs)
-
-    monkeypatch.setattr(
-        writer_publication,
-        "_raw_unlinkat",
-        replace_at_removal_boundary,
-    )
-    monkeypatch.setattr(
-        writer_publication.WriterPublication,
-        "publish",
-        fail_before_first_publish,
-    )
-
-    with pytest.raises((RuntimeError, ValueError)) as raised:
-        write_v30_data_subset(
-            root,
-            staging,
-            dataset,
-            [0],
-            read_v30_info(root),
-        )
-
-    assert injected_identity is not None
-    assert competitor_identity is not None
-    error_details = "\n".join(
-        (str(raised.value), *getattr(raised.value, "__notes__", ()))
-    )
-    assert "writer rollback left owned filesystem identities active" in error_details
-    competitors = []
-    if staging.exists():
-        for candidate in (staging, *staging.rglob("*")):
-            value = candidate.lstat()
-            identity = writer_publication._EntryIdentity.from_stat(value)
-            if identity == competitor_identity:
-                competitors.append(candidate)
-    assert len(competitors) == 1
-    competitor = competitors[0]
-    if replacement_kind == "file":
-        assert competitor.read_bytes() == b"preserve retirement competitor"
-    elif replacement_kind == "empty_directory":
-        assert competitor.is_dir()
-        assert list(competitor.iterdir()) == []
-    else:
-        assert (competitor / "competitor.txt").read_bytes() == (
-            b"preserve retirement competitor"
-        )
-    assert source_tree_digest(root) == before_source
-    assert not (staging / "data").exists()
-    assert not (staging / "meta/tasks.parquet").exists()
-    assert len(os.listdir("/proc/self/fd")) == before_fds
-
-
-def test_retirement_rejects_an_external_link_before_the_removal_boundary(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    parent = tmp_path / "parent"
-    parent.mkdir()
-    target = parent / "owned"
-    target.write_bytes(b"owned bytes")
-    external_link = parent / "external-link"
-    os.link(target, external_link)
-    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-    identity = writer_publication._EntryIdentity.from_stat(
-        os.stat("owned", dir_fd=parent_fd, follow_symlinks=False)
-    )
-    registry = writer_publication._OwnershipRegistry()
-    registry.register(identity)
-    actual_unlinkat = writer_publication._raw_unlinkat
-    removal_boundary_reached = False
-
-    def unlink_both_names(
-        parent_descriptor: int,
-        name: str,
-        *,
-        is_directory: bool,
-        **kwargs: object,
-    ) -> None:
-        nonlocal removal_boundary_reached
-        removal_boundary_reached = True
-        os.unlink("external-link", dir_fd=parent_descriptor)
-        actual_unlinkat(
-            parent_descriptor,
-            name,
-            is_directory=is_directory,
-            **kwargs,
-        )
-
-    monkeypatch.setattr(writer_publication, "_raw_unlinkat", unlink_both_names)
-    try:
-        with pytest.raises(
-            ValueError,
-            match="ambiguous retirement link count",
-        ):
-            writer_publication._retire_and_delete_owned_entry_at(
-                parent_fd,
-                "owned",
-                identity,
-                registry,
-                lambda: True,
-            )
-    finally:
-        os.close(parent_fd)
-
-    assert not removal_boundary_reached
-    assert target.read_bytes() == b"owned bytes"
-    assert external_link.read_bytes() == b"owned bytes"
-    assert target.stat().st_ino == external_link.stat().st_ino
-    assert registry.is_owned(identity)
-
-
-def test_retirement_event_overflow_fails_closed_and_rolls_back(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    root = make_lerobot_v30_fixture(tmp_path)
-    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
-    staging = tmp_path / "staging"
-    before_source = source_tree_digest(root)
-    before_fds = len(os.listdir("/proc/self/fd"))
-    actual_entry_at = writer_publication._entry_at
-    actual_read = writer_publication.os.read
-    retirement_boundary_reached = False
-    overflow_injected = False
-
-    def mark_retirement_boundary(parent_fd: int, name: str):
-        nonlocal retirement_boundary_reached
-        current = actual_entry_at(parent_fd, name)
-        if name.startswith(".writer-retire-") and current is not None:
-            retirement_boundary_reached = True
-        return current
-
-    def inject_overflow(descriptor: int, size: int) -> bytes:
-        nonlocal overflow_injected
-        if retirement_boundary_reached and not overflow_injected:
-            overflow_injected = True
-            return writer_publication._INOTIFY_EVENT.pack(
-                -1,
-                writer_publication._IN_Q_OVERFLOW,
-                0,
-                0,
-            )
-        return actual_read(descriptor, size)
-
-    monkeypatch.setattr(
-        writer_publication,
-        "_entry_at",
-        mark_retirement_boundary,
-    )
-    monkeypatch.setattr(writer_publication.os, "read", inject_overflow)
-
-    with pytest.raises(ValueError, match="cleanup failed"):
-        write_v30_data_subset(
-            root,
-            staging,
-            dataset,
-            [0],
-            read_v30_info(root),
-        )
-
-    assert retirement_boundary_reached
-    assert overflow_injected
-    assert source_tree_digest(root) == before_source
-    assert not (staging / "data").exists()
-    assert not (staging / "meta/tasks.parquet").exists()
-    assert len(os.listdir("/proc/self/fd")) == before_fds
-
-
-@pytest.mark.parametrize("entry_kind", ["file", "directory"])
-def test_retiring_owned_identity_prevents_reentrant_inode_reuse_cleanup(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    entry_kind: str,
-) -> None:
-    parent = tmp_path / "parent"
-    parent.mkdir()
-    target = parent / "owned"
-    if entry_kind == "file":
-        target.write_bytes(b"owned")
-    else:
-        target.mkdir()
-    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-    identity = v30_data_writer._EntryIdentity.from_stat(
-        os.stat("owned", dir_fd=parent_fd, follow_symlinks=False)
-    )
-    registry = v30_data_writer._OwnershipRegistry()
-    registry.register(identity)
-    actual_entry_at = v30_data_writer._entry_at
-    actual_unlinkat = writer_publication._raw_unlinkat
-    replacement_installed = False
-
-    def reused_identity(parent_descriptor: int, name: str):
-        current = actual_entry_at(parent_descriptor, name)
-        if replacement_installed and current is not None:
-            return identity
-        return current
-
-    def install_replacement(
-        parent_descriptor: int,
-        name: str,
-        *,
-        is_directory: bool,
-        **kwargs: object,
-    ) -> None:
-        nonlocal replacement_installed
-        actual_unlinkat(
-            parent_descriptor,
-            name,
-            is_directory=is_directory,
-            **kwargs,
-        )
-        if entry_kind == "file":
-            target.write_bytes(b"replacement")
-        else:
-            target.mkdir()
-        replacement_installed = True
-        v30_data_writer._remove_owned_entry_at(
-            parent_fd,
-            "owned",
-            identity,
-            registry,
-            lambda: True,
-        )
-
-    monkeypatch.setattr(writer_publication, "_entry_at", reused_identity)
-    monkeypatch.setattr(writer_publication, "_raw_unlinkat", install_replacement)
-    try:
-        v30_data_writer._remove_owned_entry_at(
-            parent_fd,
-            "owned",
-            identity,
-            registry,
-            lambda: True,
-        )
-    finally:
-        os.close(parent_fd)
-
-    assert replacement_installed
-    assert target.exists()
-    if entry_kind == "file":
-        assert target.read_bytes() == b"replacement"
-    assert not registry.is_owned(identity)
-
-
 def test_write_and_close_failure_preserves_primary_exception(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2476,34 +2776,32 @@ def test_incomplete_private_bundle_retirement_rolls_back_published_outputs(
     dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
     staging = tmp_path / "staging"
     before_source = source_tree_digest(root)
-    actual_unlinkat = writer_publication._raw_unlinkat
+    actual_rmdir = writer_publication.os.rmdir
     injected = False
 
     def fail_private_bundle_retirement(
-        parent_fd: int,
-        name: str,
-        *,
-        is_directory: bool,
+        name: object,
+        *args: object,
         **kwargs: object,
     ) -> None:
         nonlocal injected
+        parent_fd = kwargs.get("dir_fd")
         if (
             not injected
-            and is_directory
+            and isinstance(name, str)
             and name.startswith(".writer-retire-")
+            and isinstance(parent_fd, int)
+            and Path(os.readlink(f"/proc/self/fd/{parent_fd}")).name.startswith(
+                ".writer-quarantine-"
+            )
         ):
             injected = True
             return
-        actual_unlinkat(
-            parent_fd,
-            name,
-            is_directory=is_directory,
-            **kwargs,
-        )
+        actual_rmdir(name, *args, **kwargs)
 
     monkeypatch.setattr(
-        writer_publication,
-        "_raw_unlinkat",
+        writer_publication.os,
+        "rmdir",
         fail_private_bundle_retirement,
     )
 
@@ -2578,28 +2876,27 @@ def test_attachment_loss_preserves_cleanup_errors_already_accumulated(
     )
     registry = v30_data_writer._OwnershipRegistry()
     registry.register(identity)
-    actual_unlinkat = writer_publication._raw_unlinkat
+    anchor, lock, namespace = _open_test_retirement_namespace(parent, registry)
+    actual_unlink = writer_publication.os.unlink
     removal_failed = False
 
     def fail_owned_removal(
-        parent_descriptor: int,
-        name: str,
-        *,
-        is_directory: bool,
+        name: object,
+        *args: object,
         **kwargs: object,
     ) -> None:
         nonlocal removal_failed
-        if name.startswith(".writer-retire-"):
+        parent_descriptor = kwargs.get("dir_fd")
+        if (
+            isinstance(name, str)
+            and name.startswith(".writer-retire-")
+            and parent_descriptor == namespace.descriptor
+        ):
             removal_failed = True
             raise OSError(errno.EIO, "injected owned cleanup failure")
-        actual_unlinkat(
-            parent_descriptor,
-            name,
-            is_directory=is_directory,
-            **kwargs,
-        )
+        actual_unlink(name, *args, **kwargs)
 
-    monkeypatch.setattr(writer_publication, "_raw_unlinkat", fail_owned_removal)
+    monkeypatch.setattr(writer_publication.os, "unlink", fail_owned_removal)
     try:
         with pytest.raises(ValueError, match="injected owned cleanup failure"):
             v30_data_writer._remove_owned_identities_below(
@@ -2609,8 +2906,13 @@ def test_attachment_loss_preserves_cleanup_errors_already_accumulated(
             )
     finally:
         os.close(parent_fd)
+        namespace.close()
+        lock.close()
+        anchor.close()
 
-    quarantined = list(parent.glob(".writer-retire-*"))
+    quarantines = list(parent.glob(".writer-quarantine-*"))
+    assert len(quarantines) == 1
+    quarantined = list(quarantines[0].glob(".writer-retire-*"))
     assert len(quarantined) == 1
     assert quarantined[0].read_bytes() == b"owned"
     assert not owned.exists()

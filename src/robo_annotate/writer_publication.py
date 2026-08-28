@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import fcntl
 import os
 import secrets
 import stat
@@ -27,8 +28,8 @@ _OUTPUT_FILE_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
 )
 _PRIVATE_DIRECTORY_PREFIX = ".writer-dir-"
+_RETIREMENT_NAMESPACE_PREFIX = ".writer-quarantine-"
 _RETIREMENT_PREFIX = ".writer-retire-"
-_IN_ATTRIB = 0x00000004
 _IN_CREATE = 0x00000100
 _IN_DELETE = 0x00000200
 _IN_MOVED_FROM = 0x00000040
@@ -48,10 +49,9 @@ _BIRTH_WATCH_MASK = (
     | _IN_MOVED_TO
     | _IN_DELETE_SELF
     | _IN_MOVE_SELF
+    | _IN_UNMOUNT
     | _IN_ONLYDIR
 )
-_RETIREMENT_WATCH_MASK = _BIRTH_WATCH_MASK | _IN_ATTRIB | _IN_UNMOUNT
-_AT_REMOVEDIR = 0x200
 
 
 class _DirectoryBirthWitness:
@@ -168,71 +168,6 @@ class _DirectoryBirthWitness:
             os.close(descriptor)
 
 
-class _RetirementEventWitness(_DirectoryBirthWitness):
-    """Prove one quarantine move and one unambiguous retirement delete."""
-
-    _WATCH_MASK = _RETIREMENT_WATCH_MASK
-
-    def verify_quarantine_move(
-        self,
-        source_name: str,
-        quarantine_name: str,
-        *,
-        is_directory: bool,
-    ) -> None:
-        self._events.extend(self._read_events())
-        source = os.fsencode(source_name)
-        quarantine = os.fsencode(quarantine_name)
-        relevant = [
-            event
-            for event in self._events
-            if event[2] in (source, quarantine)
-        ]
-        kind = _IN_ISDIR if is_directory else 0
-        valid = (
-            len(relevant) == 2
-            and relevant[0][0] == (_IN_MOVED_FROM | kind)
-            and relevant[0][2] == source
-            and relevant[0][1] != 0
-            and relevant[1][0] == (_IN_MOVED_TO | kind)
-            and relevant[1][2] == quarantine
-            and relevant[1][1] == relevant[0][1]
-        )
-        if self._has_global_failure(self._events) or not valid:
-            raise ValueError("owned entry quarantine event history is ambiguous")
-        self._events.clear()
-
-    def verify_unchanged(self, quarantine_name: str) -> None:
-        self._events.extend(self._read_events())
-        quarantine = os.fsencode(quarantine_name)
-        if self._has_global_failure(self._events) or any(
-            event_name == quarantine for _, _, event_name in self._events
-        ):
-            raise ValueError("owned entry changed before retirement removal")
-        self._events.clear()
-
-    def verify_deleted(
-        self,
-        quarantine_name: str,
-        *,
-        is_directory: bool,
-    ) -> None:
-        self._events.extend(self._read_events())
-        quarantine = os.fsencode(quarantine_name)
-        relevant = [
-            mask
-            for mask, _, event_name in self._events
-            if event_name == quarantine
-        ]
-        kind = _IN_ISDIR if is_directory else 0
-        if (
-            self._has_global_failure(self._events)
-            or relevant != [(_IN_DELETE | kind)]
-        ):
-            raise ValueError("owned entry retirement event history is ambiguous")
-        self._events.clear()
-
-
 @dataclass(frozen=True)
 class _EntryIdentity:
     device: int
@@ -254,6 +189,29 @@ class _OwnershipRegistry:
     def __init__(self) -> None:
         self._active: set[_EntryIdentity] = set()
         self._retiring: set[_EntryIdentity] = set()
+        self._retirement_namespace: _RetirementNamespace | None = None
+
+    def bind_retirement_namespace(
+        self,
+        namespace: "_RetirementNamespace",
+    ) -> None:
+        if self._retirement_namespace is not None:
+            raise ValueError("writer retirement namespace is already bound")
+        self._retirement_namespace = namespace
+
+    def replace_retirement_namespace(
+        self,
+        namespace: "_RetirementNamespace",
+    ) -> None:
+        if self._retirement_namespace is None:
+            raise ValueError("writer retirement namespace is unavailable")
+        self._retirement_namespace = namespace
+
+    @property
+    def retirement_namespace(self) -> "_RetirementNamespace":
+        if self._retirement_namespace is None:
+            raise ValueError("writer retirement namespace is unavailable")
+        return self._retirement_namespace
 
     def register(self, identity: _EntryIdentity) -> None:
         if identity in self._active or identity in self._retiring:
@@ -546,6 +504,123 @@ class _AnchoredDirectoryPath:
         failures.finish(None, self.label)
 
 
+class _WriterLock:
+    """Serialize cooperating Robo-Annotate writers on one staging parent.
+
+    Linux ``flock`` is advisory.  This lock is the supported concurrency
+    boundary for Robo-Annotate writers; it is not an atomic compare-delete
+    defense against an uncooperative same-credential process.
+    """
+
+    def __init__(
+        self,
+        parent: _AnchoredDirectoryPath,
+        descriptor: int,
+        identity: _EntryIdentity,
+    ) -> None:
+        self.parent = parent
+        self.descriptor = descriptor
+        self.identity = identity
+        self.held = True
+
+    @classmethod
+    def acquire(cls, parent: _AnchoredDirectoryPath) -> "_WriterLock":
+        parent.verify("writer lock acquisition")
+        descriptor = os.dup(parent.descriptor)
+        try:
+            identity = _directory_identity(
+                os.fstat(descriptor),
+                "staging parent writer lock",
+            )
+            if identity != parent.identity:
+                raise ValueError("staging parent changed before writer lock")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            parent.verify("writer lock acquisition")
+            if (
+                _directory_identity(
+                    os.fstat(descriptor),
+                    "staging parent writer lock",
+                )
+                != identity
+            ):
+                raise ValueError("staging parent changed during writer lock")
+            return cls(parent, descriptor, identity)
+        except BaseException as exc:
+            failures = _CleanupFailures()
+            failures.attempt(
+                "writer lock descriptor close",
+                lambda: os.close(descriptor),
+            )
+            primary = (
+                exc
+                if isinstance(exc, ValueError)
+                else ValueError("writer lock acquisition failed")
+            )
+            failures.finish(primary, "writer lock acquisition")
+            if primary is exc:
+                raise
+            raise primary from exc
+
+    def verify(self, context: str) -> None:
+        if not self.held or self.descriptor < 0:
+            raise ValueError("staging parent writer lock is not held")
+        self.parent.verify(context)
+        if (
+            _directory_identity(
+                os.fstat(self.descriptor),
+                "staging parent writer lock",
+            )
+            != self.identity
+        ):
+            raise ValueError(f"staging parent changed during {context}")
+
+    def release(self) -> None:
+        if self.descriptor >= 0 and self.held:
+            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+            self.held = False
+
+    def reacquire(self) -> None:
+        if self.descriptor < 0:
+            raise ValueError("staging parent writer lock descriptor is closed")
+        fcntl.flock(self.descriptor, fcntl.LOCK_EX)
+        self.held = True
+        self.verify("writer lock recovery")
+
+    def rebind_parent(
+        self,
+        parent: _AnchoredDirectoryPath,
+        context: str,
+    ) -> None:
+        """Replace a failed path anchor while retaining the lock descriptor."""
+        if self.descriptor < 0:
+            raise ValueError("staging parent writer lock descriptor is closed")
+        parent.verify(context)
+        if (
+            parent.identity != self.identity
+            or _directory_identity(
+                os.fstat(self.descriptor),
+                "staging parent writer lock",
+            )
+            != self.identity
+        ):
+            raise ValueError(f"staging parent changed during {context}")
+        self.parent = parent
+        if self.held:
+            self.verify(context)
+
+    def close(self) -> None:
+        failures = _CleanupFailures()
+        failures.attempt("writer lock release", self.release)
+        if self.descriptor >= 0:
+            descriptor = self.descriptor
+            self.descriptor = -1
+            failures.attempt(
+                "writer lock descriptor close",
+                lambda: os.close(descriptor),
+            )
+        failures.finish(None, "writer lock")
+
+
 @dataclass
 class _ChildDirectory:
     parent_fd: int
@@ -583,6 +658,63 @@ class _ChildDirectory:
             descriptor = self.descriptor
             self.descriptor = -1
             os.close(descriptor)
+
+
+class _RetirementNamespace:
+    """Hold a never-published quarantine for one locked writer transaction."""
+
+    def __init__(
+        self,
+        directory: _ChildDirectory,
+        writer_lock: _WriterLock,
+    ) -> None:
+        self.directory = directory
+        self.writer_lock = writer_lock
+        self._unexpected: set[str] = set()
+
+    @property
+    def descriptor(self) -> int:
+        return self.directory.descriptor
+
+    def verify(self, context: str) -> None:
+        self.writer_lock.verify(context)
+        self.directory.verify(context)
+
+    def is_attached(self) -> bool:
+        try:
+            self.verify("retirement quarantine cleanup")
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def inspect(self, allowed: Sequence[str] = ()) -> None:
+        self.verify("retirement quarantine inspection")
+        permitted = set(allowed)
+        self._unexpected.update(
+            name for name in os.listdir(self.descriptor) if name not in permitted
+        )
+
+    def verify_clean(self) -> None:
+        self.inspect()
+        if self._unexpected:
+            names = ", ".join(sorted(self._unexpected))
+            raise ValueError(
+                f"retirement quarantine contains unexpected entries: {names}"
+            )
+
+    def remove(self) -> None:
+        self.verify_clean()
+        removed = _remove_locked_owned_empty_directory_at(
+            self.directory.parent_fd,
+            self.directory.name,
+            self.directory.identity,
+            self.is_attached,
+        )
+        if not removed:
+            raise ValueError("retirement quarantine removal was incomplete")
+
+    def close(self) -> None:
+        self.directory.close()
 
 
 @dataclass
@@ -742,7 +874,7 @@ def _create_private_child_directory(
     prefix: str,
     context: str,
     parent_is_attached: Callable[[], bool],
-    registry: _OwnershipRegistry,
+    registry: _OwnershipRegistry | None,
 ) -> _ChildDirectory:
     """Create and witness one private child before accepting its pinned identity."""
     for _ in range(100):
@@ -776,6 +908,7 @@ def _create_private_child_directory(
         descriptor = -1
         validation_descriptor = -1
         registered = False
+        accepted = False
         try:
             # Pin the first object reachable after mkdir, derive authority only
             # from fstat, and let the event witness reject a replaced pathname.
@@ -787,8 +920,10 @@ def _create_private_child_directory(
             expected = _directory_identity(os.fstat(descriptor), context)
             assert witness is not None
             witness.verify_birth(name)
-            registry.register(expected)
-            registered = True
+            if registry is not None:
+                registry.register(expected)
+                registered = True
+            accepted = True
             current = _directory_identity(
                 os.stat(name, dir_fd=parent_fd, follow_symlinks=False), context
             )
@@ -844,17 +979,28 @@ def _create_private_child_directory(
                     "private directory descriptor close",
                     lambda current=descriptor: os.close(current),
                 )
-            if expected is not None and registered:
-                failures.attempt(
-                    "private directory removal",
-                    lambda: _remove_owned_empty_directory_at(
-                        parent_fd,
-                        name,
-                        expected,
-                        registry,
-                        parent_is_attached,
-                    ),
-                )
+            if expected is not None and accepted:
+                if registry is not None and registered:
+                    failures.attempt(
+                        "private directory removal",
+                        lambda: _remove_owned_empty_directory_at(
+                            parent_fd,
+                            name,
+                            expected,
+                            registry,
+                            parent_is_attached,
+                        ),
+                    )
+                elif registry is None:
+                    failures.attempt(
+                        "private directory removal",
+                        lambda: _remove_locked_owned_empty_directory_at(
+                            parent_fd,
+                            name,
+                            expected,
+                            parent_is_attached,
+                        ),
+                    )
             primary = (
                 exc
                 if not isinstance(exc, OSError)
@@ -956,6 +1102,56 @@ def _entry_at(parent_fd: int, name: str) -> _EntryIdentity | None:
         return None
 
 
+def _remove_locked_owned_empty_directory_at(
+    parent_fd: int,
+    name: str,
+    expected: _EntryIdentity,
+    lock_and_parent_are_attached: Callable[[], bool],
+) -> bool:
+    """Remove one exact private directory while its parent writer lock is held."""
+    if (
+        not stat.S_ISDIR(expected.mode)
+        or not lock_and_parent_are_attached()
+        or _entry_at(parent_fd, name) != expected
+    ):
+        return False
+    descriptor = -1
+    primary_error: BaseException | None = None
+    removed = False
+    try:
+        descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+        valid = not (
+            _EntryIdentity.from_stat(os.fstat(descriptor)) != expected
+            or not lock_and_parent_are_attached()
+            or _entry_at(parent_fd, name) != expected
+        )
+        if valid:
+            os.rmdir(name, dir_fd=parent_fd)
+            after = os.fstat(descriptor)
+            if _EntryIdentity.from_stat(after) != expected or after.st_nlink != 0:
+                raise ValueError("locked private directory removal was incomplete")
+            if _entry_at(parent_fd, name) is not None:
+                raise ValueError("locked private directory name was unexpectedly reused")
+            removed = True
+    except BaseException as exc:
+        primary_error = exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except BaseException as close_error:
+                if primary_error is None:
+                    primary_error = close_error
+                else:
+                    primary_error.add_note(
+                        "Secondary locked directory descriptor close failure: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+    if primary_error is not None:
+        raise primary_error
+    return removed
+
+
 def _create_owned_file_at(
     parent_fd: int,
     name: str,
@@ -1009,74 +1205,6 @@ def _create_owned_file_at(
         raise
 
 
-def _raw_unlinkat(
-    parent_fd: int,
-    name: str,
-    *,
-    is_directory: bool,
-    witness: _RetirementEventWitness,
-) -> None:
-    """Drain the boundary witness, then immediately call Linux unlinkat."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    unlinkat = getattr(libc, "unlinkat", None)
-    if unlinkat is None:
-        raise ValueError("owned retirement requires Linux unlinkat")
-    unlinkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-    unlinkat.restype = ctypes.c_int
-    encoded_name = os.fsencode(name)
-    flags = _AT_REMOVEDIR if is_directory else 0
-    witness.verify_unchanged(name)
-    if unlinkat(parent_fd, encoded_name, flags) == 0:
-        return
-    error = ctypes.get_errno()
-    raise OSError(error, os.strerror(error), name)
-
-
-def _remove_pinned_quarantine_entry_at(
-    parent_fd: int,
-    quarantine: str,
-    expected: _EntryIdentity,
-    retirement_descriptor: int,
-    witness: _RetirementEventWitness,
-    still_attached: Callable[[], bool],
-) -> None:
-    """Apply the Linux event invariant at the compare-to-unlink boundary.
-
-    Linux has no compare-and-unlink syscall.  Safety therefore requires an
-    inode-bound parent watch, a final no-follow name comparison, a clean event
-    drain immediately followed by one raw unlinkat, exactly one matching
-    delete event, and the pinned inode's own link-count transition to zero.
-    A regular file must have exactly one link before removal, preventing an
-    external unlink from helping produce that transition.  Any ambiguity is
-    a transaction failure.
-    """
-    is_directory = stat.S_ISDIR(expected.mode)
-    if not still_attached():
-        raise ValueError("owned entry parent changed during retirement")
-    current = _entry_at(parent_fd, quarantine)
-    if current != expected or not still_attached():
-        raise ValueError("owned entry changed before retirement removal")
-    before = os.fstat(retirement_descriptor)
-    if _EntryIdentity.from_stat(before) != expected or before.st_nlink <= 0:
-        raise ValueError("owned entry changed before retirement removal")
-    if not is_directory and before.st_nlink != 1:
-        raise ValueError("owned file has an ambiguous retirement link count")
-    _raw_unlinkat(
-        parent_fd,
-        quarantine,
-        is_directory=is_directory,
-        witness=witness,
-    )
-    witness.verify_deleted(quarantine, is_directory=is_directory)
-    after = os.fstat(retirement_descriptor)
-    if _EntryIdentity.from_stat(after) != expected or after.st_nlink != 0:
-        raise ValueError("owned entry retirement was incomplete")
-    if not still_attached():
-        raise ValueError("owned entry parent changed during retirement")
-    if _entry_at(parent_fd, quarantine) is not None:
-        raise ValueError("owned entry quarantine was reused during retirement")
-
-
 def _retire_and_delete_owned_entry_at(
     parent_fd: int,
     name: str,
@@ -1084,83 +1212,68 @@ def _retire_and_delete_owned_entry_at(
     registry: _OwnershipRegistry,
     still_attached: Callable[[], bool],
 ) -> bool:
-    """Quarantine one name atomically, then delete only its owned identity."""
+    """Move one owned identity into the locked private retirement namespace."""
     if not still_attached() or _entry_at(parent_fd, name) != expected:
         return False
+    namespace = registry.retirement_namespace
+    namespace.verify("owned entry retirement")
     if not registry.begin_retirement(expected):
         return False
     quarantine: str | None = None
     retirement_descriptor = -1
-    retirement_witness: _RetirementEventWitness | None = None
     retired = False
     primary_error: BaseException | None = None
     try:
         if not still_attached() or _entry_at(parent_fd, name) != expected:
             registry.restore(expected)
             return False
-        retirement_witness = _RetirementEventWitness.open(
-            parent_fd,
-            "owned entry retirement",
-        )
-        if not still_attached():
-            raise ValueError("owned entry parent changed during retirement")
+        namespace.inspect()
         for _ in range(100):
             candidate = _RETIREMENT_PREFIX + secrets.token_hex(12)
-            if not still_attached():
+            if not still_attached() or not namespace.is_attached():
                 raise ValueError("owned entry parent changed during retirement")
             try:
                 rename_noreplace_at(
                     parent_fd,
                     name,
-                    parent_fd,
+                    namespace.descriptor,
                     candidate,
                 )
             except FileExistsError:
+                namespace.inspect()
                 continue
             quarantine = candidate
             break
         if quarantine is None:
             raise ValueError("unable to reserve an owned entry quarantine")
-        if not still_attached():
-            raise ValueError("owned entry parent changed during retirement")
         flags = _DIRECTORY_FLAGS if stat.S_ISDIR(expected.mode) else (
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         )
         retirement_descriptor = os.open(
             quarantine,
             flags,
-            dir_fd=parent_fd,
+            dir_fd=namespace.descriptor,
         )
         pinned = _EntryIdentity.from_stat(os.fstat(retirement_descriptor))
-        quarantined = _entry_at(parent_fd, quarantine)
+        quarantined = _entry_at(namespace.descriptor, quarantine)
         if pinned != expected or quarantined != expected:
-            error = ValueError("owned entry changed during retirement")
-            try:
-                _restore_quarantined_entry_at(
-                    parent_fd,
-                    quarantine,
-                    name,
-                    still_attached,
-                )
-            except BaseException as restore_error:
-                error.add_note(
-                    "Secondary quarantine restore failure: "
-                    f"{type(restore_error).__name__}: {restore_error}"
-                )
-            raise error
-        retirement_witness.verify_quarantine_move(
-            name,
-            quarantine,
-            is_directory=stat.S_ISDIR(expected.mode),
-        )
-        _remove_pinned_quarantine_entry_at(
-            parent_fd,
-            quarantine,
-            expected,
-            retirement_descriptor,
-            retirement_witness,
-            still_attached,
-        )
+            raise ValueError("owned entry changed inside retirement quarantine")
+        namespace.inspect((quarantine,))
+        before = os.fstat(retirement_descriptor)
+        if _EntryIdentity.from_stat(before) != expected or before.st_nlink <= 0:
+            raise ValueError("owned entry changed inside retirement quarantine")
+        if stat.S_ISDIR(expected.mode):
+            os.rmdir(quarantine, dir_fd=namespace.descriptor)
+        else:
+            if before.st_nlink != 1:
+                raise ValueError("owned file has an ambiguous retirement link count")
+            os.unlink(quarantine, dir_fd=namespace.descriptor)
+        after = os.fstat(retirement_descriptor)
+        if _EntryIdentity.from_stat(after) != expected or after.st_nlink != 0:
+            raise ValueError("owned entry retirement was incomplete")
+        if _entry_at(namespace.descriptor, quarantine) is not None:
+            raise ValueError("owned retirement quarantine name was unexpectedly reused")
+        namespace.inspect()
         retired = True
     except BaseException as exc:
         primary_error = exc
@@ -1176,17 +1289,6 @@ def _retire_and_delete_owned_entry_at(
                     "Secondary retirement descriptor close failure: "
                     f"{type(close_error).__name__}: {close_error}"
                 )
-    if retirement_witness is not None:
-        try:
-            retirement_witness.close()
-        except BaseException as close_error:
-            if primary_error is None:
-                primary_error = close_error
-            else:
-                primary_error.add_note(
-                    "Secondary retirement witness close failure: "
-                    f"{type(close_error).__name__}: {close_error}"
-                )
 
     if retired:
         registry.finish_retirement(expected)
@@ -1195,7 +1297,10 @@ def _retire_and_delete_owned_entry_at(
         quarantined_after_failure: _EntryIdentity | None = None
         if quarantine is not None:
             try:
-                quarantined_after_failure = _entry_at(parent_fd, quarantine)
+                quarantined_after_failure = _entry_at(
+                    namespace.descriptor,
+                    quarantine,
+                )
             except BaseException as inspection_error:
                 if primary_error is None:
                     primary_error = inspection_error
@@ -1204,14 +1309,22 @@ def _retire_and_delete_owned_entry_at(
                         "Secondary owned quarantine inspection failure: "
                         f"{type(inspection_error).__name__}: {inspection_error}"
                     )
-        if quarantined_after_failure is not None:
+        if quarantined_after_failure == expected:
             assert quarantine is not None
             try:
-                _restore_quarantined_entry_at(
-                    parent_fd,
+                if (
+                    not still_attached()
+                    or _entry_at(parent_fd, name) is not None
+                    or not namespace.is_attached()
+                ):
+                    raise ValueError(
+                        "owned entry parent changed before quarantine restore"
+                    )
+                rename_noreplace_at(
+                    namespace.descriptor,
                     quarantine,
+                    parent_fd,
                     name,
-                    still_attached,
                 )
             except BaseException as restore_error:
                 assert primary_error is not None
@@ -1219,30 +1332,18 @@ def _retire_and_delete_owned_entry_at(
                     "Secondary owned quarantine restore failure: "
                     f"{type(restore_error).__name__}: {restore_error}"
                 )
+        elif quarantined_after_failure is not None:
+            try:
+                namespace.inspect()
+            except BaseException as inspection_error:
+                assert primary_error is not None
+                primary_error.add_note(
+                    "Secondary unexpected quarantine inspection failure: "
+                    f"{type(inspection_error).__name__}: {inspection_error}"
+                )
     if primary_error is not None:
         raise primary_error
     return True
-
-
-def _restore_quarantined_entry_at(
-    parent_fd: int,
-    quarantine: str,
-    original_name: str,
-    still_attached: Callable[[], bool],
-) -> None:
-    """Restore a quarantined entry without replacing any current original."""
-    if not still_attached():
-        raise ValueError("owned entry parent changed before quarantine restore")
-    if _entry_at(parent_fd, quarantine) is None:
-        return
-    if not still_attached():
-        raise ValueError("owned entry parent changed before quarantine restore")
-    rename_noreplace_at(
-        parent_fd,
-        quarantine,
-        parent_fd,
-        original_name,
-    )
 
 
 def _remove_owned_empty_directory_at(
@@ -1455,7 +1556,12 @@ def _remove_owned_identities_below(
 
 
 class WriterPublication:
-    """Own one atomic writer bundle and finalize every cleanup outcome."""
+    """Own one locked writer bundle and finalize every cleanup outcome.
+
+    Every supported staging mutation is serialized by the anchored parent
+    lock.  Owned entries retire only after a no-replace move into this
+    transaction's private sibling quarantine.
+    """
 
     def __init__(
         self,
@@ -1472,6 +1578,9 @@ class WriterPublication:
         self.bundle_context = bundle_context or f"{context} bundle"
         self.registry = _OwnershipRegistry()
         self.source_anchor: _AnchoredDirectoryPath | None = None
+        self.staging_parent_anchor: _AnchoredDirectoryPath | None = None
+        self.writer_lock: _WriterLock | None = None
+        self.retirement_namespace: _RetirementNamespace | None = None
         self.staging_anchor: _AnchoredDirectoryPath | None = None
         self.bundle: _ChildDirectory | None = None
         self._children: list[_ChildDirectory] = []
@@ -1506,12 +1615,37 @@ class WriterPublication:
                 != source_tree.directory_identity
             ):
                 raise ValueError("source path changed before staging publication")
+            publication.staging_parent_anchor = _AnchoredDirectoryPath.open(
+                publication.staging_path.parent,
+                "staging parent path",
+                create_final=False,
+            )
+            publication.writer_lock = _WriterLock.acquire(
+                publication.staging_parent_anchor
+            )
+            retirement_directory = _create_private_child_directory(
+                publication.staging_parent_anchor.descriptor,
+                _RETIREMENT_NAMESPACE_PREFIX,
+                "writer retirement quarantine",
+                publication.staging_parent_is_locked,
+                None,
+            )
+            publication.retirement_namespace = _RetirementNamespace(
+                retirement_directory,
+                publication.writer_lock,
+            )
+            publication.retirement_namespace.verify_clean()
+            publication.registry.bind_retirement_namespace(
+                publication.retirement_namespace
+            )
+            publication.writer_lock.verify("staging path creation")
             publication.staging_anchor = _AnchoredDirectoryPath.open(
                 publication.staging_path,
                 "staging path",
                 create_final=True,
                 registry=publication.registry,
             )
+            publication.writer_lock.verify("staging path creation")
             if (
                 publication.source_anchor.identity.directory_key
                 in publication.staging_anchor.ancestry
@@ -1544,7 +1678,20 @@ class WriterPublication:
         return self.bundle
 
     def staging_is_attached(self) -> bool:
-        return self.staging_anchor is not None and self.staging_anchor.is_attached()
+        return (
+            self.staging_parent_is_locked()
+            and self.staging_anchor is not None
+            and self.staging_anchor.is_attached()
+        )
+
+    def staging_parent_is_locked(self) -> bool:
+        try:
+            if self.writer_lock is None:
+                return False
+            self.writer_lock.verify("writer transaction")
+        except (OSError, ValueError):
+            return False
+        return True
 
     def bundle_is_attached(self) -> bool:
         return (
@@ -1694,8 +1841,24 @@ class WriterPublication:
                     )
                 )
 
+        if self.retirement_namespace is not None:
+            failures.attempt(
+                "retirement quarantine topology verification",
+                self.retirement_namespace.verify_clean,
+            )
+
         if self.source_anchor is not None:
             failures.attempt("source anchor close", self.source_anchor.close)
+
+        if (
+            self.retirement_namespace is not None
+            and not self.retirement_namespace.is_attached()
+        ):
+            failures.attempt(
+                "detached retirement quarantine descriptor close",
+                self.retirement_namespace.close,
+            )
+            self._create_recovery_retirement_namespace(failures)
 
         rollback_required = not committed or bool(failures.errors)
         if (
@@ -1742,12 +1905,339 @@ class WriterPublication:
                 failures,
             )
 
+        before_quarantine_removal = len(failures.errors)
+        if self.retirement_namespace is not None:
+            failures.attempt(
+                "retirement quarantine removal",
+                self.retirement_namespace.remove,
+            )
+        if (
+            committed
+            and len(failures.errors) > before_quarantine_removal
+            and self.registry.has_active()
+            and staging_identity is not None
+        ):
+            if (
+                self.retirement_namespace is not None
+                and not self.retirement_namespace.is_attached()
+            ):
+                failures.attempt(
+                    "removed retirement quarantine descriptor close",
+                    self.retirement_namespace.close,
+                )
+                self._create_recovery_retirement_namespace(failures)
+            self._recover_after_final_anchor_close(
+                staging_identity,
+                failures,
+            )
+            if self.retirement_namespace is not None:
+                failures.attempt(
+                    "retirement quarantine removal after rollback",
+                    self.retirement_namespace.remove,
+                )
+        closing_retirement_namespace = self.retirement_namespace
+        before_quarantine_close = len(failures.errors)
+        if self.retirement_namespace is not None:
+            failures.attempt(
+                "retirement quarantine descriptor close",
+                self.retirement_namespace.close,
+            )
+        if (
+            committed
+            and len(failures.errors) > before_quarantine_close
+            and self.registry.has_active()
+            and staging_identity is not None
+        ):
+            if closing_retirement_namespace is not None:
+                failures.attempt(
+                    "failed retirement quarantine descriptor retry close",
+                    closing_retirement_namespace.close,
+                )
+            self._create_recovery_retirement_namespace(failures)
+            self._recover_after_final_anchor_close(
+                staging_identity,
+                failures,
+            )
+            if self.retirement_namespace is not None:
+                failures.attempt(
+                    "quarantine-close recovery namespace removal",
+                    self.retirement_namespace.remove,
+                )
+                failures.attempt(
+                    "quarantine-close recovery descriptor close",
+                    self.retirement_namespace.close,
+                )
+
+        staging_parent_identity = (
+            self.staging_parent_anchor.identity
+            if self.staging_parent_anchor is not None
+            else None
+        )
+        before_parent_close = len(failures.errors)
+        if self.staging_parent_anchor is not None:
+            failures.attempt(
+                "staging parent anchor close",
+                self.staging_parent_anchor.close,
+            )
+        if (
+            committed
+            and len(failures.errors) > before_parent_close
+            and self.registry.has_active()
+            and staging_identity is not None
+            and staging_parent_identity is not None
+        ):
+            self._recover_after_parent_anchor_close(
+                staging_parent_identity,
+                staging_identity,
+                failures,
+            )
+
+        before_lock_release = len(failures.errors)
+        if self.writer_lock is not None:
+            failures.attempt("writer lock release", self.writer_lock.release)
+        if (
+            committed
+            and len(failures.errors) > before_lock_release
+            and self.registry.has_active()
+            and staging_identity is not None
+            and staging_parent_identity is not None
+        ):
+            self._recover_after_lock_release(
+                staging_parent_identity,
+                staging_identity,
+                failures,
+            )
+
+        before_lock_close = len(failures.errors)
+        if self.writer_lock is not None:
+            failures.attempt("writer lock close", self.writer_lock.close)
+        if (
+            committed
+            and len(failures.errors) > before_lock_close
+            and self.registry.has_active()
+            and staging_identity is not None
+            and staging_parent_identity is not None
+        ):
+            self._recover_after_lock_close(
+                staging_parent_identity,
+                staging_identity,
+                failures,
+            )
+
         if primary is None and not failures.errors:
             self.registry.release_all()
         self.bundle = None
         self.source_anchor = None
+        self.writer_lock = None
+        self.retirement_namespace = None
+        self.staging_parent_anchor = None
         self.staging_anchor = None
         failures.finish(primary, self.context)
+
+    def _recover_after_lock_release(
+        self,
+        staging_parent_identity: _EntryIdentity,
+        staging_identity: _EntryIdentity,
+        failures: _CleanupFailures,
+    ) -> None:
+        failed_parent = self.staging_parent_anchor
+        recovery_parent: _AnchoredDirectoryPath | None = None
+        try:
+            recovery_parent = _AnchoredDirectoryPath.open(
+                self.staging_path.parent,
+                "writer lock release recovery parent",
+                create_final=False,
+            )
+            if recovery_parent.identity != staging_parent_identity:
+                raise ValueError(
+                    "staging parent changed before lock-release recovery"
+                )
+            if self.writer_lock is None:
+                raise ValueError("writer lock is unavailable for release recovery")
+            self.writer_lock.rebind_parent(
+                recovery_parent,
+                "writer lock release recovery",
+            )
+            self.staging_parent_anchor = recovery_parent
+            self.writer_lock.reacquire()
+            self._create_recovery_retirement_namespace(failures)
+            self._recover_after_final_anchor_close(staging_identity, failures)
+            if self.retirement_namespace is not None:
+                failures.attempt(
+                    "lock-release recovery retirement quarantine removal",
+                    self.retirement_namespace.remove,
+                )
+                failures.attempt(
+                    "lock-release recovery quarantine descriptor close",
+                    self.retirement_namespace.close,
+                )
+        except BaseException as exc:
+            failures.errors.append(("writer lock release recovery", exc))
+        finally:
+            if recovery_parent is not None:
+                failures.attempt(
+                    "writer lock release recovery parent close",
+                    recovery_parent.close,
+                )
+            if failed_parent is not None and failed_parent is not recovery_parent:
+                failures.attempt(
+                    "released writer lock parent retry close",
+                    failed_parent.close,
+                )
+
+    def _recover_after_lock_close(
+        self,
+        staging_parent_identity: _EntryIdentity,
+        staging_identity: _EntryIdentity,
+        failures: _CleanupFailures,
+    ) -> None:
+        failed_parent = self.staging_parent_anchor
+        recovery_parent: _AnchoredDirectoryPath | None = None
+        recovery_lock: _WriterLock | None = None
+        try:
+            recovery_parent = _AnchoredDirectoryPath.open(
+                self.staging_path.parent,
+                "writer lock close recovery parent",
+                create_final=False,
+            )
+            if recovery_parent.identity != staging_parent_identity:
+                raise ValueError(
+                    "staging parent changed before lock-close recovery"
+                )
+            current = self.writer_lock
+            if current is not None and current.descriptor >= 0:
+                current.rebind_parent(
+                    recovery_parent,
+                    "writer lock close recovery",
+                )
+                current.reacquire()
+                recovery_lock = current
+            else:
+                recovery_lock = _WriterLock.acquire(recovery_parent)
+            self.staging_parent_anchor = recovery_parent
+            self.writer_lock = recovery_lock
+            self._create_recovery_retirement_namespace(failures)
+            self._recover_after_final_anchor_close(staging_identity, failures)
+            if self.retirement_namespace is not None:
+                failures.attempt(
+                    "lock-close recovery retirement quarantine removal",
+                    self.retirement_namespace.remove,
+                )
+                failures.attempt(
+                    "lock-close recovery quarantine descriptor close",
+                    self.retirement_namespace.close,
+                )
+        except BaseException as exc:
+            failures.errors.append(("writer lock close recovery", exc))
+        finally:
+            if recovery_lock is not None:
+                failures.attempt(
+                    "lock-close recovery writer lock close",
+                    recovery_lock.close,
+                )
+            if recovery_parent is not None:
+                failures.attempt(
+                    "writer lock close recovery parent close",
+                    recovery_parent.close,
+                )
+            if failed_parent is not None and failed_parent is not recovery_parent:
+                failures.attempt(
+                    "closed writer lock parent retry close",
+                    failed_parent.close,
+                )
+
+    def _recover_after_parent_anchor_close(
+        self,
+        staging_parent_identity: _EntryIdentity,
+        staging_identity: _EntryIdentity,
+        failures: _CleanupFailures,
+    ) -> None:
+        failed_parent = self.staging_parent_anchor
+        recovery_parent: _AnchoredDirectoryPath | None = None
+        recovery_namespace: _RetirementNamespace | None = None
+        try:
+            recovery_parent = _AnchoredDirectoryPath.open(
+                self.staging_path.parent,
+                "staging parent rollback path",
+                create_final=False,
+            )
+            if recovery_parent.identity != staging_parent_identity:
+                raise ValueError(
+                    "staging parent changed before close-failure recovery"
+                )
+            if self.writer_lock is None:
+                raise ValueError("writer lock is unavailable for parent recovery")
+            self.writer_lock.rebind_parent(
+                recovery_parent,
+                "staging parent close recovery",
+            )
+            self.staging_parent_anchor = recovery_parent
+            directory = _create_private_child_directory(
+                recovery_parent.descriptor,
+                _RETIREMENT_NAMESPACE_PREFIX,
+                "parent-close recovery retirement quarantine",
+                self.staging_parent_is_locked,
+                None,
+            )
+            recovery_namespace = _RetirementNamespace(
+                directory,
+                self.writer_lock,
+            )
+            recovery_namespace.verify_clean()
+            self.registry.replace_retirement_namespace(recovery_namespace)
+            self.retirement_namespace = recovery_namespace
+            self._recover_after_final_anchor_close(staging_identity, failures)
+            failures.attempt(
+                "parent-close recovery retirement quarantine removal",
+                recovery_namespace.remove,
+            )
+        except BaseException as exc:
+            failures.errors.append(("staging parent close recovery", exc))
+        finally:
+            if recovery_namespace is not None:
+                failures.attempt(
+                    "parent-close recovery quarantine descriptor close",
+                    recovery_namespace.close,
+                )
+            if recovery_parent is not None:
+                failures.attempt(
+                    "staging parent recovery anchor close",
+                    recovery_parent.close,
+                )
+            if failed_parent is not None and failed_parent is not recovery_parent:
+                failures.attempt(
+                    "failed staging parent anchor retry close",
+                    failed_parent.close,
+                )
+
+    def _create_recovery_retirement_namespace(
+        self,
+        failures: _CleanupFailures,
+    ) -> None:
+        if self.staging_parent_anchor is None or self.writer_lock is None:
+            failures.errors.append(
+                (
+                    "recovery retirement quarantine creation",
+                    ValueError("staging parent writer lock is unavailable"),
+                )
+            )
+            return
+        try:
+            directory = _create_private_child_directory(
+                self.staging_parent_anchor.descriptor,
+                _RETIREMENT_NAMESPACE_PREFIX,
+                "recovery retirement quarantine",
+                self.staging_parent_is_locked,
+                None,
+            )
+            namespace = _RetirementNamespace(directory, self.writer_lock)
+            namespace.verify_clean()
+            self.registry.replace_retirement_namespace(namespace)
+            self.retirement_namespace = namespace
+        except BaseException as exc:
+            failures.errors.append(
+                ("recovery retirement quarantine creation", exc)
+            )
 
     def _recover_after_final_anchor_close(
         self,
@@ -1756,6 +2246,8 @@ class WriterPublication:
     ) -> None:
         recovery: _AnchoredDirectoryPath | None = None
         try:
+            if not self.staging_parent_is_locked():
+                raise ValueError("staging parent writer lock was lost before recovery")
             recovery = _AnchoredDirectoryPath.open(
                 self.staging_path,
                 "staging rollback path",
