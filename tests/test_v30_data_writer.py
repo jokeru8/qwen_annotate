@@ -882,6 +882,281 @@ def test_replaced_published_data_is_removed_without_following_replacement(
     assert list(staging.glob(".v30-data-*")) == []
 
 
+def test_relocated_staging_is_never_cleaned_through_displaced_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "marker.txt").write_text("unchanged", encoding="utf-8")
+    relocated = outside / "relocated-staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_publish = v30_data_writer.rename_noreplace_at
+    outside_after_injection: str | None = None
+
+    def publish_then_relocate_staging(
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
+    ) -> None:
+        nonlocal outside_after_injection
+        actual_publish(
+            source_fd,
+            source_name,
+            destination_fd,
+            destination_name,
+        )
+        if destination_name != "data":
+            return
+        os.replace(staging, relocated)
+        staging.mkdir()
+        (staging / "replacement-marker.txt").write_text(
+            "preserve replacement root",
+            encoding="utf-8",
+        )
+        os.replace(relocated / "data", relocated / "displaced-data")
+        (relocated / "data").mkdir()
+        (relocated / "data/competitor.txt").write_text(
+            "preserve external competitor",
+            encoding="utf-8",
+        )
+        outside_after_injection = _tree_digest(outside)
+
+    monkeypatch.setattr(
+        v30_data_writer,
+        "rename_noreplace_at",
+        publish_then_relocate_staging,
+    )
+
+    with pytest.raises(ValueError, match="staging data changed during publication"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert outside_after_injection is not None
+    assert source_tree_digest(root) == before_source
+    assert _tree_digest(outside) == outside_after_injection
+    assert (relocated / "data/competitor.txt").read_text(encoding="utf-8") == (
+        "preserve external competitor"
+    )
+    assert (relocated / "displaced-data").is_dir()
+    assert sorted(path.name for path in staging.iterdir()) == [
+        "replacement-marker.txt"
+    ]
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_relocated_meta_is_never_cleaned_through_displaced_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "marker.txt").write_text("unchanged", encoding="utf-8")
+    relocated = outside / "relocated-meta"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_publish = v30_data_writer.rename_noreplace_at
+    outside_after_injection: str | None = None
+
+    def publish_then_relocate_meta(
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
+    ) -> None:
+        nonlocal outside_after_injection
+        actual_publish(
+            source_fd,
+            source_name,
+            destination_fd,
+            destination_name,
+        )
+        if destination_name != "tasks.parquet":
+            return
+        os.replace(staging / "meta", relocated)
+        (staging / "meta").mkdir()
+        (staging / "meta/replacement-marker.txt").write_text(
+            "preserve replacement meta",
+            encoding="utf-8",
+        )
+        os.replace(
+            relocated / "tasks.parquet",
+            relocated / "displaced-tasks.parquet",
+        )
+        (relocated / "tasks.parquet").write_text(
+            "preserve external competitor",
+            encoding="utf-8",
+        )
+        outside_after_injection = _tree_digest(outside)
+
+    monkeypatch.setattr(
+        v30_data_writer,
+        "rename_noreplace_at",
+        publish_then_relocate_meta,
+    )
+
+    with pytest.raises(ValueError, match="staging tasks changed during publication"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert outside_after_injection is not None
+    assert source_tree_digest(root) == before_source
+    assert _tree_digest(outside) == outside_after_injection
+    assert (relocated / "tasks.parquet").read_text(encoding="utf-8") == (
+        "preserve external competitor"
+    )
+    assert (relocated / "displaced-tasks.parquet").is_file()
+    assert not (staging / "data").exists()
+    assert sorted(path.name for path in (staging / "meta").iterdir()) == [
+        "replacement-marker.txt"
+    ]
+    assert list(staging.glob(".v30-data-*")) == []
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_task_owned_inode_is_removed_after_meta_moves_within_attached_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    displaced_meta = staging / "displaced-meta"
+    before_source = source_tree_digest(root)
+    actual_publish = v30_data_writer.rename_noreplace_at
+
+    def publish_then_move_meta_within_staging(
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
+    ) -> None:
+        actual_publish(
+            source_fd,
+            source_name,
+            destination_fd,
+            destination_name,
+        )
+        if destination_name != "tasks.parquet":
+            return
+        os.replace(staging / "meta", displaced_meta)
+        (staging / "meta").mkdir()
+        (staging / "meta/replacement-marker.txt").write_text(
+            "preserve replacement meta",
+            encoding="utf-8",
+        )
+        os.replace(
+            displaced_meta / "tasks.parquet",
+            displaced_meta / "task-owned.parquet",
+        )
+        (displaced_meta / "tasks.parquet").write_text(
+            "preserve attached competitor",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        v30_data_writer,
+        "rename_noreplace_at",
+        publish_then_move_meta_within_staging,
+    )
+
+    with pytest.raises(ValueError, match="staging tasks changed during publication"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (displaced_meta / "task-owned.parquet").exists()
+    assert (displaced_meta / "tasks.parquet").read_text(encoding="utf-8") == (
+        "preserve attached competitor"
+    )
+    assert (staging / "meta/replacement-marker.txt").read_text(
+        encoding="utf-8"
+    ) == "preserve replacement meta"
+    assert list(staging.glob(".v30-data-*")) == []
+
+
+def test_renamed_tasks_are_removed_only_while_meta_remains_attached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    actual_entry_at = v30_data_writer._entry_at
+    injected = False
+
+    def entry_at_then_replace_tasks(parent_fd: int, name: str):
+        nonlocal injected
+        identity = actual_entry_at(parent_fd, name)
+        try:
+            parent_path = Path(os.readlink(f"/proc/self/fd/{parent_fd}"))
+        except OSError:
+            parent_path = Path()
+        if (
+            not injected
+            and name == "tasks.parquet"
+            and identity is not None
+            and parent_path == staging / "meta"
+        ):
+            os.replace(
+                staging / "meta/tasks.parquet",
+                staging / "meta/displaced-tasks.parquet",
+            )
+            (staging / "meta/tasks.parquet").write_text(
+                "remove attached competitor",
+                encoding="utf-8",
+            )
+            injected = True
+        return identity
+
+    monkeypatch.setattr(
+        v30_data_writer,
+        "_entry_at",
+        entry_at_then_replace_tasks,
+    )
+
+    with pytest.raises(ValueError, match="staging tasks changed during publication"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert not (staging / "meta/displaced-tasks.parquet").exists()
+    assert list(staging.glob(".v30-data-*")) == []
+
+
 def test_bundle_open_failure_removes_owned_bundle_and_new_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

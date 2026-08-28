@@ -8,7 +8,7 @@ import math
 import os
 import secrets
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -796,13 +796,33 @@ class _AnchoredDirectoryPath:
         return tuple(identity.directory_key for identity in self._identities)
 
     def verify(self, context: str) -> None:
+        self._verify_components(len(self._names), context)
+
+    def is_attached(self) -> bool:
+        try:
+            self._verify_components(len(self._names), "cleanup")
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def _parent_chain_is_attached(self) -> bool:
+        try:
+            self._verify_components(
+                max(0, len(self._names) - 1),
+                "cleanup",
+            )
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def _verify_components(self, count: int, context: str) -> None:
         if len(self._descriptors) != len(self._identities):
             raise ValueError(f"closed {self.label}")
         if _directory_identity(
             os.fstat(self._descriptors[0]), self.label
         ) != self._identities[0]:
             raise ValueError(f"{self.label} changed during {context}")
-        for index, name in enumerate(self._names):
+        for index, name in enumerate(self._names[:count]):
             expected = self._identities[index + 1]
             try:
                 entry = _directory_identity(
@@ -822,7 +842,7 @@ class _AnchoredDirectoryPath:
                 raise ValueError(f"{self.label} changed during {context}")
 
     def remove_created_final(self) -> None:
-        if not self.created_final:
+        if not self.created_final or not self._parent_chain_is_attached():
             return
         parent_fd = self._descriptors[-2]
         name = self._names[-1]
@@ -866,6 +886,13 @@ class _ChildDirectory:
             raise ValueError(f"{self.context} changed during {phase}") from exc
         if entry != self.identity or opened != self.identity:
             raise ValueError(f"{self.context} changed during {phase}")
+
+    def is_attached(self) -> bool:
+        try:
+            self.verify("cleanup")
+        except (OSError, ValueError):
+            return False
+        return True
 
     def close(self) -> None:
         if self.descriptor >= 0:
@@ -1025,11 +1052,16 @@ def _remove_tree_at(
     parent_fd: int,
     name: str,
     expected: _EntryIdentity,
+    still_attached: Callable[[], bool] | None = None,
 ) -> None:
+    if still_attached is not None and not still_attached():
+        return
     current = _entry_at(parent_fd, name)
     if current is None or current != expected:
         return
     if not stat.S_ISDIR(current.mode):
+        if still_attached is not None and not still_attached():
+            return
         os.unlink(name, dir_fd=parent_fd)
         return
     descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
@@ -1037,25 +1069,48 @@ def _remove_tree_at(
         if _EntryIdentity.from_stat(os.fstat(descriptor)) != expected:
             return
         for child in os.listdir(descriptor):
+            if still_attached is not None and not still_attached():
+                return
             child_identity = _entry_at(descriptor, child)
             if child_identity is not None:
-                _remove_tree_at(descriptor, child, child_identity)
+                _remove_tree_at(
+                    descriptor,
+                    child,
+                    child_identity,
+                    still_attached,
+                )
     finally:
         os.close(descriptor)
-    if _entry_at(parent_fd, name) == expected:
+    if (
+        (still_attached is None or still_attached())
+        and _entry_at(parent_fd, name) == expected
+    ):
         os.rmdir(name, dir_fd=parent_fd)
 
 
-def _remove_entry_at(parent_fd: int, name: str) -> None:
+def _remove_entry_at(
+    parent_fd: int,
+    name: str,
+    still_attached: Callable[[], bool] | None = None,
+) -> None:
     """Remove one descriptor-relative entry recursively without following links."""
     for _ in range(3):
+        if still_attached is not None and not still_attached():
+            return
         current = _entry_at(parent_fd, name)
         if current is None:
             return
         try:
-            _remove_tree_at(parent_fd, name, current)
+            _remove_tree_at(
+                parent_fd,
+                name,
+                current,
+                still_attached,
+            )
         except OSError:
             if stat.S_ISDIR(current.mode):
+                if still_attached is not None and not still_attached():
+                    return
                 try:
                     os.rmdir(name, dir_fd=parent_fd)
                     return
@@ -1066,25 +1121,53 @@ def _remove_entry_at(parent_fd: int, name: str) -> None:
         raise OSError(f"unable to remove staged entry: {name}")
 
 
-def _remove_identity_at(
+def _remove_identity_below(
     parent_fd: int,
     expected: _EntryIdentity,
+    still_attached: Callable[[], bool],
+    visited: set[tuple[int, int]] | None = None,
 ) -> None:
-    """Remove a renamed task-owned entry by identity below one anchored parent."""
-    for _ in range(3):
-        found = False
-        for name in os.listdir(parent_fd):
-            if _entry_at(parent_fd, name) != expected:
-                continue
-            found = True
-            _remove_tree_at(parent_fd, name, expected)
-        if not found:
+    """Remove a task-owned identity only while reachable below an anchored fd."""
+    if visited is None:
+        visited = set()
+    for name in os.listdir(parent_fd):
+        if not still_attached():
             return
-    if any(
-        _entry_at(parent_fd, name) == expected
-        for name in os.listdir(parent_fd)
-    ):
-        raise OSError("unable to remove renamed staged entry")
+        current = _entry_at(parent_fd, name)
+        if current is None:
+            continue
+        if current == expected:
+            _remove_tree_at(
+                parent_fd,
+                name,
+                expected,
+                still_attached,
+            )
+            continue
+        if not stat.S_ISDIR(current.mode):
+            continue
+        key = current.directory_key
+        if key in visited:
+            continue
+        descriptor = -1
+        try:
+            descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            opened = _EntryIdentity.from_stat(os.fstat(descriptor))
+            linked = _entry_at(parent_fd, name)
+            if opened != current or linked != current:
+                continue
+            visited.add(key)
+            _remove_identity_below(
+                descriptor,
+                expected,
+                still_attached,
+                visited,
+            )
+        except OSError:
+            continue
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 def _publish(
@@ -1104,6 +1187,13 @@ def _publish(
     data_published = False
     tasks_published = False
     success = False
+
+    def staging_is_linked() -> bool:
+        return staging_anchor is not None and staging_anchor.is_attached()
+
+    def meta_is_linked() -> bool:
+        return staging_is_linked() and meta is not None and meta.is_attached()
+
     try:
         source_anchor = _AnchoredDirectoryPath.open(
             source_tree.path,
@@ -1214,58 +1304,80 @@ def _publish(
     finally:
         if not success:
             if tasks_published and meta is not None and tasks_identity is not None:
-                try:
-                    _remove_entry_at(meta.descriptor, "tasks.parquet")
-                except OSError:
-                    pass
-                try:
-                    _remove_identity_at(meta.descriptor, tasks_identity)
-                except OSError:
-                    pass
+                if meta_is_linked():
+                    try:
+                        _remove_entry_at(
+                            meta.descriptor,
+                            "tasks.parquet",
+                            meta_is_linked,
+                        )
+                    except OSError:
+                        pass
+                if staging_is_linked() and staging_anchor is not None:
+                    try:
+                        _remove_identity_below(
+                            staging_anchor.descriptor,
+                            tasks_identity,
+                            staging_is_linked,
+                        )
+                    except OSError:
+                        pass
             if (
                 data_published
                 and staging_anchor is not None
                 and data_identity is not None
             ):
-                try:
-                    _remove_entry_at(
-                        staging_anchor.descriptor,
-                        "data",
-                    )
-                except OSError:
-                    pass
-                try:
-                    _remove_identity_at(
-                        staging_anchor.descriptor,
-                        data_identity,
-                    )
-                except OSError:
-                    pass
+                if staging_is_linked():
+                    try:
+                        _remove_entry_at(
+                            staging_anchor.descriptor,
+                            "data",
+                            staging_is_linked,
+                        )
+                    except OSError:
+                        pass
+                if staging_is_linked():
+                    try:
+                        _remove_identity_below(
+                            staging_anchor.descriptor,
+                            data_identity,
+                            staging_is_linked,
+                        )
+                    except OSError:
+                        pass
         if bundle is not None:
             bundle.close()
             if staging_anchor is not None:
-                try:
-                    _remove_entry_at(
-                        staging_anchor.descriptor,
-                        bundle.name,
-                    )
-                except OSError:
-                    pass
-                try:
-                    _remove_identity_at(
-                        staging_anchor.descriptor,
-                        bundle.identity,
-                    )
-                except OSError:
-                    pass
+                if staging_is_linked():
+                    try:
+                        _remove_entry_at(
+                            staging_anchor.descriptor,
+                            bundle.name,
+                            staging_is_linked,
+                        )
+                    except OSError:
+                        pass
+                if staging_is_linked():
+                    try:
+                        _remove_identity_below(
+                            staging_anchor.descriptor,
+                            bundle.identity,
+                            staging_is_linked,
+                        )
+                    except OSError:
+                        pass
         if meta is not None:
-            meta.close()
-            if not success and meta.created and staging_anchor is not None:
+            if (
+                not success
+                and meta.created
+                and staging_anchor is not None
+                and meta_is_linked()
+            ):
                 try:
-                    if _entry_at(staging_anchor.descriptor, "meta") == meta.identity:
-                        os.rmdir("meta", dir_fd=staging_anchor.descriptor)
+                    os.rmdir("meta", dir_fd=staging_anchor.descriptor)
                 except OSError:
                     pass
+            meta.close()
         if staging_anchor is not None:
             if not success:
                 staging_anchor.remove_created_final()
