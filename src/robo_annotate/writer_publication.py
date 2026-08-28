@@ -28,12 +28,14 @@ _OUTPUT_FILE_FLAGS = (
 )
 _PRIVATE_DIRECTORY_PREFIX = ".writer-dir-"
 _RETIREMENT_PREFIX = ".writer-retire-"
+_IN_ATTRIB = 0x00000004
 _IN_CREATE = 0x00000100
 _IN_DELETE = 0x00000200
 _IN_MOVED_FROM = 0x00000040
 _IN_MOVED_TO = 0x00000080
 _IN_DELETE_SELF = 0x00000400
 _IN_MOVE_SELF = 0x00000800
+_IN_UNMOUNT = 0x00002000
 _IN_Q_OVERFLOW = 0x00004000
 _IN_IGNORED = 0x00008000
 _IN_ISDIR = 0x40000000
@@ -48,16 +50,20 @@ _BIRTH_WATCH_MASK = (
     | _IN_MOVE_SELF
     | _IN_ONLYDIR
 )
+_RETIREMENT_WATCH_MASK = _BIRTH_WATCH_MASK | _IN_ATTRIB | _IN_UNMOUNT
+_AT_REMOVEDIR = 0x200
 
 
 class _DirectoryBirthWitness:
     """Use an inode-bound inotify watch to prove one private mkdir birth."""
 
+    _WATCH_MASK = _BIRTH_WATCH_MASK
+
     def __init__(self, descriptor: int, watch: int, context: str) -> None:
         self.descriptor = descriptor
         self.watch = watch
         self.context = context
-        self._events: list[tuple[int, bytes]] = []
+        self._events: list[tuple[int, int, bytes]] = []
 
     @classmethod
     def open(cls, parent_fd: int, context: str) -> "_DirectoryBirthWitness":
@@ -79,7 +85,7 @@ class _DirectoryBirthWitness:
         watch = add_watch(
             descriptor,
             os.fsencode(f"/proc/self/fd/{parent_fd}"),
-            _BIRTH_WATCH_MASK,
+            cls._WATCH_MASK,
         )
         if watch >= 0:
             return cls(descriptor, watch, context)
@@ -102,20 +108,30 @@ class _DirectoryBirthWitness:
         expected_name = os.fsencode(name)
         relevant = [
             mask
-            for mask, event_name in self._events
+            for mask, _, event_name in self._events
             if event_name == expected_name
         ]
-        global_failure = any(
-            mask & (_IN_Q_OVERFLOW | _IN_IGNORED | _IN_DELETE_SELF | _IN_MOVE_SELF)
-            for mask, _ in self._events
-        )
+        global_failure = self._has_global_failure(self._events)
         if global_failure or relevant != [_IN_CREATE | _IN_ISDIR]:
             raise ValueError(
                 f"{self.context} changed while establishing ownership"
             )
 
-    def _read_events(self) -> list[tuple[int, bytes]]:
-        events: list[tuple[int, bytes]] = []
+    @staticmethod
+    def _has_global_failure(
+        events: Sequence[tuple[int, int, bytes]],
+    ) -> bool:
+        failures = (
+            _IN_Q_OVERFLOW
+            | _IN_IGNORED
+            | _IN_DELETE_SELF
+            | _IN_MOVE_SELF
+            | _IN_UNMOUNT
+        )
+        return any(mask & failures for mask, _, _ in events)
+
+    def _read_events(self) -> list[tuple[int, int, bytes]]:
+        events: list[tuple[int, int, bytes]] = []
         while True:
             try:
                 payload = os.read(self.descriptor, 64 * 1024)
@@ -133,13 +149,16 @@ class _DirectoryBirthWitness:
             while offset < len(payload):
                 if len(payload) - offset < _INOTIFY_EVENT.size:
                     raise ValueError("truncated private directory birth event")
-                _, mask, _, length = _INOTIFY_EVENT.unpack_from(payload, offset)
+                _, mask, cookie, length = _INOTIFY_EVENT.unpack_from(
+                    payload,
+                    offset,
+                )
                 offset += _INOTIFY_EVENT.size
                 if length > len(payload) - offset:
                     raise ValueError("truncated private directory birth event")
                 raw_name = payload[offset : offset + length]
                 offset += length
-                events.append((mask, raw_name.split(b"\0", 1)[0]))
+                events.append((mask, cookie, raw_name.split(b"\0", 1)[0]))
         return events
 
     def close(self) -> None:
@@ -147,6 +166,71 @@ class _DirectoryBirthWitness:
             descriptor = self.descriptor
             self.descriptor = -1
             os.close(descriptor)
+
+
+class _RetirementEventWitness(_DirectoryBirthWitness):
+    """Prove one quarantine move and one unambiguous retirement delete."""
+
+    _WATCH_MASK = _RETIREMENT_WATCH_MASK
+
+    def verify_quarantine_move(
+        self,
+        source_name: str,
+        quarantine_name: str,
+        *,
+        is_directory: bool,
+    ) -> None:
+        self._events.extend(self._read_events())
+        source = os.fsencode(source_name)
+        quarantine = os.fsencode(quarantine_name)
+        relevant = [
+            event
+            for event in self._events
+            if event[2] in (source, quarantine)
+        ]
+        kind = _IN_ISDIR if is_directory else 0
+        valid = (
+            len(relevant) == 2
+            and relevant[0][0] == (_IN_MOVED_FROM | kind)
+            and relevant[0][2] == source
+            and relevant[0][1] != 0
+            and relevant[1][0] == (_IN_MOVED_TO | kind)
+            and relevant[1][2] == quarantine
+            and relevant[1][1] == relevant[0][1]
+        )
+        if self._has_global_failure(self._events) or not valid:
+            raise ValueError("owned entry quarantine event history is ambiguous")
+        self._events.clear()
+
+    def verify_unchanged(self, quarantine_name: str) -> None:
+        self._events.extend(self._read_events())
+        quarantine = os.fsencode(quarantine_name)
+        if self._has_global_failure(self._events) or any(
+            event_name == quarantine for _, _, event_name in self._events
+        ):
+            raise ValueError("owned entry changed before retirement removal")
+        self._events.clear()
+
+    def verify_deleted(
+        self,
+        quarantine_name: str,
+        *,
+        is_directory: bool,
+    ) -> None:
+        self._events.extend(self._read_events())
+        quarantine = os.fsencode(quarantine_name)
+        relevant = [
+            mask
+            for mask, _, event_name in self._events
+            if event_name == quarantine
+        ]
+        kind = _IN_ISDIR if is_directory else 0
+        if (
+            self._has_global_failure(self._events)
+            or relevant != [(_IN_DELETE | kind)]
+        ):
+            raise ValueError("owned entry retirement event history is ambiguous")
+        self._events.clear()
 
 
 @dataclass(frozen=True)
@@ -925,6 +1009,74 @@ def _create_owned_file_at(
         raise
 
 
+def _raw_unlinkat(
+    parent_fd: int,
+    name: str,
+    *,
+    is_directory: bool,
+    witness: _RetirementEventWitness,
+) -> None:
+    """Drain the boundary witness, then immediately call Linux unlinkat."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    unlinkat = getattr(libc, "unlinkat", None)
+    if unlinkat is None:
+        raise ValueError("owned retirement requires Linux unlinkat")
+    unlinkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    unlinkat.restype = ctypes.c_int
+    encoded_name = os.fsencode(name)
+    flags = _AT_REMOVEDIR if is_directory else 0
+    witness.verify_unchanged(name)
+    if unlinkat(parent_fd, encoded_name, flags) == 0:
+        return
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error), name)
+
+
+def _remove_pinned_quarantine_entry_at(
+    parent_fd: int,
+    quarantine: str,
+    expected: _EntryIdentity,
+    retirement_descriptor: int,
+    witness: _RetirementEventWitness,
+    still_attached: Callable[[], bool],
+) -> None:
+    """Apply the Linux event invariant at the compare-to-unlink boundary.
+
+    Linux has no compare-and-unlink syscall.  Safety therefore requires an
+    inode-bound parent watch, a final no-follow name comparison, a clean event
+    drain immediately followed by one raw unlinkat, exactly one matching
+    delete event, and the pinned inode's own link-count transition to zero.
+    A regular file must have exactly one link before removal, preventing an
+    external unlink from helping produce that transition.  Any ambiguity is
+    a transaction failure.
+    """
+    is_directory = stat.S_ISDIR(expected.mode)
+    if not still_attached():
+        raise ValueError("owned entry parent changed during retirement")
+    current = _entry_at(parent_fd, quarantine)
+    if current != expected or not still_attached():
+        raise ValueError("owned entry changed before retirement removal")
+    before = os.fstat(retirement_descriptor)
+    if _EntryIdentity.from_stat(before) != expected or before.st_nlink <= 0:
+        raise ValueError("owned entry changed before retirement removal")
+    if not is_directory and before.st_nlink != 1:
+        raise ValueError("owned file has an ambiguous retirement link count")
+    _raw_unlinkat(
+        parent_fd,
+        quarantine,
+        is_directory=is_directory,
+        witness=witness,
+    )
+    witness.verify_deleted(quarantine, is_directory=is_directory)
+    after = os.fstat(retirement_descriptor)
+    if _EntryIdentity.from_stat(after) != expected or after.st_nlink != 0:
+        raise ValueError("owned entry retirement was incomplete")
+    if not still_attached():
+        raise ValueError("owned entry parent changed during retirement")
+    if _entry_at(parent_fd, quarantine) is not None:
+        raise ValueError("owned entry quarantine was reused during retirement")
+
+
 def _retire_and_delete_owned_entry_at(
     parent_fd: int,
     name: str,
@@ -939,12 +1091,19 @@ def _retire_and_delete_owned_entry_at(
         return False
     quarantine: str | None = None
     retirement_descriptor = -1
+    retirement_witness: _RetirementEventWitness | None = None
     retired = False
     primary_error: BaseException | None = None
     try:
         if not still_attached() or _entry_at(parent_fd, name) != expected:
             registry.restore(expected)
             return False
+        retirement_witness = _RetirementEventWitness.open(
+            parent_fd,
+            "owned entry retirement",
+        )
+        if not still_attached():
+            raise ValueError("owned entry parent changed during retirement")
         for _ in range(100):
             candidate = _RETIREMENT_PREFIX + secrets.token_hex(12)
             if not still_attached():
@@ -989,20 +1148,20 @@ def _retire_and_delete_owned_entry_at(
                     f"{type(restore_error).__name__}: {restore_error}"
                 )
             raise error
-        if not still_attached():
-            raise ValueError("owned entry parent changed during retirement")
-        if stat.S_ISDIR(expected.mode):
-            os.rmdir(quarantine, dir_fd=parent_fd)
-        else:
-            os.unlink(quarantine, dir_fd=parent_fd)
-        after = os.fstat(retirement_descriptor)
-        if _EntryIdentity.from_stat(after) != expected or after.st_nlink != 0:
-            raise ValueError("owned entry retirement was incomplete")
+        retirement_witness.verify_quarantine_move(
+            name,
+            quarantine,
+            is_directory=stat.S_ISDIR(expected.mode),
+        )
+        _remove_pinned_quarantine_entry_at(
+            parent_fd,
+            quarantine,
+            expected,
+            retirement_descriptor,
+            retirement_witness,
+            still_attached,
+        )
         retired = True
-        if not still_attached():
-            raise ValueError("owned entry parent changed during retirement")
-        if _entry_at(parent_fd, quarantine) is not None:
-            raise ValueError("owned entry quarantine was reused during retirement")
     except BaseException as exc:
         primary_error = exc
 
@@ -1015,6 +1174,17 @@ def _retire_and_delete_owned_entry_at(
             else:
                 primary_error.add_note(
                     "Secondary retirement descriptor close failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+    if retirement_witness is not None:
+        try:
+            retirement_witness.close()
+        except BaseException as close_error:
+            if primary_error is None:
+                primary_error = close_error
+            else:
+                primary_error.add_note(
+                    "Secondary retirement witness close failure: "
                     f"{type(close_error).__name__}: {close_error}"
                 )
 
@@ -1034,7 +1204,7 @@ def _retire_and_delete_owned_entry_at(
                         "Secondary owned quarantine inspection failure: "
                         f"{type(inspection_error).__name__}: {inspection_error}"
                     )
-        if quarantined_after_failure == expected:
+        if quarantined_after_failure is not None:
             assert quarantine is not None
             try:
                 _restore_quarantined_entry_at(

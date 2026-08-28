@@ -3,6 +3,7 @@ import io
 import json
 import math
 import os
+import stat
 from pathlib import Path
 
 import numpy as np
@@ -1715,6 +1716,268 @@ def test_retirement_quarantines_before_deleting_and_preserves_a_swap(
     assert list(parent.glob(".writer-retire-*")) == []
 
 
+@pytest.mark.parametrize(
+    "replacement_kind",
+    ["file", "empty_directory", "nonempty_directory"],
+)
+def test_retirement_boundary_witness_preserves_post_pin_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_unlinkat = writer_publication._raw_unlinkat
+    actual_publish = writer_publication.WriterPublication.publish
+    injected_identity: writer_publication._EntryIdentity | None = None
+    competitor_identity: writer_publication._EntryIdentity | None = None
+    forced_rollback = False
+
+    def replace_at_removal_boundary(
+        parent_fd: int,
+        name: str,
+        *,
+        is_directory: bool,
+        **kwargs: object,
+    ) -> None:
+        nonlocal competitor_identity, injected_identity
+        target_kind = (
+            replacement_kind == "file" and not is_directory
+        ) or (
+            replacement_kind != "file" and is_directory
+        )
+        if (
+            injected_identity is None
+            and name.startswith(".writer-retire-")
+            and target_kind
+        ):
+            current = writer_publication._entry_at(parent_fd, name)
+            assert current is not None
+            injected_identity = current
+            if is_directory:
+                os.rmdir(name, dir_fd=parent_fd)
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+                if replacement_kind == "nonempty_directory":
+                    competitor = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY,
+                        dir_fd=parent_fd,
+                    )
+                    try:
+                        marker = os.open(
+                            "competitor.txt",
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=competitor,
+                        )
+                        try:
+                            os.write(marker, b"preserve retirement competitor")
+                        finally:
+                            os.close(marker)
+                    finally:
+                        os.close(competitor)
+            else:
+                os.unlink(name, dir_fd=parent_fd)
+                competitor = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    os.write(competitor, b"preserve retirement competitor")
+                finally:
+                    os.close(competitor)
+            competitor_identity = writer_publication._EntryIdentity.from_stat(
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            )
+        actual_unlinkat(
+            parent_fd,
+            name,
+            is_directory=is_directory,
+            **kwargs,
+        )
+
+    def fail_before_first_publish(
+        publication: writer_publication.WriterPublication,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal forced_rollback
+        if replacement_kind == "file" and not forced_rollback:
+            forced_rollback = True
+            raise RuntimeError("force private file rollback")
+        actual_publish(publication, *args, **kwargs)
+
+    monkeypatch.setattr(
+        writer_publication,
+        "_raw_unlinkat",
+        replace_at_removal_boundary,
+    )
+    monkeypatch.setattr(
+        writer_publication.WriterPublication,
+        "publish",
+        fail_before_first_publish,
+    )
+
+    with pytest.raises((RuntimeError, ValueError)) as raised:
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected_identity is not None
+    assert competitor_identity is not None
+    error_details = "\n".join(
+        (str(raised.value), *getattr(raised.value, "__notes__", ()))
+    )
+    assert "writer rollback left owned filesystem identities active" in error_details
+    competitors = []
+    if staging.exists():
+        for candidate in (staging, *staging.rglob("*")):
+            value = candidate.lstat()
+            identity = writer_publication._EntryIdentity.from_stat(value)
+            if identity == competitor_identity:
+                competitors.append(candidate)
+    assert len(competitors) == 1
+    competitor = competitors[0]
+    if replacement_kind == "file":
+        assert competitor.read_bytes() == b"preserve retirement competitor"
+    elif replacement_kind == "empty_directory":
+        assert competitor.is_dir()
+        assert list(competitor.iterdir()) == []
+    else:
+        assert (competitor / "competitor.txt").read_bytes() == (
+            b"preserve retirement competitor"
+        )
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_retirement_rejects_an_external_link_before_the_removal_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = parent / "owned"
+    target.write_bytes(b"owned bytes")
+    external_link = parent / "external-link"
+    os.link(target, external_link)
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    identity = writer_publication._EntryIdentity.from_stat(
+        os.stat("owned", dir_fd=parent_fd, follow_symlinks=False)
+    )
+    registry = writer_publication._OwnershipRegistry()
+    registry.register(identity)
+    actual_unlinkat = writer_publication._raw_unlinkat
+    removal_boundary_reached = False
+
+    def unlink_both_names(
+        parent_descriptor: int,
+        name: str,
+        *,
+        is_directory: bool,
+        **kwargs: object,
+    ) -> None:
+        nonlocal removal_boundary_reached
+        removal_boundary_reached = True
+        os.unlink("external-link", dir_fd=parent_descriptor)
+        actual_unlinkat(
+            parent_descriptor,
+            name,
+            is_directory=is_directory,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(writer_publication, "_raw_unlinkat", unlink_both_names)
+    try:
+        with pytest.raises(
+            ValueError,
+            match="ambiguous retirement link count",
+        ):
+            writer_publication._retire_and_delete_owned_entry_at(
+                parent_fd,
+                "owned",
+                identity,
+                registry,
+                lambda: True,
+            )
+    finally:
+        os.close(parent_fd)
+
+    assert not removal_boundary_reached
+    assert target.read_bytes() == b"owned bytes"
+    assert external_link.read_bytes() == b"owned bytes"
+    assert target.stat().st_ino == external_link.stat().st_ino
+    assert registry.is_owned(identity)
+
+
+def test_retirement_event_overflow_fails_closed_and_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_entry_at = writer_publication._entry_at
+    actual_read = writer_publication.os.read
+    retirement_boundary_reached = False
+    overflow_injected = False
+
+    def mark_retirement_boundary(parent_fd: int, name: str):
+        nonlocal retirement_boundary_reached
+        current = actual_entry_at(parent_fd, name)
+        if name.startswith(".writer-retire-") and current is not None:
+            retirement_boundary_reached = True
+        return current
+
+    def inject_overflow(descriptor: int, size: int) -> bytes:
+        nonlocal overflow_injected
+        if retirement_boundary_reached and not overflow_injected:
+            overflow_injected = True
+            return writer_publication._INOTIFY_EVENT.pack(
+                -1,
+                writer_publication._IN_Q_OVERFLOW,
+                0,
+                0,
+            )
+        return actual_read(descriptor, size)
+
+    monkeypatch.setattr(
+        writer_publication,
+        "_entry_at",
+        mark_retirement_boundary,
+    )
+    monkeypatch.setattr(writer_publication.os, "read", inject_overflow)
+
+    with pytest.raises(ValueError, match="cleanup failed"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert retirement_boundary_reached
+    assert overflow_injected
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
 @pytest.mark.parametrize("entry_kind", ["file", "directory"])
 def test_retiring_owned_identity_prevents_reentrant_inode_reuse_cleanup(
     tmp_path: Path,
@@ -1735,8 +1998,7 @@ def test_retiring_owned_identity_prevents_reentrant_inode_reuse_cleanup(
     registry = v30_data_writer._OwnershipRegistry()
     registry.register(identity)
     actual_entry_at = v30_data_writer._entry_at
-    actual_unlink = os.unlink
-    actual_rmdir = os.rmdir
+    actual_unlinkat = writer_publication._raw_unlinkat
     replacement_installed = False
 
     def reused_identity(parent_descriptor: int, name: str):
@@ -1745,31 +2007,24 @@ def test_retiring_owned_identity_prevents_reentrant_inode_reuse_cleanup(
             return identity
         return current
 
-    def install_file_replacement(
+    def install_replacement(
+        parent_descriptor: int,
         name: str,
-        *args: object,
+        *,
+        is_directory: bool,
         **kwargs: object,
     ) -> None:
         nonlocal replacement_installed
-        actual_unlink(name, *args, **kwargs)
-        target.write_bytes(b"replacement")
-        replacement_installed = True
-        v30_data_writer._remove_owned_entry_at(
-            parent_fd,
-            "owned",
-            identity,
-            registry,
-            lambda: True,
+        actual_unlinkat(
+            parent_descriptor,
+            name,
+            is_directory=is_directory,
+            **kwargs,
         )
-
-    def install_directory_replacement(
-        name: str,
-        *args: object,
-        **kwargs: object,
-    ) -> None:
-        nonlocal replacement_installed
-        actual_rmdir(name, *args, **kwargs)
-        target.mkdir()
+        if entry_kind == "file":
+            target.write_bytes(b"replacement")
+        else:
+            target.mkdir()
         replacement_installed = True
         v30_data_writer._remove_owned_entry_at(
             parent_fd,
@@ -1780,10 +2035,7 @@ def test_retiring_owned_identity_prevents_reentrant_inode_reuse_cleanup(
         )
 
     monkeypatch.setattr(writer_publication, "_entry_at", reused_identity)
-    if entry_kind == "file":
-        monkeypatch.setattr(v30_data_writer.os, "unlink", install_file_replacement)
-    else:
-        monkeypatch.setattr(v30_data_writer.os, "rmdir", install_directory_replacement)
+    monkeypatch.setattr(writer_publication, "_raw_unlinkat", install_replacement)
     try:
         v30_data_writer._remove_owned_entry_at(
             parent_fd,
@@ -2224,25 +2476,36 @@ def test_incomplete_private_bundle_retirement_rolls_back_published_outputs(
     dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
     staging = tmp_path / "staging"
     before_source = source_tree_digest(root)
-    actual_rmdir = os.rmdir
+    actual_unlinkat = writer_publication._raw_unlinkat
     injected = False
 
     def fail_private_bundle_retirement(
-        path: object,
-        *args: object,
+        parent_fd: int,
+        name: str,
+        *,
+        is_directory: bool,
         **kwargs: object,
     ) -> None:
         nonlocal injected
         if (
             not injected
-            and isinstance(path, str)
-            and path.startswith(".writer-retire-")
+            and is_directory
+            and name.startswith(".writer-retire-")
         ):
             injected = True
             return
-        actual_rmdir(path, *args, **kwargs)
+        actual_unlinkat(
+            parent_fd,
+            name,
+            is_directory=is_directory,
+            **kwargs,
+        )
 
-    monkeypatch.setattr(v30_data_writer.os, "rmdir", fail_private_bundle_retirement)
+    monkeypatch.setattr(
+        writer_publication,
+        "_raw_unlinkat",
+        fail_private_bundle_retirement,
+    )
 
     with pytest.raises(ValueError, match="cleanup failed"):
         write_v30_data_subset(
@@ -2315,17 +2578,28 @@ def test_attachment_loss_preserves_cleanup_errors_already_accumulated(
     )
     registry = v30_data_writer._OwnershipRegistry()
     registry.register(identity)
-    actual_unlink = os.unlink
+    actual_unlinkat = writer_publication._raw_unlinkat
     removal_failed = False
 
-    def fail_owned_removal(path: object, *args: object, **kwargs: object) -> None:
+    def fail_owned_removal(
+        parent_descriptor: int,
+        name: str,
+        *,
+        is_directory: bool,
+        **kwargs: object,
+    ) -> None:
         nonlocal removal_failed
-        if isinstance(path, str) and path.startswith(".writer-retire-"):
+        if name.startswith(".writer-retire-"):
             removal_failed = True
             raise OSError(errno.EIO, "injected owned cleanup failure")
-        actual_unlink(path, *args, **kwargs)
+        actual_unlinkat(
+            parent_descriptor,
+            name,
+            is_directory=is_directory,
+            **kwargs,
+        )
 
-    monkeypatch.setattr(v30_data_writer.os, "unlink", fail_owned_removal)
+    monkeypatch.setattr(writer_publication, "_raw_unlinkat", fail_owned_removal)
     try:
         with pytest.raises(ValueError, match="injected owned cleanup failure"):
             v30_data_writer._remove_owned_identities_below(
