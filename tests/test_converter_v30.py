@@ -1,9 +1,12 @@
 import json
+import os
 import shutil
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import pyarrow.parquet as pq
 
 from robo_annotate.config import AnnotationConfig
 from robo_annotate.lerobot import inspect_dataset
@@ -17,6 +20,7 @@ from tests.v30_fixtures import (
     make_lerobot_v30_fixture,
     make_v30_config,
     official_core_file_digests,
+    source_tree_digest,
 )
 
 
@@ -191,55 +195,317 @@ def test_full_v30_conversion_preserves_core_payload_and_validates(
     assert validation.dataset_version == "v3.0"
 
 
-def test_v30_accepted_only_waits_for_shared_shard_repacking(
+def selectively_accepted_v30_workspace(
+    tmp_path: Path,
+    accepted: tuple[int, ...],
+) -> tuple[Path, Path, dict]:
+    source = make_lerobot_v30_fixture(tmp_path)
+    work = tmp_path / "work"
+    base = make_v30_config(source, work)
+    payload = base.model_dump(mode="python")
+    payload["augmentation"] = {"enabled": True, "language": "English"}
+    payload["sampling"]["min_segment_frames"] = 1
+    config = AnnotationConfig.model_validate(payload)
+    dataset = inspect_dataset(config)
+    store = WorkspaceStore(work, clock=lambda: RECORDED_AT)
+    store.initialize(config, dataset, model_revision="a" * 40)
+    for episode_index in accepted:
+        pending = store.load_episode(episode_index)
+        record = EpisodeRecord.model_validate(
+            pending.model_dump()
+            | {
+                "status": "accepted",
+                "updated_at": RECORDED_AT + timedelta(seconds=episode_index),
+                "final_annotation": FinalAnnotation(
+                    start_subtask_index=0,
+                    boundaries=[],
+                ).model_dump(),
+                "decision_source": "human",
+            }
+        )
+        (work / f"episodes/episode_{episode_index:06d}.json").write_text(
+            record.model_dump_json(),
+            encoding="utf-8",
+        )
+
+    def augment(_config, requests):
+        return {
+            request.episode_index: [
+                f"Perform the selected manipulation for source episode "
+                f"{request.episode_index}."
+            ]
+            for request in requests
+        }
+
+    return work, source, {"augment_episodes": augment}
+
+
+def test_v30_accepted_only_removes_middle_episode_and_rebuilds_every_reference(
     tmp_path: Path,
 ) -> None:
     from robo_annotate.converter import convert_dataset
-    from tests.test_release_validator_v30 import accepted_v30_workspace
+    from robo_annotate.release_validator import validate_release
 
-    work, _, services = accepted_v30_workspace(tmp_path)
+    work, source, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    source_digest_before = source_tree_digest(source)
+
+    report = convert_dataset(
+        work,
+        tmp_path / "accepted",
+        accepted_only=True,
+        services=services,
+    )
+    output = inspect_dataset(
+        make_v30_config(report.output, tmp_path / "inspect-work")
+    )
+
+    assert report.dataset_version == "v3.0"
+    assert report.episode_count == 2
+    assert report.frame_count == 11
+    assert [episode.episode_index for episode in output.episodes] == [0, 1]
+    assert [episode.length for episode in output.episodes] == [6, 5]
+    assert validate_release(report.output, services=services).valid
+    assert source_tree_digest(source) == source_digest_before
+
+    info = json.loads(
+        (report.output / "meta/info.json").read_text(encoding="utf-8")
+    )
+    assert info["codebase_version"] == "v3.0"
+    assert info["data_path"] == (
+        "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+    )
+    assert info["video_path"] == (
+        "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+    )
+    assert info["episodes_path"] == (
+        "meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+    )
+    assert info["data_files_size_in_mb"] == pytest.approx(
+        sum(path.stat().st_size for path in report.output.glob("data/**/*.parquet"))
+        / (2**20)
+    )
+    assert info["video_files_size_in_mb"] == pytest.approx(
+        sum(path.stat().st_size for path in report.output.glob("videos/**/*.mp4"))
+        / (2**20)
+    )
+    episode_rows = pq.read_table(
+        report.output / "meta/episodes/chunk-000/file-000.parquet"
+    ).to_pylist()
+    assert [row["episode_index"] for row in episode_rows] == [0, 1]
+    assert [row["dataset_from_index"] for row in episode_rows] == [0, 6]
+    assert [row["dataset_to_index"] for row in episode_rows] == [6, 11]
+
+    annotations = json.loads(
+        (report.output / "meta/lerobot_annotations.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert list(annotations["episodes"]) == ["0", "1"]
+    task_info = json.loads(
+        (report.output / "meta/task_info/task_0.json").read_text(encoding="utf-8")
+    )
+    assert [entry["episode_id"] for entry in task_info] == [0, 1]
+    assert [
+        entry["label_info"]["action_config"][0]["action_text"]
+        for entry in task_info
+    ] == [
+        "Perform the selected manipulation for source episode 0.",
+        "Perform the selected manipulation for source episode 2.",
+    ]
+
+
+def test_v30_accepted_only_rejects_empty_selection_without_output(
+    tmp_path: Path,
+) -> None:
+    from robo_annotate.converter import convert_dataset
+
+    work, source, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(),
+    )
     output = tmp_path / "accepted-only"
+    before = source_tree_digest(source)
 
-    with pytest.raises(ValueError, match=r"shared-shard repacking"):
+    with pytest.raises(ValueError, match=r"at least one accepted episode"):
         convert_dataset(work, output, accepted_only=True, services=services)
 
+    assert source_tree_digest(source) == before
     assert not output.exists()
     assert not list(tmp_path.glob("accepted-only.staging-*"))
 
 
-def test_v30_accepted_only_rejects_before_any_external_side_effect(
+def test_v30_accepted_only_never_cleans_a_replacement_staging_tree(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    import robo_annotate.converter as converter
-    from tests.test_release_validator_v30 import accepted_v30_workspace
+    import robo_annotate.converter_v30 as converter_v30
+    from robo_annotate.converter import convert_dataset
 
-    work, source, services = accepted_v30_workspace(tmp_path)
-    output = tmp_path / "accepted-only"
-    calls: list[str] = []
+    work, source, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    source_before = source_tree_digest(source)
+    held = tmp_path / "held-owned-staging"
+    replacement: Path | None = None
 
-    def forbidden(name: str):
-        def fail(*args, **kwargs):
-            calls.append(name)
-            raise AssertionError(f"unexpected side effect: {name}")
+    def replace_staging(*args, **kwargs):
+        nonlocal replacement
+        staging = args[1]
+        staging.rename(held)
+        staging.mkdir()
+        (staging / "competitor.txt").write_text(
+            "must survive",
+            encoding="utf-8",
+        )
+        replacement = staging
+        raise RuntimeError("injected writer failure")
 
-        return fail
+    monkeypatch.setattr(
+        converter_v30,
+        "write_v30_data_subset",
+        replace_staging,
+    )
 
-    monkeypatch.setattr(converter, "_guard_workspace", forbidden("inspect"))
-    monkeypatch.setattr(converter, "_tree_digest", forbidden("source hash"))
-    monkeypatch.setattr(converter, "_augment_selected", forbidden("augmentation"))
-    monkeypatch.setattr(converter, "_copy_tree", forbidden("tree copy"))
-    monkeypatch.setattr(converter, "validate_release", forbidden("validation"))
-    # The rejection must not even resolve or inspect the source tree after loading
-    # the manifest.  Removing it makes accidental source access observable.
-    shutil.rmtree(source)
+    with pytest.raises(RuntimeError, match=r"injected writer failure"):
+        convert_dataset(
+            work,
+            tmp_path / "accepted",
+            accepted_only=True,
+            services=services,
+        )
 
-    with pytest.raises(ValueError, match=r"shared-shard repacking"):
-        converter.convert_dataset(work, output, accepted_only=True, services=services)
+    assert replacement is not None
+    assert (replacement / "competitor.txt").read_text(encoding="utf-8") == (
+        "must survive"
+    )
+    assert held.is_dir()
+    assert source_tree_digest(source) == source_before
+    assert not (tmp_path / "accepted").exists()
 
-    assert calls == []
-    assert not output.exists()
-    assert not list(tmp_path.glob("accepted-only.staging-*"))
+
+def test_v30_accepted_only_pairs_every_data_and_video_placement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import robo_annotate.converter_v30 as converter_v30
+    from robo_annotate.converter import convert_dataset
+    from robo_annotate.v30_video_writer import V30VideoWriteResult
+
+    work, source, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    source_before = source_tree_digest(source)
+    original = converter_v30.write_v30_video_subset
+
+    def mismatched(*args, **kwargs):
+        result = original(*args, **kwargs)
+        placements = dict(result.placements)
+        camera = next(iter(placements))
+        changed = list(placements[camera])
+        changed[1] = replace(changed[1], source_index=1)
+        placements[camera] = tuple(changed)
+        return V30VideoWriteResult(
+            placements=placements,
+            files_by_camera=result.files_by_camera,
+        )
+
+    monkeypatch.setattr(
+        converter_v30,
+        "write_v30_video_subset",
+        mismatched,
+    )
+
+    with pytest.raises(ValueError, match=r"placements do not match"):
+        convert_dataset(
+            work,
+            tmp_path / "accepted",
+            accepted_only=True,
+            services=services,
+        )
+
+    assert source_tree_digest(source) == source_before
+    assert not (tmp_path / "accepted").exists()
+    assert not list(tmp_path.glob("accepted.staging-*"))
+
+
+def test_v30_accepted_only_decodes_each_rebuilt_video_once_for_stats(
+    tmp_path: Path,
+) -> None:
+    from robo_annotate.converter import convert_dataset
+    from robo_annotate.stats import iter_video_rgb_frames
+
+    work, _, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    decoded_targets: list[Path] = []
+
+    def tracked(path: Path):
+        target = Path(os.readlink(path)) if str(path).startswith("/proc/self/fd/") else path
+        parts = target.parts
+        decoded_targets.append(Path(*parts[parts.index("videos") :]))
+        yield from iter_video_rgb_frames(path)
+
+    services["iter_video_rgb_frames"] = tracked
+    report = convert_dataset(
+        work,
+        tmp_path / "accepted",
+        accepted_only=True,
+        services=services,
+    )
+    rebuilt = sorted(
+        path.relative_to(report.output)
+        for path in report.output.glob("videos/**/*.mp4")
+    )
+
+    assert rebuilt
+    # One pass creates publication stats and one independent pass validates them.
+    assert {path: decoded_targets.count(path) for path in rebuilt} == {
+        path: 2 for path in rebuilt
+    }
+
+
+def test_v30_accepted_only_source_change_during_stats_aborts_publication(
+    tmp_path: Path,
+) -> None:
+    from robo_annotate.converter import convert_dataset
+    from robo_annotate.stats import iter_video_rgb_frames
+
+    work, source, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    mutated = False
+
+    def racing(path: Path):
+        nonlocal mutated
+        for frame in iter_video_rgb_frames(path):
+            if not mutated:
+                (source / "meta/source-race.txt").write_text(
+                    "changed",
+                    encoding="utf-8",
+                )
+                mutated = True
+            yield frame
+
+    services["iter_video_rgb_frames"] = racing
+
+    with pytest.raises(ValueError, match=r"source dataset changed"):
+        convert_dataset(
+            work,
+            tmp_path / "accepted",
+            accepted_only=True,
+            services=services,
+        )
+
+    assert mutated
+    assert not (tmp_path / "accepted").exists()
+    assert not list(tmp_path.glob("accepted.staging-*"))
 
 
 def test_full_v30_conversion_rechecks_source_digest_before_publish(

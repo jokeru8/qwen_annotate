@@ -110,6 +110,30 @@ def test_v30_validator_accepts_pinned_v061_feature_and_stats_schema(
     assert validate_release(output, deep_video_stats=False).valid
 
 
+def test_v30_validator_rejects_rebuilt_subset_payload_size_corruption(
+    tmp_path: Path,
+) -> None:
+    from tests.test_converter_v30 import selectively_accepted_v30_workspace
+
+    work, _, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    output = convert_dataset(
+        work,
+        tmp_path / "accepted",
+        accepted_only=True,
+        services=services,
+    ).output
+    info_path = output / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["data_files_size_in_mb"] += 1.0
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"data_files_size_in_mb.*actual"):
+        validate_release(output, services=services)
+
+
 def test_v30_validator_accepts_hf_features_json_extension_language_columns(
     tmp_path: Path,
 ) -> None:

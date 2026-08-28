@@ -126,10 +126,6 @@ def convert_dataset(
 
     store = WorkspaceStore(work)
     manifest = store._load_manifest()  # secure bounded loader; conversion is a workspace peer.
-    if accepted_only and manifest.dataset_version == "v3.0":
-        raise ValueError(
-            "accepted-only LeRobot v3.0 publication requires shared-shard repacking"
-        )
     source = manifest.dataset_root.resolve(strict=True)
     if manifest.dataset_root.is_symlink() or not source.is_dir():
         raise ValueError("manifest source root is unsafe")
@@ -140,6 +136,7 @@ def convert_dataset(
     lock_path = out.parent / f".{out.name}.conversion.lock"
     lock_fd = _open_lock(lock_path)
     staging: Path | None = None
+    staging_identity: tuple[int, int, int] | None = None
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         _reject_existing(out)
@@ -150,13 +147,37 @@ def convert_dataset(
         augmented_texts = _augment_selected(config, manifest, records, services)
         staging = out.parent / f"{out.name}.staging-{secrets.token_hex(16)}"
         os.mkdir(staging, 0o700)
-        _copy_tree(source, staging, include_payload=not accepted_only)
+        staging_identity = _directory_identity(staging)
+        if not (accepted_only and manifest.dataset_version == "v3.0"):
+            _copy_tree(source, staging, include_payload=not accepted_only)
         converted_at = datetime.now(UTC)
         if accepted_only:
-            frame_count = _rewrite_accepted_subset(
-                staging, source, out, manifest, dataset, records, converted_at, services,
-                augmented_texts,
-            )
+            if manifest.dataset_version == "v3.0":
+                from .converter_v30 import rewrite_accepted_v30_release
+
+                frame_count = rewrite_accepted_v30_release(
+                    staging,
+                    source,
+                    out,
+                    manifest,
+                    dataset,
+                    records,
+                    converted_at,
+                    augmented_texts,
+                    services,
+                )
+            else:
+                frame_count = _rewrite_accepted_subset(
+                    staging,
+                    source,
+                    out,
+                    manifest,
+                    dataset,
+                    records,
+                    converted_at,
+                    services,
+                    augmented_texts,
+                )
         else:
             frame_count = manifest.total_frames
             if manifest.dataset_version == "v3.0":
@@ -203,7 +224,11 @@ def convert_dataset(
         )
         if _tree_digest(source) != source_before:
             raise ValueError("source dataset changed during conversion")
+        if _directory_identity(staging) != staging_identity:
+            raise ValueError("owned staging directory changed before publication")
         _rename_noreplace(staging, out)
+        if _directory_identity(out) != staging_identity:
+            raise ValueError("published output identity differs from owned staging")
         staging = None
         parent_fd = os.open(out.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
         try:
@@ -221,19 +246,31 @@ def convert_dataset(
             validation=published_validation,
         )
     finally:
-        primary = None
+        active_error = sys.exc_info()[1]
+        cleanup_failure = None
         if staging is not None:
             try:
-                _remove_owned_staging(staging, out.parent, out.name)
+                _remove_owned_staging(
+                    staging,
+                    out.parent,
+                    out.name,
+                    staging_identity,
+                )
             except Exception as cleanup_error:
-                primary = cleanup_error
+                if active_error is not None:
+                    active_error.add_note(
+                        "Secondary staging cleanup failure: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                else:
+                    cleanup_failure = cleanup_error
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         finally:
             os.close(lock_fd)
         # A cleanup error is surfaced only when there was no active primary exception.
-        if primary is not None and sys.exc_info()[0] is None:
-            raise primary
+        if cleanup_failure is not None:
+            raise cleanup_failure
 
 
 def _guard_workspace(
@@ -678,11 +715,28 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
     )
 
 
-def _remove_owned_staging(staging: Path, parent: Path, output_name: str) -> None:
+def _directory_identity(path: Path) -> tuple[int, int, int]:
+    metadata = path.stat(follow_symlinks=False)
+    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("owned staging path is not a real directory")
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _remove_owned_staging(
+    staging: Path,
+    parent: Path,
+    output_name: str,
+    expected: tuple[int, int, int] | None,
+) -> None:
     if staging.parent != parent or not staging.name.startswith(f"{output_name}.staging-"):
         raise ValueError("refusing to clean an unowned path")
-    if staging.exists() and not staging.is_symlink():
-        shutil.rmtree(staging)
+    try:
+        actual = _directory_identity(staging)
+    except FileNotFoundError:
+        return
+    if expected is None or actual != expected:
+        raise ValueError("refusing to clean a replaced staging directory")
+    shutil.rmtree(staging)
 
 
 def _service(services: Any, name: str, default: Any) -> Any:
