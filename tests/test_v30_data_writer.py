@@ -2015,7 +2015,7 @@ def test_source_close_failure_is_secondary_to_primary_publication_error(
     actual_publish = writer_publication.WriterPublication.publish
     actual_close = secure_tree.SecureFile.close
     close_phase = False
-    injected = False
+    source_close_failures = 0
     attempted: list[str] = []
 
     def publish_then_fail(
@@ -2044,14 +2044,17 @@ def test_source_close_failure_is_secondary_to_primary_publication_error(
             raise RuntimeError("primary publication failure")
 
     def close_then_fail_first_source(item: secure_tree.SecureFile) -> None:
-        nonlocal injected
+        nonlocal source_close_failures
         was_open = item._fd >= 0 or item._parent_fd >= 0
         if close_phase and was_open:
             attempted.append(item.relative)
         actual_close(item)
-        if close_phase and was_open and not injected:
-            injected = True
-            raise OSError(errno.EIO, "secondary secure source close failure")
+        if close_phase and was_open and source_close_failures < 2:
+            source_close_failures += 1
+            raise OSError(
+                errno.EIO,
+                f"secondary secure source close failure {source_close_failures}",
+            )
 
     monkeypatch.setattr(
         writer_publication.WriterPublication,
@@ -2074,12 +2077,13 @@ def test_source_close_failure_is_secondary_to_primary_publication_error(
         )
 
     expected_data = dataset.episodes[0].data.path.relative_to(root).as_posix()
-    assert injected
+    assert source_close_failures == 2
     assert {"meta/tasks.parquet", "meta/stats.json", expected_data} <= set(
         attempted
     )
     assert any(
-        "secondary secure source close failure" in note
+        "secondary secure source close failure 1" in note
+        and "secondary secure source close failure 2" in note
         for note in getattr(raised.value, "__notes__", ())
     )
     assert not (staging / "data").exists()

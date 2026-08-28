@@ -33,7 +33,7 @@ def _finish_close_failures(
         primary.add_note(f"Secondary {context} cleanup failures: {details}")
         return
     first = errors[0][1]
-    failure = ValueError(f"{context} cleanup failed: {first}")
+    failure = ValueError(f"{context} cleanup failed: {details}")
     failure.add_note(f"Cleanup failures: {details}")
     raise failure from first
 

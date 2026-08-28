@@ -225,7 +225,7 @@ class _CleanupFailures:
             primary.add_note(f"Secondary {context} failures: {details}")
             return
         first_error = self.errors[0][1]
-        error = ValueError(f"{context} cleanup failed: {first_error}")
+        error = ValueError(f"{context} cleanup failed: {details}")
         error.add_note(f"Cleanup failures: {details}")
         raise error from first_error
 
