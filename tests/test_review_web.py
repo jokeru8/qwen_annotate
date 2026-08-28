@@ -2,6 +2,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from robo_annotate.review_server import create_review_app
@@ -79,14 +80,42 @@ def test_playback_sync_corrects_at_half_frame_not_multi_frame_drift() -> None:
     assert result == {"within": False, "half": True, "twoFrames": True}
 
 
-def test_shared_seek_waits_for_every_camera_and_uses_one_frame_time() -> None:
+def test_episode_media_time_helpers_translate_and_clamp_half_open_slice() -> None:
+    result = _run_js("(() => {const source={from_timestamp:1.2,to_timestamp:2.8};return {"
+        "media:m.mediaTimeForFrame(0,5,source),"
+        "frame:m.localFrameForMediaTime(1.8,5,source),"
+        "last:m.localFrameForMediaTime(2.8,5,source),"
+        "low:m.clampMediaTime(-10,source),"
+        "high:m.clampMediaTime(10,source)};})()")
+
+    assert result["media"] == pytest.approx(1.2)
+    assert result["frame"] == 3
+    assert result["last"] == 7
+    assert result["low"] == pytest.approx(1.2)
+    assert 1.2 <= result["high"] < 2.8
+
+
+def test_shared_seek_waits_for_every_camera_and_uses_each_slice_offset() -> None:
     result = _run_js("(async()=>{class Video{constructor(delay){this.readyState=1;this.seeking=false;this._time=0;this.delay=delay;this.listeners={};}"
         "addEventListener(name,fn){this.listeners[name]=fn;}removeEventListener(name){delete this.listeners[name];}"
         "get currentTime(){return this._time;}set currentTime(value){this._time=value;this.seeking=true;setTimeout(()=>{this.seeking=false;this.listeners.seeked?.();},this.delay);}}"
-        "const videos=[new Video(1),new Video(3),new Video(5),new Video(7)];let resolved=false;"
-        "const pending=m.seekVideosToFrame(videos,28,28).then(()=>{resolved=true;});"
-        "const before=resolved;await pending;return {before,after:resolved,times:videos.map(v=>v.currentTime)};})()")
-    assert result == {"before": False, "after": True, "times": [1, 1, 1, 1]}
+        "const videos=new Map([['main',new Video(1)],['wrist',new Video(3)]]);"
+        "const sources={main:{from_timestamp:1.2,to_timestamp:2.8},wrist:{from_timestamp:3.4,to_timestamp:5.0}};"
+        "let resolved=false;const pending=m.seekVideosToFrame(videos,3,5,sources).then(()=>{resolved=true;});"
+        "const before=resolved;await pending;return {before,after:resolved,times:[...videos.values()].map(v=>v.currentTime)};})()")
+    assert result["before"] is False
+    assert result["after"] is True
+    assert result["times"] == pytest.approx([1.8, 4.0])
+
+
+def test_shared_seek_preserves_v21_zero_offset_behavior() -> None:
+    result = _run_js("(async()=>{class Video{constructor(){this.readyState=1;this.seeking=false;this._time=0;this.listeners={};}"
+        "addEventListener(name,fn){this.listeners[name]=fn;}removeEventListener(name){delete this.listeners[name];}"
+        "get currentTime(){return this._time;}set currentTime(value){this._time=value;this.seeking=true;setTimeout(()=>{this.seeking=false;this.listeners.seeked?.();},1);}}"
+        "const videos=new Map([['eye',new Video()]]);"
+        "await m.seekVideosToFrame(videos,28,28,{eye:{from_timestamp:0,to_timestamp:2}});"
+        "return [...videos.values()].map(v=>v.currentTime);})()")
+    assert result == [1]
 
 
 def test_episode_drafts_are_copied_and_restored_independently() -> None:

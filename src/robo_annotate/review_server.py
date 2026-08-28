@@ -97,10 +97,13 @@ class ReviewRuntime:
             ],
             "coarse_attempts": [item.model_dump(mode="json") for item in record.coarse_attempts],
             "refine_attempts": [item.model_dump(mode="json") for item in record.refine_attempts],
-            "video_urls": {
-                camera: f"/api/episodes/{index}/videos/{quote(camera, safe='')}"
-                for camera in self.manifest.camera_keys
-                if camera in episode.videos
+            "videos": {
+                camera: {
+                    "url": f"/api/episodes/{index}/videos/{quote(camera, safe='')}",
+                    "from_timestamp": ref.from_timestamp,
+                    "to_timestamp": ref.to_timestamp,
+                }
+                for camera, ref in episode.videos.items()
             },
         }
 

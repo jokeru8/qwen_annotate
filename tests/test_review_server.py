@@ -1,15 +1,29 @@
 from pathlib import Path
 from urllib.parse import quote
 
+import pytest
 from fastapi.testclient import TestClient
 
+from robo_annotate.lerobot import inspect_dataset
 from robo_annotate.review_server import create_review_app
+from robo_annotate.workspace import WorkspaceStore
 from tests.test_review import _workspace
+from tests.v30_fixtures import make_lerobot_v30_fixture, make_v30_config
 
 
 def _client(tmp_path: Path):
     work, _, store, record, services, _ = _workspace(tmp_path)
     return TestClient(create_review_app(work, services=services)), work, store, record, services
+
+
+def v30_review_client(tmp_path: Path, episode_index: int) -> TestClient:
+    root = make_lerobot_v30_fixture(tmp_path)
+    config = make_v30_config(root, tmp_path / "work-v30")
+    dataset = inspect_dataset(config)
+    store = WorkspaceStore(config.work_dir)
+    store.initialize(config, dataset, "a" * 40)
+    store.load_episode(episode_index)
+    return TestClient(create_review_app(config.work_dir))
 
 
 def test_session_and_episode_views_are_bounded_and_redacted(tmp_path: Path) -> None:
@@ -44,7 +58,11 @@ def test_session_and_episode_views_are_bounded_and_redacted(tmp_path: Path) -> N
     assert payload["source_fingerprint"] == record.source_fingerprint
     assert payload["candidate_annotation"] == {"start_subtask_index": 1, "boundaries": [184]}
     assert payload["episode_length"] == 240
-    assert payload["video_urls"]["cam.eye"].endswith("cam.eye")
+    assert payload["videos"]["cam.eye"] == {
+        "url": "/api/episodes/0/videos/cam.eye",
+        "from_timestamp": 0.0,
+        "to_timestamp": 12.0,
+    }
     serialized = detail.text
     assert "TOP-SECRET" not in serialized and "NESTED-SECRET" not in serialized
     assert "sampling_details" not in serialized
@@ -74,9 +92,19 @@ def test_video_endpoint_supports_full_and_single_ranges(tmp_path: Path) -> None:
     assert suffix.status_code == 206 and suffix.content == b"eo"
     open_ended = client.get(url, headers={"Range": "bytes=3-"})
     assert open_ended.status_code == 206 and open_ended.content == b"eo"
-    slash_camera_url = client.get("/api/episodes/0").json()["video_urls"]["cam/wrist"]
+    slash_camera_url = client.get("/api/episodes/0").json()["videos"]["cam/wrist"]["url"]
     slash_camera = client.get(slash_camera_url)
     assert slash_camera.status_code == 200 and slash_camera.content == b"video"
+
+
+def test_v30_episode_payload_exposes_shared_video_offsets(tmp_path: Path) -> None:
+    client = v30_review_client(tmp_path, episode_index=1)
+
+    source = client.get("/api/episodes/1").json()["videos"]["observation.images.main"]
+
+    assert source["url"].endswith("observation.images.main")
+    assert source["from_timestamp"] == pytest.approx(1.2)
+    assert source["to_timestamp"] == pytest.approx(2.8)
 
 
 def test_video_endpoint_rejects_multiple_or_unsatisfiable_ranges(tmp_path: Path) -> None:
