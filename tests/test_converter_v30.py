@@ -756,6 +756,147 @@ def test_v30_cleanup_only_failure_raises_after_published_output_rollback(
     assert not list(tmp_path.glob(".writer-quarantine-*"))
 
 
+def test_v30_publication_parent_fsync_remains_primary_when_close_also_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import robo_annotate.converter as converter
+
+    work, source, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    output = tmp_path / "accepted"
+    source_before = source_tree_digest(source)
+    original_open = converter.os.open
+    original_open_lock = converter._open_lock
+    original_fsync = converter.os.fsync
+    original_close = converter.os.close
+    publication_parent_fd = -1
+    output_lock_fd = -1
+    parent_close_attempted = False
+    output_lock_close_attempted = False
+
+    def tracked_open(path, flags, *args, **kwargs):
+        nonlocal publication_parent_fd
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if isinstance(path, (str, Path)) and Path(path) == tmp_path and output.exists():
+            publication_parent_fd = descriptor
+        return descriptor
+
+    def tracked_open_lock(path):
+        nonlocal output_lock_fd
+        output_lock_fd = original_open_lock(path)
+        return output_lock_fd
+
+    def failing_fsync(descriptor):
+        if descriptor == publication_parent_fd:
+            raise OSError("injected publication parent fsync failure")
+        return original_fsync(descriptor)
+
+    def failing_close(descriptor):
+        nonlocal parent_close_attempted, output_lock_close_attempted
+        if descriptor == publication_parent_fd and not parent_close_attempted:
+            parent_close_attempted = True
+            original_close(descriptor)
+            raise OSError("injected publication parent close failure")
+        if descriptor == output_lock_fd:
+            output_lock_close_attempted = True
+        return original_close(descriptor)
+
+    monkeypatch.setattr(converter.os, "open", tracked_open)
+    monkeypatch.setattr(converter, "_open_lock", tracked_open_lock)
+    monkeypatch.setattr(converter.os, "fsync", failing_fsync)
+    monkeypatch.setattr(converter.os, "close", failing_close)
+
+    with pytest.raises(
+        OSError,
+        match=r"injected publication parent fsync failure",
+    ) as failure:
+        converter.convert_dataset(
+            work,
+            output,
+            accepted_only=True,
+            services=services,
+        )
+
+    notes = "\n".join(failure.value.__notes__)
+    assert parent_close_attempted
+    assert output_lock_close_attempted
+    assert "publication parent descriptor close" in notes
+    assert "injected publication parent close failure" in notes
+    assert source_tree_digest(source) == source_before
+    assert not output.exists()
+    assert not list(tmp_path.glob("accepted.staging-*"))
+
+
+def test_v30_publication_parent_close_only_failure_rolls_back_before_raising(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import robo_annotate.converter as converter
+
+    work, source, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    output = tmp_path / "accepted"
+    source_before = source_tree_digest(source)
+    original_open = converter.os.open
+    original_open_lock = converter._open_lock
+    original_close = converter.os.close
+    publication_parent_fd = -1
+    output_lock_fd = -1
+    parent_close_attempted = False
+    output_lock_close_attempted = False
+
+    def tracked_open(path, flags, *args, **kwargs):
+        nonlocal publication_parent_fd
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if isinstance(path, (str, Path)) and Path(path) == tmp_path and output.exists():
+            publication_parent_fd = descriptor
+        return descriptor
+
+    def tracked_open_lock(path):
+        nonlocal output_lock_fd
+        output_lock_fd = original_open_lock(path)
+        return output_lock_fd
+
+    def failing_close(descriptor):
+        nonlocal parent_close_attempted, output_lock_close_attempted
+        if descriptor == publication_parent_fd and not parent_close_attempted:
+            parent_close_attempted = True
+            original_close(descriptor)
+            raise OSError("injected publication parent close failure")
+        if descriptor == output_lock_fd:
+            output_lock_close_attempted = True
+        return original_close(descriptor)
+
+    monkeypatch.setattr(converter.os, "open", tracked_open)
+    monkeypatch.setattr(converter, "_open_lock", tracked_open_lock)
+    monkeypatch.setattr(converter.os, "close", failing_close)
+
+    with pytest.raises(
+        ValueError,
+        match=r"publication parent cleanup failed",
+    ) as failure:
+        converter.convert_dataset(
+            work,
+            output,
+            accepted_only=True,
+            services=services,
+        )
+
+    notes = "\n".join(failure.value.__notes__)
+    assert parent_close_attempted
+    assert output_lock_close_attempted
+    assert "publication parent descriptor close" in notes
+    assert "injected publication parent close failure" in notes
+    assert source_tree_digest(source) == source_before
+    assert not output.exists()
+    assert not list(tmp_path.glob("accepted.staging-*"))
+
+
 def test_v30_accepted_only_source_change_during_stats_aborts_publication(
     tmp_path: Path,
 ) -> None:

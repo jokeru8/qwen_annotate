@@ -239,10 +239,7 @@ def convert_dataset(
             raise ValueError("published output identity differs from owned staging")
         staging = None
         parent_fd = os.open(out.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        _fsync_and_close_directory(parent_fd, "publication parent")
         published_validation = validation.model_copy(update={"path": out.resolve()})
         return ConversionReport(
             output=out.resolve(), dataset_version=manifest.dataset_version,
@@ -724,6 +721,22 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
         -100,
         os.fspath(destination),
     )
+
+
+def _fsync_and_close_directory(descriptor: int, context: str) -> None:
+    primary: BaseException | None = None
+    try:
+        os.fsync(descriptor)
+    except BaseException as exc:
+        primary = exc
+    failures = _CleanupFailures()
+    failures.attempt(
+        f"{context} descriptor close",
+        lambda: os.close(descriptor),
+    )
+    failures.finish(primary, context)
+    if primary is not None:
+        raise primary
 
 
 def _service(services: Any, name: str, default: Any) -> Any:

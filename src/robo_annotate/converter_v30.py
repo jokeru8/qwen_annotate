@@ -596,6 +596,7 @@ def _atomic_parquet(path: Path, table: pa.Table) -> None:
     )
     name = f".{path.name}.{secrets.token_hex(12)}.tmp"
     descriptor = -1
+    primary: BaseException | None = None
     try:
         descriptor = os.open(
             name,
@@ -606,11 +607,20 @@ def _atomic_parquet(path: Path, table: pa.Table) -> None:
             0o600,
             dir_fd=parent_fd,
         )
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = -1
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        write_primary: BaseException | None = None
+        try:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            write_primary = exc
+        handle_failures = _CleanupFailures()
+        handle_failures.attempt("temporary episode parquet close", handle.close)
+        handle_failures.finish(write_primary, "temporary episode parquet")
+        if write_primary is not None:
+            raise write_primary
         os.replace(
             name,
             path.name,
@@ -619,15 +629,34 @@ def _atomic_parquet(path: Path, table: pa.Table) -> None:
         )
         name = ""
         os.fsync(parent_fd)
+    except BaseException as exc:
+        primary = exc
     finally:
+        failures = _CleanupFailures()
         if descriptor >= 0:
-            os.close(descriptor)
+            failures.attempt(
+                "temporary episode parquet descriptor close",
+                lambda: os.close(descriptor),
+            )
         if name:
-            try:
-                os.unlink(name, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
-        os.close(parent_fd)
+            failures.attempt(
+                "temporary episode parquet removal",
+                lambda: _unlink_if_present(parent_fd, name),
+            )
+        failures.attempt(
+            "episode metadata parent descriptor close",
+            lambda: os.close(parent_fd),
+        )
+        failures.finish(primary, "episode metadata publication")
+    if primary is not None:
+        raise primary
+
+
+def _unlink_if_present(parent_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
 
 
 def _official_size_limit(
