@@ -144,7 +144,9 @@ def inspect_dataset(
         from .lerobot_v21 import inspect_v21_dataset
 
         return inspect_v21_dataset(config, info, probe)
-    raise NotImplementedError("LeRobot v3.0 inspection is not implemented")
+    from .lerobot_v30 import inspect_v30_dataset
+
+    return inspect_v30_dataset(config, info, probe)
 
 
 def detect_dataset_version(root: Path) -> DatasetVersion:

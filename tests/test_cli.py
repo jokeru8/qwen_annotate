@@ -121,8 +121,27 @@ def test_inspect_prints_dataset_metadata(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("robo_annotate.cli.inspect_dataset", lambda config: dataset)
     result = runner.invoke(app, ["inspect", str(tmp_path / "config.yaml")])
     assert result.exit_code == 0
-    for expected in ("v2.1", "28.0", "cam.eye", "episodes: 1", "frames: 12", "OK"):
+    for expected in (
+        "version: v2.1",
+        "dataset_version: v2.1",
+        "28.0",
+        "cam.eye",
+        "episodes: 1",
+        "frames: 12",
+        "OK",
+    ):
         assert expected in result.stdout
+
+    as_json = runner.invoke(app, ["inspect", str(tmp_path / "config.yaml"), "--json"])
+    assert as_json.exit_code == 0
+    assert json.loads(as_json.stdout) == {
+        "cameras": ["cam.eye"],
+        "dataset_version": "v2.1",
+        "episodes": 1,
+        "fps": 28.0,
+        "frames": 12,
+        "inspection": "OK",
+    }
 
 
 def test_annotate_prints_summary_and_failed_episode_causes_exit_one(monkeypatch, tmp_path: Path) -> None:
