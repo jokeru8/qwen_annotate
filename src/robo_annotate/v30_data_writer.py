@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import math
@@ -37,6 +38,7 @@ _OUTPUT_FLAGS = (
     | os.O_EXCL
     | getattr(os, "O_NOFOLLOW", 0)
 )
+_PRIVATE_DIRECTORY_PREFIX = ".v30-dir-"
 StatValue = list[int | float] | list[list[list[float]]]
 FeatureStats = dict[str, StatValue]
 
@@ -671,6 +673,69 @@ class _EntryIdentity:
         return self.device, self.inode
 
 
+class _OwnershipRegistry:
+    """Track active cleanup authority without allowing inode-reuse matches."""
+
+    def __init__(self) -> None:
+        self._active: set[_EntryIdentity] = set()
+        self._retiring: set[_EntryIdentity] = set()
+
+    def register(self, identity: _EntryIdentity) -> None:
+        if identity in self._active or identity in self._retiring:
+            raise ValueError("duplicate task-owned filesystem identity")
+        self._active.add(identity)
+
+    def is_owned(self, identity: _EntryIdentity) -> bool:
+        return identity in self._active
+
+    def begin_retirement(self, identity: _EntryIdentity) -> bool:
+        if identity not in self._active:
+            return False
+        self._active.remove(identity)
+        self._retiring.add(identity)
+        return True
+
+    def restore(self, identity: _EntryIdentity) -> None:
+        if identity in self._retiring:
+            self._retiring.remove(identity)
+            self._active.add(identity)
+
+    def finish_retirement(self, identity: _EntryIdentity) -> None:
+        self._retiring.discard(identity)
+
+    def release_all(self) -> None:
+        self._active.clear()
+        self._retiring.clear()
+
+
+class _CleanupFailures:
+    """Attempt every cleanup and preserve an already-active primary error."""
+
+    def __init__(self) -> None:
+        self.errors: list[tuple[str, BaseException]] = []
+
+    def attempt(self, context: str, action: Callable[[], None]) -> None:
+        try:
+            action()
+        except BaseException as exc:
+            self.errors.append((context, exc))
+
+    def finish(self, primary: BaseException | None, context: str) -> None:
+        if not self.errors:
+            return
+        details = "; ".join(
+            f"{label}: {type(error).__name__}: {error}"
+            for label, error in self.errors
+        )
+        if primary is not None:
+            primary.add_note(f"Secondary {context} failures: {details}")
+            return
+        first_error = self.errors[0][1]
+        error = ValueError(f"{context} cleanup failed: {first_error}")
+        error.add_note(f"Cleanup failures: {details}")
+        raise error from first_error
+
+
 class _AnchoredDirectoryPath:
     """Hold every component of an absolute directory path open and verified."""
 
@@ -697,6 +762,7 @@ class _AnchoredDirectoryPath:
         label: str,
         *,
         create_final: bool,
+        registry: _OwnershipRegistry | None = None,
     ) -> "_AnchoredDirectoryPath":
         absolute = Path(os.path.abspath(path))
         components = absolute.parts[1:]
@@ -705,16 +771,22 @@ class _AnchoredDirectoryPath:
         root_fd = os.open("/", _DIRECTORY_FLAGS)
         try:
             root_identity = _directory_identity(os.fstat(root_fd), label)
-        except BaseException:
-            os.close(root_fd)
-            raise
+        except BaseException as exc:
+            failures = _CleanupFailures()
+            failures.attempt("root descriptor close", lambda: os.close(root_fd))
+            primary = (
+                exc
+                if isinstance(exc, ValueError)
+                else ValueError(f"unable to anchor {label}")
+            )
+            failures.finish(primary, label)
+            if primary is exc:
+                raise
+            raise primary from exc
         descriptors = [root_fd]
         names: list[str] = []
         identities = [root_identity]
         created_final_component = False
-        created_parent_fd: int | None = None
-        created_name = ""
-        created_identity: _EntryIdentity | None = None
         try:
             for position, component in enumerate(components):
                 parent_fd = descriptors[-1]
@@ -729,18 +801,31 @@ class _AnchoredDirectoryPath:
                         raise ValueError(
                             f"{label} parent components must already exist"
                         ) from None
-                    os.mkdir(component, 0o700, dir_fd=parent_fd)
-                    created_final_component = True
-                    created_parent_fd = parent_fd
-                    created_name = component
-                    before = os.stat(
-                        component,
-                        dir_fd=parent_fd,
-                        follow_symlinks=False,
+                    if registry is None:
+                        raise ValueError(f"ownership registry required for {label}")
+                    parent_is_attached = lambda: _anchored_chain_is_attached(
+                        descriptors,
+                        names,
+                        identities,
+                        label,
                     )
+                    try:
+                        child = _create_published_child_directory(
+                            parent_fd,
+                            component,
+                            label,
+                            parent_is_attached,
+                            registry,
+                        )
+                    except (OSError, ValueError) as exc:
+                        raise ValueError(f"unable to anchor {label}") from exc
+                    created_final_component = True
+                    descriptors.append(child.descriptor)
+                    child.descriptor = -1
+                    names.append(component)
+                    identities.append(child.identity)
+                    continue
                 expected = _directory_identity(before, label)
-                if created_final_component and position == len(components) - 1:
-                    created_identity = expected
                 child_fd = -1
                 try:
                     child_fd = os.open(
@@ -759,9 +844,14 @@ class _AnchoredDirectoryPath:
                     )
                     if expected != opened or opened != current:
                         raise ValueError(f"{label} changed while opening")
-                except BaseException:
+                except BaseException as exc:
+                    failures = _CleanupFailures()
                     if child_fd >= 0:
-                        os.close(child_fd)
+                        failures.attempt(
+                            "untracked directory close",
+                            lambda descriptor=child_fd: os.close(descriptor),
+                        )
+                    failures.finish(exc, label)
                     raise
                 descriptors.append(child_fd)
                 names.append(component)
@@ -774,27 +864,23 @@ class _AnchoredDirectoryPath:
                 identities,
                 created_final_component,
             )
-        except (OSError, ValueError) as exc:
-            if created_parent_fd is not None and created_identity is not None:
-                try:
-                    _remove_owned_empty_directory_at(
-                        created_parent_fd,
-                        created_name,
-                        created_identity,
-                        lambda: _anchored_chain_is_attached(
-                            descriptors,
-                            names,
-                            identities,
-                            label,
-                        ),
-                    )
-                except OSError:
-                    pass
+        except BaseException as exc:
+            primary = (
+                exc
+                if not isinstance(exc, OSError)
+                else ValueError(f"unable to anchor {label}")
+            )
+            failures = _CleanupFailures()
             for descriptor in reversed(descriptors):
-                os.close(descriptor)
-            if isinstance(exc, ValueError):
+                failures.attempt(
+                    "anchored descriptor close",
+                    lambda current=descriptor: os.close(current),
+                )
+            descriptors.clear()
+            failures.finish(primary, label)
+            if primary is exc:
                 raise
-            raise ValueError(f"unable to anchor {label}") from exc
+            raise primary from exc
 
     @property
     def descriptor(self) -> int:
@@ -854,25 +940,28 @@ class _AnchoredDirectoryPath:
             if entry != expected or opened != expected:
                 raise ValueError(f"{self.label} changed during {context}")
 
-    def remove_created_final(self) -> None:
+    def remove_created_final(self, registry: _OwnershipRegistry) -> None:
         if not self.created_final:
             return
         parent_fd = self._descriptors[-2]
         name = self._names[-1]
-        try:
-            _remove_owned_empty_directory_at(
-                parent_fd,
-                name,
-                self.identity,
-                self._parent_chain_is_attached,
-            )
-        except OSError:
-            pass
+        _remove_owned_empty_directory_at(
+            parent_fd,
+            name,
+            self.identity,
+            registry,
+            self._parent_chain_is_attached,
+        )
 
     def close(self) -> None:
+        failures = _CleanupFailures()
         for descriptor in reversed(self._descriptors):
-            os.close(descriptor)
+            failures.attempt(
+                "anchored descriptor close",
+                lambda current=descriptor: os.close(current),
+            )
         self._descriptors.clear()
+        failures.finish(None, self.label)
 
 
 @dataclass
@@ -909,8 +998,9 @@ class _ChildDirectory:
 
     def close(self) -> None:
         if self.descriptor >= 0:
-            os.close(self.descriptor)
+            descriptor = self.descriptor
             self.descriptor = -1
+            os.close(descriptor)
 
 
 def _directory_identity(value: os.stat_result, context: str) -> _EntryIdentity:
@@ -961,10 +1051,8 @@ def _open_or_create_child_directory(
     name: str,
     context: str,
     parent_is_attached: Callable[[], bool],
-    owned: set[_EntryIdentity],
+    registry: _OwnershipRegistry,
 ) -> _ChildDirectory:
-    created = False
-    created_identity: _EntryIdentity | None = None
     try:
         try:
             before = os.stat(
@@ -973,36 +1061,22 @@ def _open_or_create_child_directory(
                 follow_symlinks=False,
             )
         except FileNotFoundError:
-            os.mkdir(name, 0o700, dir_fd=parent_fd)
-            created = True
-            before = os.stat(
+            return _create_published_child_directory(
+                parent_fd,
                 name,
-                dir_fd=parent_fd,
-                follow_symlinks=False,
+                context,
+                parent_is_attached,
+                registry,
             )
         expected = _directory_identity(before, context)
-        if created:
-            created_identity = expected
-            owned.add(expected)
         return _open_child_directory(
             parent_fd,
             name,
             expected,
             context,
-            created=created,
+            created=False,
         )
     except (OSError, ValueError) as exc:
-        if created_identity is not None:
-            try:
-                _remove_owned_entry_at(
-                    parent_fd,
-                    name,
-                    created_identity,
-                    owned,
-                    parent_is_attached,
-                )
-            except OSError:
-                pass
         if isinstance(exc, ValueError):
             raise
         raise ValueError(f"unable to open {context}") from exc
@@ -1034,9 +1108,14 @@ def _open_child_directory(
             context,
             created,
         )
-    except BaseException:
+    except BaseException as exc:
+        failures = _CleanupFailures()
         if descriptor >= 0:
-            os.close(descriptor)
+            failures.attempt(
+                "untracked child descriptor close",
+                lambda: os.close(descriptor),
+            )
+        failures.finish(exc, context)
         raise
 
 
@@ -1045,43 +1124,158 @@ def _create_private_child_directory(
     prefix: str,
     context: str,
     parent_is_attached: Callable[[], bool],
-    owned: set[_EntryIdentity],
+    registry: _OwnershipRegistry,
 ) -> _ChildDirectory:
+    """Create an unpredictable child and establish its identity before use.
+
+    `mkdirat` succeeds only for the freshly generated, previously absent name.
+    The name has 96 random bits and is never a public dataset name. The first
+    no-follow stat is therefore the ownership provenance; the held directory
+    descriptor and a second no-follow stat must match it before any write or
+    deterministic-name publication.
+    """
     for _ in range(100):
         name = prefix + secrets.token_hex(12)
+        if not parent_is_attached():
+            raise ValueError(f"{context} parent changed before creation")
         try:
             os.mkdir(name, 0o700, dir_fd=parent_fd)
         except FileExistsError:
             continue
         expected: _EntryIdentity | None = None
+        descriptor = -1
         try:
             expected = _directory_identity(
                 os.stat(name, dir_fd=parent_fd, follow_symlinks=False), context
             )
-            owned.add(expected)
-            return _open_child_directory(
+            registry.register(expected)
+            descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            opened = _directory_identity(os.fstat(descriptor), context)
+            current = _directory_identity(
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False), context
+            )
+            if (
+                not parent_is_attached()
+                or expected != opened
+                or opened != current
+            ):
+                raise ValueError(f"{context} changed while establishing ownership")
+            return _ChildDirectory(
                 parent_fd,
                 name,
+                descriptor,
                 expected,
                 context,
-                created=True,
+                True,
             )
         except BaseException as exc:
+            failures = _CleanupFailures()
+            if descriptor >= 0:
+                failures.attempt(
+                    "private directory descriptor close",
+                    lambda current=descriptor: os.close(current),
+                )
             if expected is not None:
-                try:
-                    _remove_owned_entry_at(
+                failures.attempt(
+                    "private directory removal",
+                    lambda: _remove_owned_entry_at(
                         parent_fd,
                         name,
                         expected,
-                        owned,
+                        registry,
                         parent_is_attached,
-                    )
-                except OSError:
-                    pass
-            if isinstance(exc, OSError):
-                raise ValueError(f"unable to open {context}") from exc
-            raise
+                    ),
+                )
+            primary = (
+                exc
+                if not isinstance(exc, OSError)
+                else ValueError(f"unable to open {context}")
+            )
+            failures.finish(primary, context)
+            if primary is exc:
+                raise
+            raise primary from exc
     raise ValueError(f"unable to create {context}")
+
+
+def _publish_private_directory(
+    directory: _ChildDirectory,
+    destination_parent_fd: int,
+    destination_name: str,
+    context: str,
+    parent_is_attached: Callable[[], bool],
+) -> _ChildDirectory:
+    if not parent_is_attached():
+        raise ValueError(f"{context} parent changed before publication")
+    directory.verify("private publication")
+    source_name = directory.name
+    rename_noreplace_at(
+        directory.parent_fd,
+        source_name,
+        destination_parent_fd,
+        destination_name,
+    )
+    directory.parent_fd = destination_parent_fd
+    directory.name = destination_name
+    directory.context = context
+    if not parent_is_attached():
+        raise ValueError(f"{context} changed while publishing")
+    try:
+        opened = _directory_identity(os.fstat(directory.descriptor), context)
+        current = _directory_identity(
+            os.stat(
+                destination_name,
+                dir_fd=destination_parent_fd,
+                follow_symlinks=False,
+            ),
+            context,
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{context} changed while publishing") from exc
+    if opened != directory.identity or current != directory.identity:
+        raise ValueError(f"{context} changed while publishing")
+    return directory
+
+
+def _create_published_child_directory(
+    parent_fd: int,
+    name: str,
+    context: str,
+    parent_is_attached: Callable[[], bool],
+    registry: _OwnershipRegistry,
+) -> _ChildDirectory:
+    private: _ChildDirectory | None = None
+    try:
+        private = _create_private_child_directory(
+            parent_fd,
+            _PRIVATE_DIRECTORY_PREFIX,
+            context,
+            parent_is_attached,
+            registry,
+        )
+        return _publish_private_directory(
+            private,
+            parent_fd,
+            name,
+            context,
+            parent_is_attached,
+        )
+    except BaseException as exc:
+        failures = _CleanupFailures()
+        if private is not None:
+            failures.attempt("private directory close", private.close)
+            failures.attempt(
+                "private directory removal",
+                lambda: _remove_owned_entry_at(
+                    parent_fd,
+                    private.name,
+                    private.identity,
+                    registry,
+                    parent_is_attached,
+                ),
+            )
+        failures.finish(exc, context)
+        raise
 
 
 def _entry_at(parent_fd: int, name: str) -> _EntryIdentity | None:
@@ -1098,56 +1292,113 @@ def _write_parquet_at(
     name: str,
     table: pa.Table,
     parent_is_attached: Callable[[], bool],
-    owned: set[_EntryIdentity],
+    registry: _OwnershipRegistry,
 ) -> _EntryIdentity:
     try:
         descriptor = os.open(name, _OUTPUT_FLAGS, 0o600, dir_fd=parent_fd)
     except OSError as exc:
         raise ValueError(f"unable to create staged parquet {name}") from exc
     created_identity: _EntryIdentity | None = None
+    manager: Any | None = None
     try:
         created = os.fstat(descriptor)
         if not stat.S_ISREG(created.st_mode):
             raise ValueError(f"staged parquet is not a regular file: {name}")
         created_identity = _EntryIdentity.from_stat(created)
-        owned.add(created_identity)
+        registry.register(created_identity)
         if (
             not parent_is_attached()
             or _entry_at(parent_fd, name) != created_identity
         ):
             raise ValueError(f"staged parquet changed while opening: {name}")
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = -1
+        manager = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        handle = manager.__enter__()
+        write_error: BaseException | None = None
+        try:
             pq.write_table(table, handle)
             handle.flush()
             os.fsync(handle.fileno())
+        except BaseException as exc:
+            write_error = exc
+            raise
+        finally:
+            failures = _CleanupFailures()
+            failures.attempt(
+                "parquet file close",
+                lambda: manager.__exit__(
+                    type(write_error) if write_error is not None else None,
+                    write_error,
+                    write_error.__traceback__ if write_error is not None else None,
+                ),
+            )
+            manager = None
+            failures.finish(write_error, "parquet file")
         if (
             not parent_is_attached()
             or _entry_at(parent_fd, name) != created_identity
         ):
             raise ValueError(f"staged parquet changed while writing: {name}")
         return created_identity
-    except BaseException:
+    except BaseException as exc:
+        failures = _CleanupFailures()
+        if manager is not None:
+            failures.attempt(
+                "parquet manager close",
+                lambda: manager.__exit__(type(exc), exc, exc.__traceback__),
+            )
         if descriptor >= 0:
-            os.close(descriptor)
+            failures.attempt(
+                "parquet descriptor close",
+                lambda: os.close(descriptor),
+            )
         if created_identity is not None:
-            try:
-                _remove_owned_entry_at(
+            failures.attempt(
+                "staged parquet removal",
+                lambda: _remove_owned_entry_at(
                     parent_fd,
                     name,
                     created_identity,
-                    owned,
+                    registry,
                     parent_is_attached,
-                )
-            except OSError:
-                pass
+                ),
+            )
+        failures.finish(exc, "staged parquet")
         raise
+
+
+def _retire_and_delete_owned_entry_at(
+    parent_fd: int,
+    name: str,
+    expected: _EntryIdentity,
+    registry: _OwnershipRegistry,
+    still_attached: Callable[[], bool],
+) -> bool:
+    """Make an identity unmatchable before its deleting syscall can free it."""
+    if not still_attached() or _entry_at(parent_fd, name) != expected:
+        return False
+    if not registry.begin_retirement(expected):
+        return False
+    try:
+        if not still_attached() or _entry_at(parent_fd, name) != expected:
+            registry.restore(expected)
+            return False
+        if stat.S_ISDIR(expected.mode):
+            os.rmdir(name, dir_fd=parent_fd)
+        else:
+            os.unlink(name, dir_fd=parent_fd)
+    except BaseException:
+        registry.restore(expected)
+        raise
+    registry.finish_retirement(expected)
+    return True
 
 
 def _remove_owned_empty_directory_at(
     parent_fd: int,
     name: str,
     expected: _EntryIdentity,
+    registry: _OwnershipRegistry,
     still_attached: Callable[[], bool],
 ) -> None:
     if not stat.S_ISDIR(expected.mode) or not still_attached():
@@ -1157,44 +1408,61 @@ def _remove_owned_empty_directory_at(
     if _entry_at(parent_fd, name) != expected:
         return
     try:
-        os.rmdir(name, dir_fd=parent_fd)
-    except OSError:
-        return
+        _retire_and_delete_owned_entry_at(
+            parent_fd,
+            name,
+            expected,
+            registry,
+            still_attached,
+        )
+    except OSError as exc:
+        if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+            return
+        raise
 
 
 def _remove_owned_tree_at(
     parent_fd: int,
     name: str,
     expected: _EntryIdentity,
-    owned: set[_EntryIdentity],
+    registry: _OwnershipRegistry,
     still_attached: Callable[[], bool],
 ) -> None:
     """Delete only identities recorded as task-owned below an attached parent."""
-    if expected not in owned or not still_attached():
+    if not registry.is_owned(expected) or not still_attached():
         return
     if _entry_at(parent_fd, name) != expected:
         return
     if not stat.S_ISDIR(expected.mode):
         if not still_attached() or _entry_at(parent_fd, name) != expected:
             return
-        os.unlink(name, dir_fd=parent_fd)
+        _retire_and_delete_owned_entry_at(
+            parent_fd,
+            name,
+            expected,
+            registry,
+            still_attached,
+        )
         return
     _remove_owned_empty_directory_at(
         parent_fd,
         name,
         expected,
+        registry,
         still_attached,
     )
     if not still_attached() or _entry_at(parent_fd, name) != expected:
         return
     descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+    failures = _CleanupFailures()
+    traversal_error: BaseException | None = None
+    opened_valid = False
     try:
-        if (
+        opened_valid = not (
             _EntryIdentity.from_stat(os.fstat(descriptor)) != expected
             or not still_attached()
             or _entry_at(parent_fd, name) != expected
-        ):
-            return
+        )
 
         def directory_is_attached() -> bool:
             try:
@@ -1206,26 +1474,44 @@ def _remove_owned_tree_at(
             except OSError:
                 return False
 
-        for child in sorted(os.listdir(descriptor)):
-            if not directory_is_attached():
-                return
-            child_identity = _entry_at(descriptor, child)
-            if child_identity in owned:
-                _remove_owned_tree_at(
-                    descriptor,
-                    child,
-                    child_identity,
-                    owned,
-                    directory_is_attached,
-                )
+        if opened_valid:
+            for child in sorted(os.listdir(descriptor)):
+                if not directory_is_attached():
+                    opened_valid = False
+                    break
+                child_identity = _entry_at(descriptor, child)
+                if (
+                    child_identity is not None
+                    and registry.is_owned(child_identity)
+                ):
+                    failures.attempt(
+                        f"owned child removal {child}",
+                        lambda child_name=child, identity=child_identity: (
+                            _remove_owned_tree_at(
+                                descriptor,
+                                child_name,
+                                identity,
+                                registry,
+                                directory_is_attached,
+                            )
+                        ),
+                    )
+    except BaseException as exc:
+        traversal_error = exc
     finally:
-        os.close(descriptor)
+        failures.attempt("owned tree descriptor close", lambda: os.close(descriptor))
+    failures.finish(traversal_error, "owned tree")
+    if traversal_error is not None:
+        raise traversal_error
+    if not opened_valid:
+        return
     if not still_attached() or _entry_at(parent_fd, name) != expected:
         return
     _remove_owned_empty_directory_at(
         parent_fd,
         name,
         expected,
+        registry,
         still_attached,
     )
 
@@ -1234,40 +1520,46 @@ def _remove_owned_entry_at(
     parent_fd: int,
     name: str,
     expected: _EntryIdentity,
-    owned: set[_EntryIdentity],
+    registry: _OwnershipRegistry,
     still_attached: Callable[[], bool],
 ) -> None:
     _remove_owned_tree_at(
         parent_fd,
         name,
         expected,
-        owned,
+        registry,
         still_attached,
     )
 
 
 def _remove_owned_identities_below(
     parent_fd: int,
-    owned: set[_EntryIdentity],
+    registry: _OwnershipRegistry,
     still_attached: Callable[[], bool],
     visited: set[tuple[int, int]] | None = None,
 ) -> None:
     """Find and remove recorded identities only below a live anchored root."""
     if visited is None:
         visited = set()
+    failures = _CleanupFailures()
     for name in sorted(os.listdir(parent_fd)):
         if not still_attached():
             return
         current = _entry_at(parent_fd, name)
         if current is None:
             continue
-        if current in owned:
-            _remove_owned_tree_at(
-                parent_fd,
-                name,
-                current,
-                owned,
-                still_attached,
+        if registry.is_owned(current):
+            failures.attempt(
+                f"owned entry removal {name}",
+                lambda current_name=name, current_identity=current: (
+                    _remove_owned_tree_at(
+                        parent_fd,
+                        current_name,
+                        current_identity,
+                        registry,
+                        still_attached,
+                    )
+                ),
             )
             continue
         if not stat.S_ISDIR(current.mode):
@@ -1305,15 +1597,22 @@ def _remove_owned_identities_below(
 
             _remove_owned_identities_below(
                 descriptor,
-                owned,
+                registry,
                 directory_is_attached,
                 visited,
             )
-        except OSError:
+        except BaseException as exc:
+            failures.errors.append((f"cleanup traversal {name}", exc))
             continue
         finally:
             if descriptor >= 0:
-                os.close(descriptor)
+                failures.attempt(
+                    "cleanup traversal descriptor close",
+                    lambda current_descriptor=descriptor: os.close(
+                        current_descriptor
+                    ),
+                )
+    failures.finish(None, "cleanup traversal")
 
 
 def _publish(
@@ -1331,13 +1630,11 @@ def _publish(
     data_identity: _EntryIdentity | None = None
     tasks_identity: _EntryIdentity | None = None
     success = False
-    owned: set[_EntryIdentity] = set()
+    registry = _OwnershipRegistry()
+    primary_error: BaseException | None = None
 
     def staging_is_linked() -> bool:
         return staging_anchor is not None and staging_anchor.is_attached()
-
-    def meta_is_linked() -> bool:
-        return staging_is_linked() and meta is not None and meta.is_attached()
 
     def bundle_is_linked() -> bool:
         return staging_is_linked() and bundle is not None and bundle.is_attached()
@@ -1354,6 +1651,7 @@ def _publish(
             staging,
             "staging path",
             create_final=True,
+            registry=registry,
         )
         if (
             source_anchor.identity.directory_key in staging_anchor.ancestry
@@ -1367,7 +1665,7 @@ def _publish(
             "meta",
             "staging meta",
             staging_is_linked,
-            owned,
+            registry,
         )
         if _entry_at(meta.descriptor, "tasks.parquet") is not None:
             raise ValueError("unsafe staging tasks entry already exists")
@@ -1376,14 +1674,14 @@ def _publish(
             ".v30-data-",
             "staging bundle",
             staging_is_linked,
-            owned,
+            registry,
         )
         data = _open_or_create_child_directory(
             bundle.descriptor,
             "data",
             "staging bundle data",
             bundle_is_linked,
-            owned,
+            registry,
         )
         data_identity = data.identity
 
@@ -1391,6 +1689,7 @@ def _publish(
             return bundle_is_linked() and data.is_attached()
 
         chunk_directories: dict[int, _ChildDirectory] = {}
+        data_error: BaseException | None = None
         try:
             for number, table in enumerate(packed):
                 chunk_index = number // chunks_size
@@ -1401,7 +1700,7 @@ def _publish(
                         f"chunk-{chunk_index:03d}",
                         "staging data chunk",
                         data_is_linked,
-                        owned,
+                        registry,
                     )
                     chunk_directories[chunk_index] = chunk
 
@@ -1415,22 +1714,27 @@ def _publish(
                     f"file-{number % chunks_size:03d}.parquet",
                     table,
                     chunk_is_linked,
-                    owned,
+                    registry,
                 )
             tasks_identity = _write_parquet_at(
                 bundle.descriptor,
                 "tasks.parquet",
                 task_table,
                 bundle_is_linked,
-                owned,
+                registry,
             )
             for chunk in chunk_directories.values():
                 chunk.verify("publication")
             data.verify("publication")
+        except BaseException as exc:
+            data_error = exc
+            raise
         finally:
+            failures = _CleanupFailures()
             for chunk in chunk_directories.values():
-                chunk.close()
-            data.close()
+                failures.attempt("data chunk close", chunk.close)
+            failures.attempt("bundle data close", data.close)
+            failures.finish(data_error, "staged data directories")
 
         staging_anchor.verify("publication")
         meta.verify("publication")
@@ -1469,52 +1773,82 @@ def _publish(
         os.fsync(meta.descriptor)
         os.fsync(staging_anchor.descriptor)
         success = True
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        if not success and staging_anchor is not None and staging_is_linked():
-            try:
-                _remove_owned_identities_below(
-                    staging_anchor.descriptor,
-                    owned,
-                    staging_is_linked,
-                )
-            except OSError:
-                pass
+        failures = _CleanupFailures()
         if bundle is not None:
-            bundle.close()
-            if success and staging_anchor is not None and staging_is_linked():
-                try:
-                    _remove_owned_entry_at(
+            failures.attempt("staging bundle close", bundle.close)
+
+        if (
+            (not success or failures.errors)
+            and staging_anchor is not None
+            and staging_is_linked()
+        ):
+            failures.attempt(
+                "failed publication rollback",
+                lambda: _remove_owned_identities_below(
+                    staging_anchor.descriptor,
+                    registry,
+                    staging_is_linked,
+                ),
+            )
+        elif bundle is not None and staging_anchor is not None:
+            failures.attempt(
+                "private bundle removal",
+                lambda: _remove_owned_entry_at(
+                    staging_anchor.descriptor,
+                    bundle.name,
+                    bundle.identity,
+                    registry,
+                    staging_is_linked,
+                ),
+            )
+            if failures.errors and staging_is_linked():
+                failures.attempt(
+                    "publication rollback after bundle cleanup failure",
+                    lambda: _remove_owned_identities_below(
                         staging_anchor.descriptor,
-                        bundle.name,
-                        bundle.identity,
-                        owned,
+                        registry,
                         staging_is_linked,
-                    )
-                except OSError:
-                    pass
+                    ),
+                )
+
         if meta is not None:
-            if (
-                not success
-                and meta.created
-                and staging_anchor is not None
-                and meta_is_linked()
-            ):
-                try:
-                    _remove_owned_empty_directory_at(
-                        staging_anchor.descriptor,
-                        "meta",
-                        meta.identity,
-                        meta_is_linked,
-                    )
-                except OSError:
-                    pass
-            meta.close()
-        if staging_anchor is not None:
-            if not success:
-                staging_anchor.remove_created_final()
-            staging_anchor.close()
+            failures.attempt("staging meta close", meta.close)
         if source_anchor is not None:
-            source_anchor.close()
+            failures.attempt("source anchor close", source_anchor.close)
+
+        if (
+            success
+            and failures.errors
+            and staging_anchor is not None
+            and staging_is_linked()
+        ):
+            failures.attempt(
+                "publication rollback after close failure",
+                lambda: _remove_owned_identities_below(
+                    staging_anchor.descriptor,
+                    registry,
+                    staging_is_linked,
+                ),
+            )
+
+        if (
+            (not success or failures.errors)
+            and staging_anchor is not None
+        ):
+            failures.attempt(
+                "created staging root removal",
+                lambda: staging_anchor.remove_created_final(registry),
+            )
+        if staging_anchor is not None:
+            failures.attempt("staging anchor close", staging_anchor.close)
+
+        if primary_error is None and not failures.errors:
+            registry.release_all()
+        failures.finish(primary_error, "v3 staging publication")
     return tuple(
         staging
         / (
