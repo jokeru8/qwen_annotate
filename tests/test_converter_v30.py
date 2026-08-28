@@ -198,8 +198,19 @@ def test_full_v30_conversion_preserves_core_payload_and_validates(
 def selectively_accepted_v30_workspace(
     tmp_path: Path,
     accepted: tuple[int, ...],
+    *,
+    size_limits: tuple[int, int] | None = (100, 200),
 ) -> tuple[Path, Path, dict]:
     source = make_lerobot_v30_fixture(tmp_path)
+    info_path = source / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    if size_limits is None:
+        info.pop("data_files_size_in_mb")
+        info.pop("video_files_size_in_mb")
+    else:
+        info["data_files_size_in_mb"] = size_limits[0]
+        info["video_files_size_in_mb"] = size_limits[1]
+    info_path.write_text(json.dumps(info), encoding="utf-8")
     work = tmp_path / "work"
     base = make_v30_config(source, work)
     payload = base.model_dump(mode="python")
@@ -238,6 +249,42 @@ def selectively_accepted_v30_workspace(
         }
 
     return work, source, {"augment_episodes": augment}
+
+
+@pytest.mark.parametrize(
+    ("source_limits", "expected"),
+    [
+        (None, (100, 200)),
+        ((17, 23), (17, 23)),
+    ],
+)
+def test_v30_accepted_only_preserves_official_integer_shard_size_limits(
+    tmp_path: Path,
+    source_limits: tuple[int, int] | None,
+    expected: tuple[int, int],
+) -> None:
+    from robo_annotate.converter import convert_dataset
+
+    work, _, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+        size_limits=source_limits,
+    )
+
+    report = convert_dataset(
+        work,
+        tmp_path / "accepted",
+        accepted_only=True,
+        services=services,
+    )
+    info = json.loads(
+        (report.output / "meta/info.json").read_text(encoding="utf-8")
+    )
+
+    assert info["data_files_size_in_mb"] == expected[0]
+    assert info["video_files_size_in_mb"] == expected[1]
+    assert type(info["data_files_size_in_mb"]) is int
+    assert type(info["video_files_size_in_mb"]) is int
 
 
 def test_v30_accepted_only_removes_middle_episode_and_rebuilds_every_reference(
@@ -283,14 +330,8 @@ def test_v30_accepted_only_removes_middle_episode_and_rebuilds_every_reference(
     assert info["episodes_path"] == (
         "meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
     )
-    assert info["data_files_size_in_mb"] == pytest.approx(
-        sum(path.stat().st_size for path in report.output.glob("data/**/*.parquet"))
-        / (2**20)
-    )
-    assert info["video_files_size_in_mb"] == pytest.approx(
-        sum(path.stat().st_size for path in report.output.glob("videos/**/*.mp4"))
-        / (2**20)
-    )
+    assert info["data_files_size_in_mb"] == 100
+    assert info["video_files_size_in_mb"] == 200
     episode_rows = pq.read_table(
         report.output / "meta/episodes/chunk-000/file-000.parquet"
     ).to_pylist()
@@ -387,6 +428,67 @@ def test_v30_accepted_only_never_cleans_a_replacement_staging_tree(
     assert not (tmp_path / "accepted").exists()
 
 
+def test_v30_cleanup_restores_a_last_boundary_staging_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import robo_annotate.converter_v30 as converter_v30
+    import robo_annotate.writer_publication as publication
+    from robo_annotate.converter import convert_dataset
+
+    work, _, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    held = tmp_path / "held-owned-staging"
+    replacement: Path | None = None
+    original_rename = publication.rename_noreplace_at
+
+    def fail_writer(*args, **kwargs):
+        raise RuntimeError("injected writer failure")
+
+    def replace_at_move(source_fd, source_name, destination_fd, destination_name):
+        nonlocal replacement
+        if source_name.startswith("accepted.staging-") and replacement is None:
+            staging = tmp_path / source_name
+            staging.rename(held)
+            staging.mkdir()
+            (staging / "competitor.txt").write_text(
+                "must survive",
+                encoding="utf-8",
+            )
+            replacement = staging
+        return original_rename(
+            source_fd,
+            source_name,
+            destination_fd,
+            destination_name,
+        )
+
+    monkeypatch.setattr(
+        converter_v30,
+        "write_v30_data_subset",
+        fail_writer,
+    )
+    monkeypatch.setattr(publication, "rename_noreplace_at", replace_at_move)
+
+    with pytest.raises(RuntimeError, match=r"injected writer failure") as failure:
+        convert_dataset(
+            work,
+            tmp_path / "accepted",
+            accepted_only=True,
+            services=services,
+        )
+
+    assert replacement is not None
+    assert (replacement / "competitor.txt").read_text(encoding="utf-8") == (
+        "must survive"
+    )
+    assert held.is_dir()
+    assert any("staging cleanup" in note for note in failure.value.__notes__)
+    assert not (tmp_path / "accepted").exists()
+
+
 def test_v30_accepted_only_pairs_every_data_and_video_placement(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -470,6 +572,190 @@ def test_v30_accepted_only_decodes_each_rebuilt_video_once_for_stats(
     }
 
 
+def test_v30_decoder_and_source_close_failures_do_not_mask_primary_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import robo_annotate.converter_v30 as converter_v30
+    from robo_annotate.converter import convert_dataset
+
+    work, _, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    decoder_closed = False
+    original_tree_close = converter_v30.SecureTree.close
+
+    class FailingDecoder:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise RuntimeError("injected decoder failure")
+
+        def close(self):
+            nonlocal decoder_closed
+            decoder_closed = True
+            raise OSError("injected decoder close failure")
+
+    def failing_tree_close(tree):
+        original_tree_close(tree)
+        if tree.label == "v3 composer source":
+            raise OSError("injected source tree close failure")
+
+    services["iter_video_rgb_frames"] = lambda _path: FailingDecoder()
+    monkeypatch.setattr(converter_v30.SecureTree, "close", failing_tree_close)
+
+    with pytest.raises(RuntimeError, match=r"injected decoder failure") as failure:
+        convert_dataset(
+            work,
+            tmp_path / "accepted",
+            accepted_only=True,
+            services=services,
+        )
+
+    notes = "\n".join(failure.value.__notes__)
+    assert decoder_closed
+    assert "video decoder iterator close" in notes
+    assert "injected decoder close failure" in notes
+    assert "secure tree close" in notes
+    assert "injected source tree close failure" in notes
+    assert not (tmp_path / "accepted").exists()
+    assert not list(tmp_path.glob("accepted.staging-*"))
+
+
+def test_v30_source_close_only_failure_raises_after_staging_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import robo_annotate.converter_v30 as converter_v30
+    from robo_annotate.converter import convert_dataset
+
+    work, _, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    original_tree_close = converter_v30.SecureTree.close
+
+    def failing_tree_close(tree):
+        original_tree_close(tree)
+        if tree.label == "v3 composer source":
+            raise OSError("injected source tree close failure")
+
+    monkeypatch.setattr(converter_v30.SecureTree, "close", failing_tree_close)
+
+    with pytest.raises(OSError, match=r"injected source tree close failure"):
+        convert_dataset(
+            work,
+            tmp_path / "accepted",
+            accepted_only=True,
+            services=services,
+        )
+
+    assert not (tmp_path / "accepted").exists()
+    assert not list(tmp_path.glob("accepted.staging-*"))
+
+
+def test_v30_output_lock_finalizers_are_all_attempted_without_masking_primary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import robo_annotate.converter as converter
+
+    work, _, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    original_open_lock = converter._open_lock
+    original_flock = converter.fcntl.flock
+    original_close = converter.os.close
+    lock_descriptor = -1
+    close_attempted = False
+
+    def tracked_open_lock(path):
+        nonlocal lock_descriptor
+        lock_descriptor = original_open_lock(path)
+        return lock_descriptor
+
+    def failing_flock(descriptor, operation):
+        if descriptor == lock_descriptor and operation == converter.fcntl.LOCK_UN:
+            raise OSError("injected output lock release failure")
+        return original_flock(descriptor, operation)
+
+    def failing_close(descriptor):
+        nonlocal close_attempted
+        if descriptor == lock_descriptor:
+            close_attempted = True
+            original_close(descriptor)
+            raise OSError("injected output lock close failure")
+        return original_close(descriptor)
+
+    def fail_validation(*args, **kwargs):
+        raise RuntimeError("injected validation failure")
+
+    monkeypatch.setattr(converter, "_open_lock", tracked_open_lock)
+    monkeypatch.setattr(converter.fcntl, "flock", failing_flock)
+    monkeypatch.setattr(converter.os, "close", failing_close)
+    monkeypatch.setattr(converter, "validate_release", fail_validation)
+
+    with pytest.raises(RuntimeError, match=r"injected validation failure") as failure:
+        converter.convert_dataset(
+            work,
+            tmp_path / "accepted",
+            accepted_only=True,
+            services=services,
+        )
+
+    notes = "\n".join(failure.value.__notes__)
+    assert close_attempted
+    assert "output lock release" in notes
+    assert "injected output lock release failure" in notes
+    assert "output lock close" in notes
+    assert "injected output lock close failure" in notes
+    assert not (tmp_path / "accepted").exists()
+    assert not list(tmp_path.glob("accepted.staging-*"))
+
+
+def test_v30_cleanup_only_failure_raises_after_published_output_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import robo_annotate.converter as converter
+
+    work, _, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    original_open_lock = converter._open_lock
+    original_flock = converter.fcntl.flock
+    lock_descriptor = -1
+
+    def tracked_open_lock(path):
+        nonlocal lock_descriptor
+        lock_descriptor = original_open_lock(path)
+        return lock_descriptor
+
+    def failing_unlock(descriptor, operation):
+        if descriptor == lock_descriptor and operation == converter.fcntl.LOCK_UN:
+            raise OSError("injected output lock release failure")
+        return original_flock(descriptor, operation)
+
+    monkeypatch.setattr(converter, "_open_lock", tracked_open_lock)
+    monkeypatch.setattr(converter.fcntl, "flock", failing_unlock)
+
+    with pytest.raises(ValueError, match=r"conversion finalization cleanup failed"):
+        converter.convert_dataset(
+            work,
+            tmp_path / "accepted",
+            accepted_only=True,
+            services=services,
+        )
+
+    assert not (tmp_path / "accepted").exists()
+    assert not list(tmp_path.glob("accepted.staging-*"))
+    assert not list(tmp_path.glob(".writer-quarantine-*"))
+
+
 def test_v30_accepted_only_source_change_during_stats_aborts_publication(
     tmp_path: Path,
 ) -> None:
@@ -506,6 +792,124 @@ def test_v30_accepted_only_source_change_during_stats_aborts_publication(
     assert mutated
     assert not (tmp_path / "accepted").exists()
     assert not list(tmp_path.glob("accepted.staging-*"))
+
+
+@pytest.mark.parametrize("relative", ["meta/info.json", "meta/stats.json"])
+def test_v30_composer_rejects_replaced_source_json_before_outside_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    import robo_annotate.converter_v30 as converter_v30
+    from robo_annotate.converter import convert_dataset
+
+    work, source, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    target = source / relative
+    held = target.with_name(f"held-{target.name}")
+    outside = tmp_path / f"outside-{target.name}"
+    outside.write_text('{"outside":"must never be parsed"}', encoding="utf-8")
+    original_open = converter_v30.SecureTree.open_file
+    original_loads = converter_v30.json.loads
+    swapped = False
+    outside_parse_attempted = False
+
+    def racing_open(tree, name, maximum, context):
+        nonlocal swapped
+        if (
+            tree.label == "v3 composer source"
+            and str(name) == relative
+            and not swapped
+        ):
+            target.rename(held)
+            target.symlink_to(outside)
+            swapped = True
+        return original_open(tree, name, maximum, context)
+
+    def guarded_loads(document, *args, **kwargs):
+        nonlocal outside_parse_attempted
+        if '"outside":"must never be parsed"' in document:
+            outside_parse_attempted = True
+        return original_loads(document, *args, **kwargs)
+
+    monkeypatch.setattr(converter_v30.SecureTree, "open_file", racing_open)
+    monkeypatch.setattr(converter_v30.json, "loads", guarded_loads)
+
+    with pytest.raises(ValueError, match=r"changed|symbolic link"):
+        convert_dataset(
+            work,
+            tmp_path / "accepted",
+            accepted_only=True,
+            services=services,
+        )
+
+    assert swapped
+    assert not outside_parse_attempted
+    assert outside.read_text(encoding="utf-8") == (
+        '{"outside":"must never be parsed"}'
+    )
+    assert not (tmp_path / "accepted").exists()
+
+
+@pytest.mark.parametrize("component", ["root", "meta"])
+def test_v30_composer_detects_restored_source_directory_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    component: str,
+) -> None:
+    import robo_annotate.converter_v30 as converter_v30
+    from robo_annotate.converter import convert_dataset
+
+    work, source, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+    )
+    original_scan = converter_v30.SecureTree.scan
+    original_loads = converter_v30.json.loads
+    replaced = False
+    outside_parse_attempted = False
+
+    def racing_scan(tree):
+        nonlocal replaced
+        result = original_scan(tree)
+        if tree.label == "v3 composer source" and not replaced:
+            target = source if component == "root" else source / "meta"
+            held = tmp_path / f"held-{component}"
+            outside = tmp_path / f"outside-{component}"
+            outside.mkdir()
+            (outside / "info.json").write_text(
+                '{"outside":"must never be parsed"}',
+                encoding="utf-8",
+            )
+            target.rename(held)
+            target.symlink_to(outside, target_is_directory=True)
+            target.unlink()
+            held.rename(target)
+            replaced = True
+        return result
+
+    def guarded_loads(document, *args, **kwargs):
+        nonlocal outside_parse_attempted
+        if '"outside":"must never be parsed"' in document:
+            outside_parse_attempted = True
+        return original_loads(document, *args, **kwargs)
+
+    monkeypatch.setattr(converter_v30.SecureTree, "scan", racing_scan)
+    monkeypatch.setattr(converter_v30.json, "loads", guarded_loads)
+
+    with pytest.raises(ValueError, match=r"changed"):
+        convert_dataset(
+            work,
+            tmp_path / "accepted",
+            accepted_only=True,
+            services=services,
+        )
+
+    assert replaced
+    assert not outside_parse_attempted
+    assert not (tmp_path / "accepted").exists()
 
 
 def test_full_v30_conversion_rechecks_source_digest_before_publish(

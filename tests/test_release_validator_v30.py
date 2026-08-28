@@ -110,7 +110,7 @@ def test_v30_validator_accepts_pinned_v061_feature_and_stats_schema(
     assert validate_release(output, deep_video_stats=False).valid
 
 
-def test_v30_validator_rejects_rebuilt_subset_payload_size_corruption(
+def test_v30_validator_accepts_positive_rebuilt_subset_shard_size_limits(
     tmp_path: Path,
 ) -> None:
     from tests.test_converter_v30 import selectively_accepted_v30_workspace
@@ -127,11 +127,11 @@ def test_v30_validator_rejects_rebuilt_subset_payload_size_corruption(
     ).output
     info_path = output / "meta/info.json"
     info = json.loads(info_path.read_text(encoding="utf-8"))
-    info["data_files_size_in_mb"] += 1.0
+    info["data_files_size_in_mb"] = 17
+    info["video_files_size_in_mb"] = 23
     info_path.write_text(json.dumps(info), encoding="utf-8")
 
-    with pytest.raises(ValueError, match=r"data_files_size_in_mb.*actual"):
-        validate_release(output, services=services)
+    assert validate_release(output, services=services).valid
 
 
 def test_v30_validator_accepts_hf_features_json_extension_language_columns(
@@ -727,6 +727,24 @@ def test_v30_validator_rejects_invalid_shard_size_limit(
     path = output / "meta/info.json"
     info = json.loads(path.read_text(encoding="utf-8"))
     info[field] = -1
+    path.write_text(json.dumps(info), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=field):
+        validate_release(output)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["data_files_size_in_mb", "video_files_size_in_mb"],
+)
+def test_v30_validator_rejects_noninteger_official_shard_size_limit(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    output = converted_v30_release(tmp_path)
+    path = output / "meta/info.json"
+    info = json.loads(path.read_text(encoding="utf-8"))
+    info[field] = 1.5
     path.write_text(json.dumps(info), encoding="utf-8")
 
     with pytest.raises(ValueError, match=field):

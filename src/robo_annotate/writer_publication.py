@@ -1555,6 +1555,301 @@ def _remove_owned_identities_below(
     failures.finish(None, "cleanup traversal")
 
 
+def capture_owned_directory_identity(path: Path) -> tuple[int, int, int]:
+    """Capture the exact stable identity used to authorize later cleanup."""
+    descriptor = -1
+    primary: BaseException | None = None
+    result: tuple[int, int, int] | None = None
+    try:
+        descriptor = os.open(path, _DIRECTORY_FLAGS)
+        identity = _directory_identity(
+            os.fstat(descriptor),
+            "owned staging directory",
+        )
+        current = _directory_identity(
+            os.stat(path, follow_symlinks=False),
+            "owned staging directory",
+        )
+        if identity != current:
+            raise ValueError("owned staging directory changed while opening")
+        result = identity.device, identity.inode, stat.S_IFMT(identity.mode)
+    except BaseException as exc:
+        primary = exc
+    finally:
+        failures = _CleanupFailures()
+        if descriptor >= 0:
+            failures.attempt(
+                "owned staging descriptor close",
+                lambda: os.close(descriptor),
+            )
+        failures.finish(primary, "owned staging identity capture")
+    if primary is not None:
+        raise primary
+    assert result is not None
+    return result
+
+
+def remove_owned_staging_tree(
+    staging: Path,
+    parent: Path,
+    output_name: str,
+    expected_key: tuple[int, int, int] | None,
+) -> None:
+    """Retire one converter-owned staging tree under the writer lock.
+
+    Cleanup authority follows the pinned directory identity, never the staging
+    pathname.  The tree is deleted only after an atomic move into this
+    transaction's private quarantine below the locked staging parent.
+    """
+    staging = Path(staging)
+    parent = Path(parent)
+    if (
+        staging.parent != parent
+        or not staging.name.startswith(f"{output_name}.staging-")
+    ):
+        raise ValueError("refusing to clean an unowned path")
+    _remove_owned_tree_under_writer_lock(
+        staging,
+        parent,
+        expected_key,
+        "staging cleanup",
+    )
+
+
+def remove_owned_published_tree(
+    output: Path,
+    parent: Path,
+    output_name: str,
+    expected_key: tuple[int, int, int] | None,
+) -> None:
+    """Roll back one exactly identified publication with the writer contract."""
+    output = Path(output)
+    parent = Path(parent)
+    if output.parent != parent or output.name != output_name:
+        raise ValueError("refusing to clean an unowned published path")
+    _remove_owned_tree_under_writer_lock(
+        output,
+        parent,
+        expected_key,
+        "published output rollback",
+    )
+
+
+def _remove_owned_tree_under_writer_lock(
+    staging: Path,
+    parent: Path,
+    expected_key: tuple[int, int, int] | None,
+    cleanup_context: str,
+) -> None:
+    if expected_key is None:
+        raise ValueError("owned staging identity is unavailable")
+    if not stat.S_ISDIR(expected_key[2]):
+        raise ValueError("owned staging identity is not a directory")
+
+    parent_anchor: _AnchoredDirectoryPath | None = None
+    writer_lock: _WriterLock | None = None
+    retirement: _RetirementNamespace | None = None
+    staging_descriptor = -1
+    retirement_name: str | None = None
+    retirement_removed = False
+    primary: BaseException | None = None
+    try:
+        parent_anchor = _AnchoredDirectoryPath.open(
+            parent,
+            "staging cleanup parent",
+            create_final=False,
+        )
+        writer_lock = _WriterLock.acquire(parent_anchor)
+        try:
+            current = _directory_identity(
+                os.stat(
+                    staging.name,
+                    dir_fd=parent_anchor.descriptor,
+                    follow_symlinks=False,
+                ),
+                "owned staging directory",
+            )
+        except FileNotFoundError as exc:
+            raise ValueError(
+                "owned staging directory disappeared before cleanup"
+            ) from exc
+        if _stable_directory_key(current) != expected_key:
+            raise ValueError("refusing to clean a replaced staging directory")
+        staging_descriptor = os.open(
+            staging.name,
+            _DIRECTORY_FLAGS,
+            dir_fd=parent_anchor.descriptor,
+        )
+        expected = _directory_identity(
+            os.fstat(staging_descriptor),
+            "owned staging directory",
+        )
+        if (
+            _stable_directory_key(expected) != expected_key
+            or _directory_identity(
+                os.stat(
+                    staging.name,
+                    dir_fd=parent_anchor.descriptor,
+                    follow_symlinks=False,
+                ),
+                "owned staging directory",
+            )
+            != expected
+        ):
+            raise ValueError(
+                "owned staging directory changed before quarantine"
+            )
+
+        retirement_directory = _create_private_child_directory(
+            parent_anchor.descriptor,
+            _RETIREMENT_NAMESPACE_PREFIX,
+            "staging cleanup quarantine",
+            lambda: (
+                writer_lock is not None
+                and _lock_is_verified(writer_lock, "staging cleanup")
+            ),
+            None,
+        )
+        retirement = _RetirementNamespace(
+            retirement_directory,
+            writer_lock,
+        )
+        retirement.verify_clean()
+        retirement_name = _RETIREMENT_PREFIX + secrets.token_hex(12)
+        rename_noreplace_at(
+            parent_anchor.descriptor,
+            staging.name,
+            retirement.descriptor,
+            retirement_name,
+        )
+        moved = _entry_at(retirement.descriptor, retirement_name)
+        if moved != expected:
+            # The source name was swapped at the rename boundary. Restore
+            # the unowned object without following or deleting it.
+            rename_noreplace_at(
+                retirement.descriptor,
+                retirement_name,
+                parent_anchor.descriptor,
+                staging.name,
+            )
+            retirement_name = None
+            raise ValueError(
+                "owned staging directory changed while entering quarantine"
+            )
+        if (
+            _directory_identity(
+                os.fstat(staging_descriptor),
+                "owned staging directory",
+            )
+            != expected
+        ):
+            raise ValueError(
+                "owned staging descriptor changed while entering quarantine"
+            )
+        _remove_private_quarantined_entry(
+            retirement.descriptor,
+            retirement_name,
+            expected,
+        )
+        retirement_name = None
+        retirement.remove()
+        retirement_removed = True
+    except BaseException as exc:
+        primary = exc
+    finally:
+        failures = _CleanupFailures()
+        if staging_descriptor >= 0:
+            failures.attempt(
+                "staging cleanup descriptor close",
+                lambda: os.close(staging_descriptor),
+            )
+        if retirement is not None and not retirement_removed:
+            failures.attempt(
+                "staging cleanup quarantine removal",
+                retirement.remove,
+            )
+        if retirement is not None:
+            failures.attempt(
+                "staging cleanup quarantine close",
+                retirement.close,
+            )
+        if writer_lock is not None:
+            failures.attempt("staging cleanup lock release", writer_lock.release)
+            failures.attempt("staging cleanup lock close", writer_lock.close)
+        if parent_anchor is not None:
+            failures.attempt(
+                "staging cleanup parent close",
+                parent_anchor.close,
+            )
+        failures.finish(primary, cleanup_context)
+    if primary is not None:
+        raise primary
+
+
+def _lock_is_verified(lock: _WriterLock, context: str) -> bool:
+    try:
+        lock.verify(context)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _stable_directory_key(identity: _EntryIdentity) -> tuple[int, int, int]:
+    return identity.device, identity.inode, stat.S_IFMT(identity.mode)
+
+
+def _remove_private_quarantined_entry(
+    parent_fd: int,
+    name: str,
+    expected: _EntryIdentity,
+) -> None:
+    """Remove an identity entirely within a transaction-private namespace."""
+    current = _entry_at(parent_fd, name)
+    if current != expected:
+        raise ValueError("quarantined staging entry changed before cleanup")
+    if stat.S_ISDIR(expected.mode):
+        descriptor = -1
+        primary: BaseException | None = None
+        try:
+            descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            if (
+                _EntryIdentity.from_stat(os.fstat(descriptor)) != expected
+                or _entry_at(parent_fd, name) != expected
+            ):
+                raise ValueError("quarantined staging directory changed")
+            for child_name in sorted(os.listdir(descriptor)):
+                child = _entry_at(descriptor, child_name)
+                if child is None:
+                    raise ValueError("quarantined staging child changed")
+                _remove_private_quarantined_entry(
+                    descriptor,
+                    child_name,
+                    child,
+                )
+            if (
+                _EntryIdentity.from_stat(os.fstat(descriptor)) != expected
+                or _entry_at(parent_fd, name) != expected
+            ):
+                raise ValueError("quarantined staging directory changed")
+        except BaseException as exc:
+            primary = exc
+        finally:
+            failures = _CleanupFailures()
+            if descriptor >= 0:
+                failures.attempt(
+                    "quarantined directory close",
+                    lambda: os.close(descriptor),
+                )
+            failures.finish(primary, "quarantined staging tree")
+        if primary is not None:
+            raise primary
+        os.rmdir(name, dir_fd=parent_fd)
+    else:
+        os.unlink(name, dir_fd=parent_fd)
+    if _entry_at(parent_fd, name) is not None:
+        raise ValueError("quarantined staging entry removal was incomplete")
+
+
 class WriterPublication:
     """Own one locked writer bundle and finalize every cleanup outcome.
 

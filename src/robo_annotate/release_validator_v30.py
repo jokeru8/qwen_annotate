@@ -164,13 +164,15 @@ def _validate_v30_release_with_info(
         info.get("chunks_size", _DEFAULT_CHUNKS_SIZE), "chunks_size", 1
     )
     fps = _positive_number(info.get("fps"), "fps")
-    data_size_mb = _positive_number(
+    _strict_int(
         info.get("data_files_size_in_mb", _DEFAULT_DATA_FILE_SIZE_MB),
         "data_files_size_in_mb",
+        1,
     )
-    video_size_mb = _positive_number(
+    _strict_int(
         info.get("video_files_size_in_mb", _DEFAULT_VIDEO_FILE_SIZE_MB),
         "video_files_size_in_mb",
+        1,
     )
     data_template = _template(
         info.get("data_path", _DEFAULT_DATA_PATH),
@@ -477,18 +479,6 @@ def _validate_v30_release_with_info(
     )
     if actual_episode_shards != expected_episode_shards:
         raise ValueError("missing or extra episode metadata shards")
-    if episodes_template is not None:
-        actual_data_mb = sum(
-            _secure_file_size(release_tree, path, _MAX_PARQUET_BYTES)
-            for path in data_tables
-        ) / (2**20)
-        actual_video_mb = sum(file.size for file in video_files.values()) / (2**20)
-        for field, declared, actual in (
-            ("data_files_size_in_mb", data_size_mb, actual_data_mb),
-            ("video_files_size_in_mb", video_size_mb, actual_video_mb),
-        ):
-            if abs(declared - actual) > max(1e-12, actual * 1e-9):
-                raise ValueError(f"{field} differs from actual rebuilt payload size")
 
     expected_stats_features = set(numeric_shapes) | set(cameras)
     if set(published_stats) != expected_stats_features:
@@ -935,12 +925,6 @@ def _read_parquet(
         return pq.read_table(pa.BufferReader(data))
     except Exception as exc:
         raise ValueError(f"unable to read {context}: {relative}") from exc
-
-
-def _secure_file_size(tree: SecureTree, relative: str, maximum: int) -> int:
-    with tree.open_file(relative, maximum, "rebuilt payload") as opened:
-        opened.verify()
-        return opened.size
 
 
 def _read_data(

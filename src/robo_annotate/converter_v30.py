@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import stat
@@ -18,7 +19,6 @@ from .lerobot import DatasetIndex
 from .publication_metadata import (
     SelectedEpisode,
     atomic_json,
-    read_bounded_json,
     write_public_annotations,
 )
 from .secure_tree import SecureFile, SecureTree
@@ -38,6 +38,7 @@ from .v30_video_writer import (
     VideoPlacement,
     write_v30_video_subset,
 )
+from .writer_publication import _CleanupFailures
 from .workspace import EpisodeRecord, RunManifest
 
 
@@ -50,6 +51,7 @@ _EPISODES_PATH = (
     "meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
 )
 _MAX_VIDEO_BYTES = 16 * 1024 * 1024 * 1024
+_MAX_JSON_BYTES = 16 * 1024 * 1024
 
 
 def write_full_v30_release(
@@ -107,10 +109,70 @@ def rewrite_accepted_v30_release(
     if not source_indices or len(source_indices) != len(set(source_indices)):
         raise ValueError("accepted v3 release requires unique selected episodes")
 
-    source_info = read_bounded_json(source / "meta/info.json")
+    with SecureTree(source, "v3 composer source") as source_tree:
+        source_tree.scan()
+        source_info = _read_source_json_object(
+            source_tree,
+            "meta/info.json",
+            "source info.json",
+        )
+        source_stats = _read_source_json_object(
+            source_tree,
+            "meta/stats.json",
+            "source stats.json",
+        )
+        result = _compose_accepted_v30_release(
+            staging,
+            source,
+            output,
+            manifest,
+            dataset,
+            selected_records,
+            source_indices,
+            converted_at,
+            augmented_texts,
+            services,
+            source_info,
+            source_stats,
+        )
+        try:
+            source_tree.verify()
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "source dataset changed during v3 composition"
+            ) from exc
+        return result
+
+
+def _compose_accepted_v30_release(
+    staging: Path,
+    source: Path,
+    output: Path,
+    manifest: RunManifest,
+    dataset: DatasetIndex,
+    selected_records: Sequence[EpisodeRecord],
+    source_indices: Sequence[int],
+    converted_at: datetime,
+    augmented_texts: Mapping[int, list[str]] | None,
+    services: Any,
+    source_info: Mapping[str, Any],
+    source_stats: Mapping[str, Any],
+) -> int:
+    data_size_limit = _official_size_limit(
+        source_info,
+        "data_files_size_in_mb",
+        100,
+    )
+    video_size_limit = _official_size_limit(
+        source_info,
+        "video_files_size_in_mb",
+        200,
+    )
     writer_info = source_info | {
         "data_path": _DATA_PATH,
         "video_path": _VIDEO_PATH,
+        "data_files_size_in_mb": data_size_limit,
+        "video_files_size_in_mb": video_size_limit,
     }
     data = write_v30_data_subset(
         source,
@@ -127,7 +189,7 @@ def rewrite_accepted_v30_release(
     )
     placements = _paired_placements(data, videos, manifest.camera_keys)
     profiles = _stats_profiles(
-        source / "meta/stats.json",
+        source_stats,
         set(data.aggregate_stats) | set(manifest.camera_keys),
     )
     aggregate_video, episode_video = _video_stats(
@@ -164,12 +226,8 @@ def rewrite_accepted_v30_release(
             "data_path": _DATA_PATH,
             "video_path": _VIDEO_PATH,
             "episodes_path": _EPISODES_PATH,
-            "data_files_size_in_mb": _payload_size_mb(
-                staging / "data", ".parquet"
-            ),
-            "video_files_size_in_mb": _payload_size_mb(
-                staging / "videos", ".mp4"
-            ),
+            "data_files_size_in_mb": data_size_limit,
+            "video_files_size_in_mb": video_size_limit,
         }
     )
     atomic_json(staging / "meta/info.json", info, sort_keys=False)
@@ -231,11 +289,41 @@ def _paired_placements(
     return placements
 
 
+def _read_source_json_object(
+    tree: SecureTree,
+    relative: str,
+    context: str,
+) -> dict[str, Any]:
+    with tree.open_file(relative, _MAX_JSON_BYTES, context) as opened:
+        payload = opened.read_bytes()
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result = {}
+        for name, value in pairs:
+            if name in result:
+                raise ValueError(f"duplicate key {name!r} in {context}")
+            result[name] = value
+        return result
+
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=unique,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(constant)
+            ),
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid {context}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{context} must be an object")
+    return value
+
+
 def _stats_profiles(
-    source: Path,
+    published: Mapping[str, Any],
     expected_features: set[str],
 ) -> dict[str, tuple[str, ...]]:
-    published = read_bounded_json(source)
     if set(published) != expected_features:
         raise ValueError("source stats feature coverage differs from rebuilt output")
     result = {}
@@ -397,6 +485,7 @@ def _decode_video_samples(
         expected_start = stop
     iterator = iter(frame_iterator(opened.proc_path))
     decoded_count = 0
+    primary: BaseException | None = None
     try:
         for frame_index, frame in enumerate(iterator):
             array = np.asarray(frame)
@@ -407,11 +496,16 @@ def _decode_video_samples(
                 sampled = _downsample_rgb(array).astype(np.float64) / 255.0
                 pixels[output_index].append(sampled.reshape(-1, 3))
             decoded_count += 1
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
+        failures = _CleanupFailures()
         close = getattr(iterator, "close", None)
         if callable(close):
-            close()
-    opened.verify()
+            failures.attempt("video decoder iterator close", close)
+        failures.attempt("rebuilt video verification", opened.verify)
+        failures.finish(primary, "rebuilt video statistics")
     if decoded_count != expected_start:
         raise ValueError("rebuilt video decoded frame count differs from placements")
     result = {}
@@ -536,12 +630,15 @@ def _atomic_parquet(path: Path, table: pa.Table) -> None:
         os.close(parent_fd)
 
 
-def _payload_size_mb(root: Path, suffix: str) -> float:
-    return sum(
-        path.stat(follow_symlinks=False).st_size
-        for path in root.rglob(f"*{suffix}")
-        if path.is_file() and not path.is_symlink()
-    ) / (2**20)
+def _official_size_limit(
+    info: Mapping[str, Any],
+    field: str,
+    default: int,
+) -> int:
+    value = info.get(field, default)
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"source {field} must be a positive integer")
+    return value
 
 
 def _service(services: Any, name: str, default: Any) -> Any:

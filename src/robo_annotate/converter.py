@@ -33,6 +33,12 @@ from .release_validator import ReleaseReport, validate_release
 from .secure_tree import rename_noreplace_at
 from .stats import iter_video_rgb_frames, recompute_stats, recompute_video_stats
 from .workspace import EpisodeRecord, RunManifest, WorkspaceStore, compute_run_fingerprint, compute_source_fingerprint
+from .writer_publication import (
+    _CleanupFailures,
+    capture_owned_directory_identity,
+    remove_owned_published_tree,
+    remove_owned_staging_tree,
+)
 
 
 @dataclass(frozen=True)
@@ -137,6 +143,7 @@ def convert_dataset(
     lock_fd = _open_lock(lock_path)
     staging: Path | None = None
     staging_identity: tuple[int, int, int] | None = None
+    published = False
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         _reject_existing(out)
@@ -147,7 +154,7 @@ def convert_dataset(
         augmented_texts = _augment_selected(config, manifest, records, services)
         staging = out.parent / f"{out.name}.staging-{secrets.token_hex(16)}"
         os.mkdir(staging, 0o700)
-        staging_identity = _directory_identity(staging)
+        staging_identity = capture_owned_directory_identity(staging)
         if not (accepted_only and manifest.dataset_version == "v3.0"):
             _copy_tree(source, staging, include_payload=not accepted_only)
         converted_at = datetime.now(UTC)
@@ -224,10 +231,11 @@ def convert_dataset(
         )
         if _tree_digest(source) != source_before:
             raise ValueError("source dataset changed during conversion")
-        if _directory_identity(staging) != staging_identity:
+        if capture_owned_directory_identity(staging) != staging_identity:
             raise ValueError("owned staging directory changed before publication")
         _rename_noreplace(staging, out)
-        if _directory_identity(out) != staging_identity:
+        published = True
+        if capture_owned_directory_identity(out) != staging_identity:
             raise ValueError("published output identity differs from owned staging")
         staging = None
         parent_fd = os.open(out.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
@@ -247,30 +255,33 @@ def convert_dataset(
         )
     finally:
         active_error = sys.exc_info()[1]
-        cleanup_failure = None
+        failures = _CleanupFailures()
         if staging is not None:
-            try:
-                _remove_owned_staging(
+            failures.attempt(
+                "staging cleanup",
+                lambda: remove_owned_staging_tree(
                     staging,
                     out.parent,
                     out.name,
                     staging_identity,
-                )
-            except Exception as cleanup_error:
-                if active_error is not None:
-                    active_error.add_note(
-                        "Secondary staging cleanup failure: "
-                        f"{type(cleanup_error).__name__}: {cleanup_error}"
-                    )
-                else:
-                    cleanup_failure = cleanup_error
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_fd)
-        # A cleanup error is surfaced only when there was no active primary exception.
-        if cleanup_failure is not None:
-            raise cleanup_failure
+                ),
+            )
+        failures.attempt(
+            "output lock release",
+            lambda: fcntl.flock(lock_fd, fcntl.LOCK_UN),
+        )
+        failures.attempt("output lock close", lambda: os.close(lock_fd))
+        if published and (active_error is not None or failures.errors):
+            failures.attempt(
+                "published output rollback",
+                lambda: remove_owned_published_tree(
+                    out,
+                    out.parent,
+                    out.name,
+                    staging_identity,
+                ),
+            )
+        failures.finish(active_error, "conversion finalization")
 
 
 def _guard_workspace(
@@ -713,30 +724,6 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
         -100,
         os.fspath(destination),
     )
-
-
-def _directory_identity(path: Path) -> tuple[int, int, int]:
-    metadata = path.stat(follow_symlinks=False)
-    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
-        raise ValueError("owned staging path is not a real directory")
-    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
-
-
-def _remove_owned_staging(
-    staging: Path,
-    parent: Path,
-    output_name: str,
-    expected: tuple[int, int, int] | None,
-) -> None:
-    if staging.parent != parent or not staging.name.startswith(f"{output_name}.staging-"):
-        raise ValueError("refusing to clean an unowned path")
-    try:
-        actual = _directory_identity(staging)
-    except FileNotFoundError:
-        return
-    if expected is None or actual != expected:
-        raise ValueError("refusing to clean a replaced staging directory")
-    shutil.rmtree(staging)
 
 
 def _service(services: Any, name: str, default: Any) -> Any:

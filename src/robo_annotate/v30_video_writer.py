@@ -300,7 +300,7 @@ def _validate_request(
     if type(chunks_size) is not int or chunks_size <= 0:
         raise ValueError("info.chunks_size must be a positive integer")
     size_mb = _positive_finite_number(
-        info.get("video_files_size_in_mb", 500),
+        info.get("video_files_size_in_mb", 200),
         "info.video_files_size_in_mb",
     )
     video_template = info.get("video_path")
