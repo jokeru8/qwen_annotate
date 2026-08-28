@@ -5,7 +5,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from robo_annotate.lerobot import inspect_dataset
+from robo_annotate.lerobot import detect_dataset_version, inspect_dataset
 from robo_annotate.lerobot_v30 import read_v30_episode_table, read_v30_tasks
 from tests.v30_fixtures import make_lerobot_v30_fixture, make_v30_config
 
@@ -26,6 +26,22 @@ def _replace_column(table: pa.Table, name: str, values: list[object]) -> pa.Tabl
     position = table.schema.get_field_index(name)
     field = table.schema.field(position)
     return table.set_column(position, field, pa.array(values, type=field.type))
+
+
+def _track_info_target_reads(
+    monkeypatch: pytest.MonkeyPatch, target: Path
+) -> list[Path]:
+    reads: list[Path] = []
+    original = Path.read_text
+    resolved_target = target.resolve()
+
+    def tracked(path: Path, *args, **kwargs) -> str:
+        if path.resolve() == resolved_target:
+            reads.append(path)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", tracked)
+    return reads
 
 
 def test_inspects_shared_v30_slices(tmp_path: Path) -> None:
@@ -137,13 +153,40 @@ def test_rejects_v30_symlink_payload(tmp_path: Path) -> None:
         inspect_dataset(make_v30_config(root, tmp_path / "work"))
 
 
-def test_rejects_v30_symlink_dataset_root(tmp_path: Path) -> None:
+def test_rejects_v30_symlink_dataset_root_before_reading_info_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     real_root = make_lerobot_v30_fixture(tmp_path)
+    target = real_root / "meta/info.json"
     alias = tmp_path / "dataset-alias"
     alias.symlink_to(real_root, target_is_directory=True)
+    reads = _track_info_target_reads(monkeypatch, target)
 
     with pytest.raises(ValueError, match=r"dataset root.*symbolic link"):
         inspect_dataset(make_v30_config(alias, tmp_path / "work"))
+    with pytest.raises(ValueError, match=r"dataset root.*symbolic link"):
+        detect_dataset_version(alias)
+
+    assert reads == []
+
+
+def test_rejects_v30_symlink_info_before_reading_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    info_path = root / "meta/info.json"
+    target = tmp_path / "outside-info.json"
+    target.write_bytes(info_path.read_bytes())
+    info_path.unlink()
+    info_path.symlink_to(target)
+    reads = _track_info_target_reads(monkeypatch, target)
+
+    with pytest.raises(ValueError, match=r"info metadata.*symbolic link"):
+        inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    with pytest.raises(ValueError, match=r"info metadata.*symbolic link"):
+        detect_dataset_version(root)
+
+    assert reads == []
 
 
 def test_rejects_noncontiguous_v30_episode_indices(tmp_path: Path) -> None:

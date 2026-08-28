@@ -33,6 +33,22 @@ def write_metadata(root: Path, value: dict[str, object]) -> None:
     (root / "meta/info.json").write_text(json.dumps(value), encoding="utf-8")
 
 
+def track_info_target_reads(
+    monkeypatch: pytest.MonkeyPatch, target: Path
+) -> list[Path]:
+    reads: list[Path] = []
+    original = Path.read_text
+    resolved_target = target.resolve()
+
+    def tracked(path: Path, *args, **kwargs) -> str:
+        if path.resolve() == resolved_target:
+            reads.append(path)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", tracked)
+    return reads
+
+
 def test_inspects_valid_v21_dataset_with_resolved_paths(tmp_path: Path) -> None:
     root = make_lerobot_fixture(tmp_path, [12, 12], 5.0, ["cam.eye"])
 
@@ -78,6 +94,58 @@ def test_version_detector_rejects_missing_and_unknown_versions(tmp_path: Path) -
         info_path.write_text(json.dumps(mutated))
         with pytest.raises(ValueError, match="Unsupported LeRobot codebase_version"):
             detect_dataset_version(root)
+
+
+def test_v21_rejects_symlinked_root_before_reading_info_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_lerobot_fixture(tmp_path, [12], 5.0, ["cam.eye"])
+    target = root / "meta/info.json"
+    alias = tmp_path / "dataset-alias"
+    alias.symlink_to(root, target_is_directory=True)
+    reads = track_info_target_reads(monkeypatch, target)
+
+    with pytest.raises(ValueError, match=r"dataset root.*symbolic link"):
+        inspect_dataset(make_config(alias, tmp_path / "work"), fixed_probe)
+    with pytest.raises(ValueError, match=r"dataset root.*symbolic link"):
+        detect_dataset_version(alias)
+
+    assert reads == []
+
+
+def test_v21_rejects_symlinked_info_before_reading_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_lerobot_fixture(tmp_path, [12], 5.0, ["cam.eye"])
+    info_path = root / "meta/info.json"
+    target = tmp_path / "outside-info.json"
+    target.write_bytes(info_path.read_bytes())
+    info_path.unlink()
+    info_path.symlink_to(target)
+    reads = track_info_target_reads(monkeypatch, target)
+
+    with pytest.raises(ValueError, match=r"info metadata.*symbolic link"):
+        inspect_dataset(make_config(root, tmp_path / "work"), fixed_probe)
+    with pytest.raises(ValueError, match=r"info metadata.*symbolic link"):
+        detect_dataset_version(root)
+
+    assert reads == []
+
+
+def test_v21_rejects_symlinked_meta_before_reading_info_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_lerobot_fixture(tmp_path, [12], 5.0, ["cam.eye"])
+    meta = root / "meta"
+    target_meta = tmp_path / "outside-meta"
+    meta.rename(target_meta)
+    meta.symlink_to(target_meta, target_is_directory=True)
+    reads = track_info_target_reads(monkeypatch, target_meta / "info.json")
+
+    with pytest.raises(ValueError, match=r"meta directory.*symbolic link"):
+        inspect_dataset(make_config(root, tmp_path / "work"), fixed_probe)
+
+    assert reads == []
 
 
 def test_rejects_missing_refine_camera_with_key(tmp_path: Path) -> None:

@@ -2,6 +2,8 @@
 
 import json
 import math
+import os
+import stat
 from collections.abc import Callable
 from pathlib import Path
 from string import Formatter
@@ -14,6 +16,7 @@ from robo_annotate.config import AnnotationConfig
 
 
 VIDEO_FPS_TOLERANCE = 0.01
+_MAX_INFO_JSON_BYTES = 16 * 1024 * 1024
 DatasetVersion = Literal["v2.1", "v3.0"]
 
 
@@ -137,21 +140,21 @@ def inspect_dataset(
     probe: Callable[[Path], VideoProbe] = probe_video,
 ) -> DatasetIndex:
     """Validate and index a supported local LeRobot dataset without writing to it."""
-    root = config.source.resolve()
-    info = _read_json_object(root / "meta" / "info.json")
+    root, info = _read_dataset_info(config.source)
+    safe_config = config.model_copy(update={"source": root})
     version = _dataset_version(info)
     if version == "v2.1":
         from .lerobot_v21 import inspect_v21_dataset
 
-        return inspect_v21_dataset(config, info, probe)
+        return inspect_v21_dataset(safe_config, info, probe)
     from .lerobot_v30 import inspect_v30_dataset
 
-    return inspect_v30_dataset(config, info, probe)
+    return inspect_v30_dataset(safe_config, info, probe)
 
 
 def detect_dataset_version(root: Path) -> DatasetVersion:
     """Return the declared supported LeRobot version without guessing from layout."""
-    info = _read_json_object(root.resolve() / "meta" / "info.json")
+    _, info = _read_dataset_info(root)
     return _dataset_version(info)
 
 
@@ -162,16 +165,161 @@ def _dataset_version(info: dict[str, Any]) -> DatasetVersion:
     return cast(DatasetVersion, version)
 
 
-def _read_json_object(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        raise FileNotFoundError(f"Missing required metadata file: {path}")
+def _read_dataset_info(source: Path) -> tuple[Path, dict[str, Any]]:
+    lexical_root = Path(os.path.abspath(source))
+    root_fd = _open_root_directory(lexical_root)
+    meta_fd: int | None = None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        root = lexical_root.resolve(strict=True)
+        if _stat_identity(os.fstat(root_fd)) != _stat_identity(
+            lexical_root.stat(follow_symlinks=False)
+        ):
+            raise ValueError("Malformed dataset root: identity changed during inspection")
+        meta_fd = _open_directory_at(
+            root_fd,
+            "meta",
+            "meta directory",
+            root / "meta",
+        )
+        payload = _read_bounded_regular_at(
+            meta_fd,
+            "info.json",
+            "info metadata",
+            root / "meta" / "info.json",
+            _MAX_INFO_JSON_BYTES,
+        )
+    finally:
+        if meta_fd is not None:
+            os.close(meta_fd)
+        os.close(root_fd)
+
+    path = root / "meta" / "info.json"
+    try:
+        value = json.loads(payload.decode("utf-8"), parse_constant=_reject_json_constant)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError(f"Malformed JSON in {path}: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"Malformed JSON in {path}: expected an object")
-    return value
+    return root, value
+
+
+def _open_root_directory(path: Path) -> int:
+    try:
+        entry = path.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Missing dataset root: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"Unable to inspect dataset root {path}: {exc}") from exc
+    if stat.S_ISLNK(entry.st_mode):
+        raise ValueError(f"Malformed dataset root {path}: symbolic links are not allowed")
+    if not stat.S_ISDIR(entry.st_mode):
+        raise ValueError(f"Malformed dataset root {path}: expected a directory")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"Unable to open dataset root {path} without following links") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or _stat_identity(entry) != _stat_identity(opened):
+            raise ValueError("Malformed dataset root: identity changed during inspection")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _open_directory_at(parent_fd: int, name: str, context: str, path: Path) -> int:
+    try:
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Missing required {context}: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"Unable to inspect {context} {path}: {exc}") from exc
+    if stat.S_ISLNK(entry.st_mode):
+        raise ValueError(f"Malformed {context} {path}: symbolic links are not allowed")
+    if not stat.S_ISDIR(entry.st_mode):
+        raise ValueError(f"Malformed {context} {path}: expected a directory")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise ValueError(f"Unable to open {context} {path} without following links") from exc
+    try:
+        opened = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or _stat_identity(entry) != _stat_identity(opened)
+            or _stat_identity(opened) != _stat_identity(current)
+        ):
+            raise ValueError(f"Malformed {context} {path}: identity changed during inspection")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_bounded_regular_at(
+    parent_fd: int,
+    name: str,
+    context: str,
+    path: Path,
+    limit: int,
+) -> bytes:
+    try:
+        entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Missing required metadata file: {path}") from exc
+    except OSError as exc:
+        raise ValueError(f"Unable to inspect {context} {path}: {exc}") from exc
+    if stat.S_ISLNK(entry.st_mode):
+        raise ValueError(f"Malformed {context} {path}: symbolic links are not allowed")
+    if not stat.S_ISREG(entry.st_mode):
+        raise ValueError(f"Malformed {context} {path}: expected a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise ValueError(f"Unable to open {context} {path} without following links") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _stat_identity(entry) != _stat_identity(opened)
+        ):
+            raise ValueError(f"Malformed {context} {path}: identity changed before reading")
+        if opened.st_size > limit:
+            raise ValueError(f"Malformed {context} {path}: exceeds {limit} bytes")
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                raise ValueError(f"Malformed {context} {path}: file changed while reading")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            _stat_identity(opened) != _stat_identity(after)
+            or _stat_identity(after) != _stat_identity(current)
+        ):
+            raise ValueError(f"Malformed {context} {path}: identity changed while reading")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
