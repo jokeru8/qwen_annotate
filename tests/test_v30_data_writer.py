@@ -12,7 +12,7 @@ import pytest
 from PIL import Image
 
 from robo_annotate.lerobot import inspect_dataset
-from robo_annotate import v30_data_writer
+from robo_annotate import v30_data_writer, writer_publication
 from robo_annotate.v30_data_writer import write_v30_data_subset
 from tests.v30_fixtures import (
     make_lerobot_v30_fixture,
@@ -663,7 +663,7 @@ def test_component_replacement_during_publication_is_detected_and_rolled_back(
     (sink / "marker.txt").write_text("unchanged", encoding="utf-8")
     before_source = source_tree_digest(root)
     before_sink = _tree_digest(sink)
-    actual_publish = v30_data_writer.rename_noreplace_at
+    actual_publish = writer_publication.rename_noreplace_at
     publications = 0
 
     def publish_then_swap_meta(
@@ -685,7 +685,7 @@ def test_component_replacement_during_publication_is_detected_and_rolled_back(
             (staging / "meta").symlink_to(sink, target_is_directory=True)
 
     monkeypatch.setattr(
-        v30_data_writer,
+        writer_publication,
         "rename_noreplace_at",
         publish_then_swap_meta,
     )
@@ -713,7 +713,7 @@ def test_source_change_after_staging_publication_is_detected_and_rolled_back(
     staging = tmp_path / "staging"
     info_path = root / "meta/info.json"
     original_info = info_path.read_bytes()
-    actual_publish = v30_data_writer.rename_noreplace_at
+    actual_publish = writer_publication.rename_noreplace_at
     publications = 0
 
     def publish_then_change_source(
@@ -734,7 +734,7 @@ def test_source_change_after_staging_publication_is_detected_and_rolled_back(
             info_path.write_bytes(original_info + b" ")
 
     monkeypatch.setattr(
-        v30_data_writer,
+        writer_publication,
         "rename_noreplace_at",
         publish_then_change_source,
     )
@@ -899,7 +899,7 @@ def test_relocated_staging_is_never_cleaned_through_displaced_descriptor(
     relocated = outside / "relocated-staging"
     before_source = source_tree_digest(root)
     before_fds = len(os.listdir("/proc/self/fd"))
-    actual_publish = v30_data_writer.rename_noreplace_at
+    actual_publish = writer_publication.rename_noreplace_at
     outside_after_injection: str | None = None
 
     def publish_then_relocate_staging(
@@ -932,7 +932,7 @@ def test_relocated_staging_is_never_cleaned_through_displaced_descriptor(
         outside_after_injection = _tree_digest(outside)
 
     monkeypatch.setattr(
-        v30_data_writer,
+        writer_publication,
         "rename_noreplace_at",
         publish_then_relocate_staging,
     )
@@ -972,7 +972,7 @@ def test_relocated_meta_is_never_cleaned_through_displaced_descriptor(
     relocated = outside / "relocated-meta"
     before_source = source_tree_digest(root)
     before_fds = len(os.listdir("/proc/self/fd"))
-    actual_publish = v30_data_writer.rename_noreplace_at
+    actual_publish = writer_publication.rename_noreplace_at
     outside_after_injection: str | None = None
 
     def publish_then_relocate_meta(
@@ -1007,7 +1007,7 @@ def test_relocated_meta_is_never_cleaned_through_displaced_descriptor(
         outside_after_injection = _tree_digest(outside)
 
     monkeypatch.setattr(
-        v30_data_writer,
+        writer_publication,
         "rename_noreplace_at",
         publish_then_relocate_meta,
     )
@@ -1045,7 +1045,7 @@ def test_task_owned_inode_is_removed_after_meta_moves_within_attached_staging(
     staging = tmp_path / "staging"
     displaced_meta = staging / "displaced-meta"
     before_source = source_tree_digest(root)
-    actual_publish = v30_data_writer.rename_noreplace_at
+    actual_publish = writer_publication.rename_noreplace_at
 
     def publish_then_move_meta_within_staging(
         source_fd: int,
@@ -1077,7 +1077,7 @@ def test_task_owned_inode_is_removed_after_meta_moves_within_attached_staging(
         )
 
     monkeypatch.setattr(
-        v30_data_writer,
+        writer_publication,
         "rename_noreplace_at",
         publish_then_move_meta_within_staging,
     )
@@ -1208,7 +1208,7 @@ def test_staging_open_failure_preserves_replacement_entry(
     relocated = outside / "relocated-owned-staging"
     before_source = source_tree_digest(root)
     before_fds = len(os.listdir("/proc/self/fd"))
-    actual_publish = v30_data_writer.rename_noreplace_at
+    actual_publish = writer_publication.rename_noreplace_at
     replacement_identity: tuple[int, int] | None = None
 
     def replace_published_staging(
@@ -1231,7 +1231,7 @@ def test_staging_open_failure_preserves_replacement_entry(
             replacement_identity = value.st_dev, value.st_ino
 
     monkeypatch.setattr(
-        v30_data_writer,
+        writer_publication,
         "rename_noreplace_at",
         replace_published_staging,
     )
@@ -1280,7 +1280,7 @@ def test_meta_open_failure_preserves_non_owned_replacement(
             parent_path = Path()
         if (
             isinstance(path, str)
-            and path.startswith(".v30-dir-")
+            and path.startswith(".writer-dir-")
             and parent_path == staging
             and not injected
         ):
@@ -1490,7 +1490,7 @@ def test_private_directory_publication_rejects_replacement_without_owning_it(
     (outside / "marker.txt").write_bytes(b"unchanged")
     relocated = outside / "relocated-owned-meta"
     before_source = source_tree_digest(root)
-    actual_publish = v30_data_writer.rename_noreplace_at
+    actual_publish = writer_publication.rename_noreplace_at
     injected = False
 
     def publish_then_replace_directory(
@@ -1508,7 +1508,7 @@ def test_private_directory_publication_rejects_replacement_without_owning_it(
         )
         if (
             not injected
-            and source_name.startswith(".v30-dir-")
+            and source_name.startswith(".writer-dir-")
             and destination_name == "meta"
         ):
             destination_parent = Path(
@@ -1522,7 +1522,7 @@ def test_private_directory_publication_rejects_replacement_without_owning_it(
             injected = True
 
     monkeypatch.setattr(
-        v30_data_writer,
+        writer_publication,
         "rename_noreplace_at",
         publish_then_replace_directory,
     )
@@ -1607,7 +1607,7 @@ def test_retiring_owned_identity_prevents_reentrant_inode_reuse_cleanup(
             lambda: True,
         )
 
-    monkeypatch.setattr(v30_data_writer, "_entry_at", reused_identity)
+    monkeypatch.setattr(writer_publication, "_entry_at", reused_identity)
     if entry_kind == "file":
         monkeypatch.setattr(v30_data_writer.os, "unlink", install_file_replacement)
     else:
@@ -1792,7 +1792,7 @@ def test_private_directory_birth_uses_open_descriptor_as_ownership_authority(
         if (
             not injected
             and isinstance(path, str)
-            and path.startswith(".v30-dir-")
+            and path.startswith(".writer-dir-")
             and isinstance(directory_fd, int)
         ):
             parent = Path(os.readlink(f"/proc/self/fd/{directory_fd}"))
@@ -1821,7 +1821,7 @@ def test_private_directory_birth_uses_open_descriptor_as_ownership_authority(
     assert isinstance(raised.value.__cause__, ValueError)
     assert "changed while establishing ownership" in str(raised.value.__cause__)
     assert relocated.is_dir()
-    competitors = list(tmp_path.glob(".v30-dir-*/competitor.txt"))
+    competitors = list(tmp_path.glob(".writer-dir-*/competitor.txt"))
     assert len(competitors) == 1
     assert competitors[0].read_bytes() == b"preserve competitor"
     assert source_tree_digest(root) == before_source
@@ -1839,7 +1839,7 @@ def test_bundle_directories_reject_preexisting_entries_instead_of_adopting_them(
     dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
     staging = tmp_path / "staging"
     actual_create = v30_data_writer._create_private_child_directory
-    actual_publish = v30_data_writer._publish_private_directory
+    actual_publish = writer_publication._publish_private_directory
     injected = False
 
     def create_then_preoccupy_data(*args: object, **kwargs: object):
@@ -1867,12 +1867,12 @@ def test_bundle_directories_reject_preexisting_entries_instead_of_adopting_them(
         return directory
 
     monkeypatch.setattr(
-        v30_data_writer,
+        writer_publication,
         "_create_private_child_directory",
         create_then_preoccupy_data,
     )
     monkeypatch.setattr(
-        v30_data_writer,
+        writer_publication,
         "_publish_private_directory",
         publish_then_preoccupy_chunk,
     )
@@ -2030,7 +2030,7 @@ def test_identity_failure_closes_untracked_directory_descriptor(
 
     def capture_open(path: object, *args: object, **kwargs: object) -> int:
         descriptor = actual_open(path, *args, **kwargs)
-        if isinstance(path, str) and path.startswith(".v30-dir-"):
+        if isinstance(path, str) and path.startswith(".writer-dir-"):
             fail_descriptors.add(descriptor)
         return descriptor
 
