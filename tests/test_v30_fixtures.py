@@ -3,6 +3,7 @@ from pathlib import Path
 
 import av
 import pyarrow.parquet as pq
+import pytest
 
 from tests.v30_fixtures import make_lerobot_v30_fixture
 
@@ -20,3 +21,11 @@ def test_v30_fixture_uses_shared_real_payloads(tmp_path: Path) -> None:
     assert len(list((root / "videos/observation.images.main").glob("**/*.mp4"))) == 1
     with av.open(str(next((root / "videos/observation.images.main").glob("**/*.mp4")))) as container:
         assert sum(1 for _ in container.decode(video=0)) == 19
+
+
+def test_v30_fixture_rejects_lengths_beyond_color_capacity_before_writes(tmp_path: Path) -> None:
+    """The color-coded fixture must reject unsupported episode lengths atomically."""
+    with pytest.raises(ValueError, match="lengths"):
+        make_lerobot_v30_fixture(tmp_path, lengths=(13,))
+
+    assert not (tmp_path / "lerobot-v30").exists()

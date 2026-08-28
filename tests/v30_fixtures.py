@@ -24,6 +24,7 @@ _FRAME_WIDTH = 32
 _FRAME_HEIGHT = 24
 _TASK_TEXT = "Arrange the colored blocks."
 _STAT_METRICS = ("min", "max", "mean", "std", "count")
+_COLOR_FRAME_CAPACITY = 1 + (255 - 16) // 20
 
 
 def make_lerobot_v30_fixture(
@@ -41,6 +42,10 @@ def make_lerobot_v30_fixture(
     """
     if not lengths or any(type(length) is not int or length <= 0 for length in lengths):
         raise ValueError("lengths must contain positive integer episode lengths")
+    if any(length > _COLOR_FRAME_CAPACITY for length in lengths):
+        raise ValueError(
+            f"lengths must not exceed {_COLOR_FRAME_CAPACITY} frames for the fixture color encoding"
+        )
     if not isinstance(fps, (int, float)) or isinstance(fps, bool) or fps <= 0:
         raise ValueError("fps must be positive")
     if not cameras or len(set(cameras)) != len(cameras):
