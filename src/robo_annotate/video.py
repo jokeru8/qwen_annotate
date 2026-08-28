@@ -76,6 +76,7 @@ def extract_frames(
     if not isinstance(camera_key, str) or not camera_key:
         raise ValueError("camera_key must be a nonempty string")
     requested = _validate_requested_indices(indices)
+    requested_set = set(requested)
     fps = _require_positive_finite_number(video.fps, "video fps")
     episode_frame_count = round((video.to_timestamp - video.from_timestamp) * fps)
     if episode_frame_count < 1:
@@ -131,6 +132,8 @@ def extract_frames(
                     raise ValueError(f"Video {video.path} contains a frame with invalid PTS")
                 if media_time > stop_time:
                     break
+                if not video.from_timestamp <= media_time < video.to_timestamp:
+                    continue
                 local_index = round((media_time - video.from_timestamp) * fps)
                 if not 0 <= local_index < episode_frame_count:
                     continue
@@ -142,11 +145,9 @@ def extract_frames(
                         f"Video {video.path} contains duplicate episode-local frame {local_index}"
                     )
                 seen_local.add(local_index)
-                if local_index not in requested:
+                if local_index not in requested_set:
                     continue
                 found[local_index] = _make_sample(frame, camera_key, local_index, fps)
-                if len(found) == len(requested):
-                    break
         except ValueError:
             raise
         except Exception as exc:
@@ -191,7 +192,7 @@ def _validate_requested_indices(indices: list[int]) -> list[int]:
         _require_int(frame_index, "indices", minimum=0)
     if len(indices) != len(set(indices)):
         raise ValueError("indices must be unique")
-    return sorted(indices)
+    return list(indices)
 
 
 def _make_sample(frame: Any, camera_key: str, frame_index: int, fps: float) -> FrameSample:

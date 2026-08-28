@@ -1,9 +1,11 @@
+import math
 import sys
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from robo_annotate.lerobot import EpisodeVideoRef, inspect_dataset
 from robo_annotate.video import extract_frames
@@ -31,6 +33,22 @@ def test_extracts_local_frames_from_middle_shared_video_slice(tmp_path: Path) ->
     ]
 
 
+def test_preserves_requested_episode_local_frame_order(tmp_path: Path) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    ref = dataset.episodes[1].videos["observation.images.main"]
+
+    samples = extract_frames(ref, "observation.images.main", [7, 0, 3])
+
+    assert [sample.frame_index for sample in samples] == [7, 0, 3]
+    assert [sample.timestamp_seconds for sample in samples] == [1.4, 0.0, 0.6]
+    assert [dominant_test_color(sample.jpeg) for sample in samples] == [
+        expected_color(0, 1, 7),
+        expected_color(0, 1, 0),
+        expected_color(0, 1, 3),
+    ]
+
+
 def test_rejects_episode_local_index_at_slice_length(tmp_path: Path) -> None:
     root = make_lerobot_v30_fixture(tmp_path)
     dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
@@ -52,20 +70,25 @@ def test_rejects_slice_when_shared_video_has_insufficient_decoded_frames(tmp_pat
 
 
 class _PtsFrame:
-    def __init__(self, pts: int | None) -> None:
+    def __init__(self, pts: int | float | None) -> None:
         self.pts = pts
 
-    def to_image(self):  # pragma: no cover - out-of-slice frames must never become samples
-        raise AssertionError("out-of-slice frame was converted to evidence")
+    def to_image(self) -> Image.Image:
+        return Image.new("RGB", (64, 64), (32, 96, 16))
 
 
 class _PtsContainer:
-    def __init__(self, pts: list[int | None]) -> None:
+    def __init__(
+        self,
+        pts: list[int | float | None],
+        *,
+        time_base: Fraction = Fraction(1, 2),
+    ) -> None:
         self.streams = [
             SimpleNamespace(
                 type="video",
                 average_rate=Fraction(2, 1),
-                time_base=Fraction(1, 2),
+                time_base=time_base,
             )
         ]
         self._pts = pts
@@ -100,6 +123,24 @@ def test_rejects_decoded_pts_before_and_after_the_episode_slice(
     assert container.closed
 
 
+def test_does_not_round_neighboring_episode_pts_into_local_frame_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container = _PtsContainer([3], time_base=Fraction(1, 4))
+    monkeypatch.setitem(sys.modules, "av", SimpleNamespace(open=lambda path: container))
+    ref = EpisodeVideoRef(
+        path=tmp_path / "shared.mp4",
+        from_timestamp=1.0,
+        to_timestamp=2.0,
+        fps=2.0,
+    )
+
+    with pytest.raises(ValueError, match=r"missing requested frame.*0"):
+        extract_frames(ref, "observation.images.main", [0])
+
+    assert container.closed
+
+
 def test_rejects_duplicate_episode_local_pts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -113,15 +154,22 @@ def test_rejects_duplicate_episode_local_pts(
     )
 
     with pytest.raises(ValueError, match=r"duplicate episode-local frame 0"):
-        extract_frames(ref, "observation.images.main", [1])
+        extract_frames(ref, "observation.images.main", [0])
 
     assert container.closed
 
 
-def test_rejects_decoded_frame_without_pts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("malformed_pts", "message"),
+    [(None, "frame without PTS"), (math.inf, "frame with invalid PTS")],
+)
+def test_rejects_malformed_pts_after_last_requested_frame(
+    malformed_pts: float | None,
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    container = _PtsContainer([None])
+    container = _PtsContainer([2, malformed_pts])
     monkeypatch.setitem(sys.modules, "av", SimpleNamespace(open=lambda path: container))
     ref = EpisodeVideoRef(
         path=tmp_path / "shared.mp4",
@@ -130,7 +178,7 @@ def test_rejects_decoded_frame_without_pts(
         fps=2.0,
     )
 
-    with pytest.raises(ValueError, match=r"frame without PTS"):
+    with pytest.raises(ValueError, match=message):
         extract_frames(ref, "observation.images.main", [0])
 
     assert container.closed
