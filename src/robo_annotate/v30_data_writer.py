@@ -714,6 +714,7 @@ class _AnchoredDirectoryPath:
         created_final_component = False
         created_parent_fd: int | None = None
         created_name = ""
+        created_identity: _EntryIdentity | None = None
         try:
             for position, component in enumerate(components):
                 parent_fd = descriptors[-1]
@@ -738,6 +739,8 @@ class _AnchoredDirectoryPath:
                         follow_symlinks=False,
                     )
                 expected = _directory_identity(before, label)
+                if created_final_component and position == len(components) - 1:
+                    created_identity = expected
                 child_fd = -1
                 try:
                     child_fd = os.open(
@@ -772,9 +775,19 @@ class _AnchoredDirectoryPath:
                 created_final_component,
             )
         except (OSError, ValueError) as exc:
-            if created_parent_fd is not None:
+            if created_parent_fd is not None and created_identity is not None:
                 try:
-                    os.rmdir(created_name, dir_fd=created_parent_fd)
+                    _remove_owned_empty_directory_at(
+                        created_parent_fd,
+                        created_name,
+                        created_identity,
+                        lambda: _anchored_chain_is_attached(
+                            descriptors,
+                            names,
+                            identities,
+                            label,
+                        ),
+                    )
                 except OSError:
                     pass
             for descriptor in reversed(descriptors):
@@ -842,18 +855,18 @@ class _AnchoredDirectoryPath:
                 raise ValueError(f"{self.label} changed during {context}")
 
     def remove_created_final(self) -> None:
-        if not self.created_final or not self._parent_chain_is_attached():
+        if not self.created_final:
             return
         parent_fd = self._descriptors[-2]
         name = self._names[-1]
         try:
-            current = _directory_identity(
-                os.stat(name, dir_fd=parent_fd, follow_symlinks=False),
-                self.label,
+            _remove_owned_empty_directory_at(
+                parent_fd,
+                name,
+                self.identity,
+                self._parent_chain_is_attached,
             )
-            if current == self.identity:
-                os.rmdir(name, dir_fd=parent_fd)
-        except (FileNotFoundError, OSError, ValueError):
+        except OSError:
             pass
 
     def close(self) -> None:
@@ -908,12 +921,50 @@ def _directory_identity(value: os.stat_result, context: str) -> _EntryIdentity:
     return _EntryIdentity.from_stat(value)
 
 
+def _anchored_chain_is_attached(
+    descriptors: Sequence[int],
+    names: Sequence[str],
+    identities: Sequence[_EntryIdentity],
+    context: str,
+) -> bool:
+    """Prove that every held descriptor is still linked at its expected name."""
+    try:
+        if len(descriptors) != len(identities):
+            return False
+        if _directory_identity(os.fstat(descriptors[0]), context) != identities[0]:
+            return False
+        for index, name in enumerate(names):
+            expected = identities[index + 1]
+            if (
+                _directory_identity(
+                    os.stat(
+                        name,
+                        dir_fd=descriptors[index],
+                        follow_symlinks=False,
+                    ),
+                    context,
+                )
+                != expected
+                or _directory_identity(
+                    os.fstat(descriptors[index + 1]), context
+                )
+                != expected
+            ):
+                return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _open_or_create_child_directory(
     parent_fd: int,
     name: str,
     context: str,
+    parent_is_attached: Callable[[], bool],
+    owned: set[_EntryIdentity],
 ) -> _ChildDirectory:
     created = False
+    created_identity: _EntryIdentity | None = None
     try:
         try:
             before = os.stat(
@@ -930,6 +981,9 @@ def _open_or_create_child_directory(
                 follow_symlinks=False,
             )
         expected = _directory_identity(before, context)
+        if created:
+            created_identity = expected
+            owned.add(expected)
         return _open_child_directory(
             parent_fd,
             name,
@@ -938,9 +992,15 @@ def _open_or_create_child_directory(
             created=created,
         )
     except (OSError, ValueError) as exc:
-        if created:
+        if created_identity is not None:
             try:
-                _remove_entry_at(parent_fd, name)
+                _remove_owned_entry_at(
+                    parent_fd,
+                    name,
+                    created_identity,
+                    owned,
+                    parent_is_attached,
+                )
             except OSError:
                 pass
         if isinstance(exc, ValueError):
@@ -984,6 +1044,8 @@ def _create_private_child_directory(
     parent_fd: int,
     prefix: str,
     context: str,
+    parent_is_attached: Callable[[], bool],
+    owned: set[_EntryIdentity],
 ) -> _ChildDirectory:
     for _ in range(100):
         name = prefix + secrets.token_hex(12)
@@ -991,11 +1053,12 @@ def _create_private_child_directory(
             os.mkdir(name, 0o700, dir_fd=parent_fd)
         except FileExistsError:
             continue
+        expected: _EntryIdentity | None = None
         try:
             expected = _directory_identity(
-                os.stat(name, dir_fd=parent_fd, follow_symlinks=False),
-                context,
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False), context
             )
+            owned.add(expected)
             return _open_child_directory(
                 parent_fd,
                 name,
@@ -1004,10 +1067,17 @@ def _create_private_child_directory(
                 created=True,
             )
         except BaseException as exc:
-            try:
-                _remove_entry_at(parent_fd, name)
-            except OSError:
-                pass
+            if expected is not None:
+                try:
+                    _remove_owned_entry_at(
+                        parent_fd,
+                        name,
+                        expected,
+                        owned,
+                        parent_is_attached,
+                    )
+                except OSError:
+                    pass
             if isinstance(exc, OSError):
                 raise ValueError(f"unable to open {context}") from exc
             raise
@@ -1023,124 +1093,180 @@ def _entry_at(parent_fd: int, name: str) -> _EntryIdentity | None:
         return None
 
 
-def _write_parquet_at(parent_fd: int, name: str, table: pa.Table) -> _EntryIdentity:
+def _write_parquet_at(
+    parent_fd: int,
+    name: str,
+    table: pa.Table,
+    parent_is_attached: Callable[[], bool],
+    owned: set[_EntryIdentity],
+) -> _EntryIdentity:
     try:
         descriptor = os.open(name, _OUTPUT_FLAGS, 0o600, dir_fd=parent_fd)
     except OSError as exc:
         raise ValueError(f"unable to create staged parquet {name}") from exc
+    created_identity: _EntryIdentity | None = None
     try:
+        created = os.fstat(descriptor)
+        if not stat.S_ISREG(created.st_mode):
+            raise ValueError(f"staged parquet is not a regular file: {name}")
+        created_identity = _EntryIdentity.from_stat(created)
+        owned.add(created_identity)
+        if (
+            not parent_is_attached()
+            or _entry_at(parent_fd, name) != created_identity
+        ):
+            raise ValueError(f"staged parquet changed while opening: {name}")
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = -1
             pq.write_table(table, handle)
             handle.flush()
             os.fsync(handle.fileno())
-        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        if not stat.S_ISREG(current.st_mode):
-            raise ValueError(f"staged parquet is not a regular file: {name}")
-        return _EntryIdentity.from_stat(current)
+        if (
+            not parent_is_attached()
+            or _entry_at(parent_fd, name) != created_identity
+        ):
+            raise ValueError(f"staged parquet changed while writing: {name}")
+        return created_identity
     except BaseException:
         if descriptor >= 0:
             os.close(descriptor)
-        try:
-            os.unlink(name, dir_fd=parent_fd)
-        except FileNotFoundError:
-            pass
+        if created_identity is not None:
+            try:
+                _remove_owned_entry_at(
+                    parent_fd,
+                    name,
+                    created_identity,
+                    owned,
+                    parent_is_attached,
+                )
+            except OSError:
+                pass
         raise
 
 
-def _remove_tree_at(
+def _remove_owned_empty_directory_at(
     parent_fd: int,
     name: str,
     expected: _EntryIdentity,
-    still_attached: Callable[[], bool] | None = None,
+    still_attached: Callable[[], bool],
 ) -> None:
-    if still_attached is not None and not still_attached():
+    if not stat.S_ISDIR(expected.mode) or not still_attached():
         return
-    current = _entry_at(parent_fd, name)
-    if current is None or current != expected:
+    if _entry_at(parent_fd, name) != expected or not still_attached():
         return
-    if not stat.S_ISDIR(current.mode):
-        if still_attached is not None and not still_attached():
+    if _entry_at(parent_fd, name) != expected:
+        return
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        return
+
+
+def _remove_owned_tree_at(
+    parent_fd: int,
+    name: str,
+    expected: _EntryIdentity,
+    owned: set[_EntryIdentity],
+    still_attached: Callable[[], bool],
+) -> None:
+    """Delete only identities recorded as task-owned below an attached parent."""
+    if expected not in owned or not still_attached():
+        return
+    if _entry_at(parent_fd, name) != expected:
+        return
+    if not stat.S_ISDIR(expected.mode):
+        if not still_attached() or _entry_at(parent_fd, name) != expected:
             return
         os.unlink(name, dir_fd=parent_fd)
         return
+    _remove_owned_empty_directory_at(
+        parent_fd,
+        name,
+        expected,
+        still_attached,
+    )
+    if not still_attached() or _entry_at(parent_fd, name) != expected:
+        return
     descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
     try:
-        if _EntryIdentity.from_stat(os.fstat(descriptor)) != expected:
+        if (
+            _EntryIdentity.from_stat(os.fstat(descriptor)) != expected
+            or not still_attached()
+            or _entry_at(parent_fd, name) != expected
+        ):
             return
-        for child in os.listdir(descriptor):
-            if still_attached is not None and not still_attached():
+
+        def directory_is_attached() -> bool:
+            try:
+                return (
+                    still_attached()
+                    and _EntryIdentity.from_stat(os.fstat(descriptor)) == expected
+                    and _entry_at(parent_fd, name) == expected
+                )
+            except OSError:
+                return False
+
+        for child in sorted(os.listdir(descriptor)):
+            if not directory_is_attached():
                 return
             child_identity = _entry_at(descriptor, child)
-            if child_identity is not None:
-                _remove_tree_at(
+            if child_identity in owned:
+                _remove_owned_tree_at(
                     descriptor,
                     child,
                     child_identity,
-                    still_attached,
+                    owned,
+                    directory_is_attached,
                 )
     finally:
         os.close(descriptor)
-    if (
-        (still_attached is None or still_attached())
-        and _entry_at(parent_fd, name) == expected
-    ):
-        os.rmdir(name, dir_fd=parent_fd)
+    if not still_attached() or _entry_at(parent_fd, name) != expected:
+        return
+    _remove_owned_empty_directory_at(
+        parent_fd,
+        name,
+        expected,
+        still_attached,
+    )
 
 
-def _remove_entry_at(
+def _remove_owned_entry_at(
     parent_fd: int,
     name: str,
-    still_attached: Callable[[], bool] | None = None,
-) -> None:
-    """Remove one descriptor-relative entry recursively without following links."""
-    for _ in range(3):
-        if still_attached is not None and not still_attached():
-            return
-        current = _entry_at(parent_fd, name)
-        if current is None:
-            return
-        try:
-            _remove_tree_at(
-                parent_fd,
-                name,
-                current,
-                still_attached,
-            )
-        except OSError:
-            if stat.S_ISDIR(current.mode):
-                if still_attached is not None and not still_attached():
-                    return
-                try:
-                    os.rmdir(name, dir_fd=parent_fd)
-                    return
-                except OSError:
-                    pass
-            continue
-    if _entry_at(parent_fd, name) is not None:
-        raise OSError(f"unable to remove staged entry: {name}")
-
-
-def _remove_identity_below(
-    parent_fd: int,
     expected: _EntryIdentity,
+    owned: set[_EntryIdentity],
+    still_attached: Callable[[], bool],
+) -> None:
+    _remove_owned_tree_at(
+        parent_fd,
+        name,
+        expected,
+        owned,
+        still_attached,
+    )
+
+
+def _remove_owned_identities_below(
+    parent_fd: int,
+    owned: set[_EntryIdentity],
     still_attached: Callable[[], bool],
     visited: set[tuple[int, int]] | None = None,
 ) -> None:
-    """Remove a task-owned identity only while reachable below an anchored fd."""
+    """Find and remove recorded identities only below a live anchored root."""
     if visited is None:
         visited = set()
-    for name in os.listdir(parent_fd):
+    for name in sorted(os.listdir(parent_fd)):
         if not still_attached():
             return
         current = _entry_at(parent_fd, name)
         if current is None:
             continue
-        if current == expected:
-            _remove_tree_at(
+        if current in owned:
+            _remove_owned_tree_at(
                 parent_fd,
                 name,
-                expected,
+                current,
+                owned,
                 still_attached,
             )
             continue
@@ -1157,10 +1283,30 @@ def _remove_identity_below(
             if opened != current or linked != current:
                 continue
             visited.add(key)
-            _remove_identity_below(
+
+            def directory_is_attached(
+                parent_guard: Callable[[], bool] = still_attached,
+                parent_descriptor: int = parent_fd,
+                child_name: str = name,
+                child_descriptor: int = descriptor,
+                expected: _EntryIdentity = current,
+            ) -> bool:
+                try:
+                    return (
+                        parent_guard()
+                        and _EntryIdentity.from_stat(
+                            os.fstat(child_descriptor)
+                        )
+                        == expected
+                        and _entry_at(parent_descriptor, child_name) == expected
+                    )
+                except OSError:
+                    return False
+
+            _remove_owned_identities_below(
                 descriptor,
-                expected,
-                still_attached,
+                owned,
+                directory_is_attached,
                 visited,
             )
         except OSError:
@@ -1184,15 +1330,17 @@ def _publish(
     bundle: _ChildDirectory | None = None
     data_identity: _EntryIdentity | None = None
     tasks_identity: _EntryIdentity | None = None
-    data_published = False
-    tasks_published = False
     success = False
+    owned: set[_EntryIdentity] = set()
 
     def staging_is_linked() -> bool:
         return staging_anchor is not None and staging_anchor.is_attached()
 
     def meta_is_linked() -> bool:
         return staging_is_linked() and meta is not None and meta.is_attached()
+
+    def bundle_is_linked() -> bool:
+        return staging_is_linked() and bundle is not None and bundle.is_attached()
 
     try:
         source_anchor = _AnchoredDirectoryPath.open(
@@ -1218,6 +1366,8 @@ def _publish(
             staging_anchor.descriptor,
             "meta",
             "staging meta",
+            staging_is_linked,
+            owned,
         )
         if _entry_at(meta.descriptor, "tasks.parquet") is not None:
             raise ValueError("unsafe staging tasks entry already exists")
@@ -1225,13 +1375,21 @@ def _publish(
             staging_anchor.descriptor,
             ".v30-data-",
             "staging bundle",
+            staging_is_linked,
+            owned,
         )
         data = _open_or_create_child_directory(
             bundle.descriptor,
             "data",
             "staging bundle data",
+            bundle_is_linked,
+            owned,
         )
         data_identity = data.identity
+
+        def data_is_linked() -> bool:
+            return bundle_is_linked() and data.is_attached()
+
         chunk_directories: dict[int, _ChildDirectory] = {}
         try:
             for number, table in enumerate(packed):
@@ -1242,17 +1400,29 @@ def _publish(
                         data.descriptor,
                         f"chunk-{chunk_index:03d}",
                         "staging data chunk",
+                        data_is_linked,
+                        owned,
                     )
                     chunk_directories[chunk_index] = chunk
+
+                def chunk_is_linked(
+                    current: _ChildDirectory = chunk,
+                ) -> bool:
+                    return data_is_linked() and current.is_attached()
+
                 _write_parquet_at(
                     chunk.descriptor,
                     f"file-{number % chunks_size:03d}.parquet",
                     table,
+                    chunk_is_linked,
+                    owned,
                 )
             tasks_identity = _write_parquet_at(
                 bundle.descriptor,
                 "tasks.parquet",
                 task_table,
+                bundle_is_linked,
+                owned,
             )
             for chunk in chunk_directories.values():
                 chunk.verify("publication")
@@ -1271,7 +1441,6 @@ def _publish(
             staging_anchor.descriptor,
             "data",
         )
-        data_published = True
         if _entry_at(staging_anchor.descriptor, "data") != data_identity:
             raise ValueError("staging data changed during publication")
         staging_anchor.verify("publication")
@@ -1282,7 +1451,6 @@ def _publish(
             meta.descriptor,
             "tasks.parquet",
         )
-        tasks_published = True
         if _entry_at(meta.descriptor, "tasks.parquet") != tasks_identity:
             raise ValueError("staging tasks changed during publication")
         staging_anchor.verify("publication")
@@ -1302,70 +1470,28 @@ def _publish(
         os.fsync(staging_anchor.descriptor)
         success = True
     finally:
-        if not success:
-            if tasks_published and meta is not None and tasks_identity is not None:
-                if meta_is_linked():
-                    try:
-                        _remove_entry_at(
-                            meta.descriptor,
-                            "tasks.parquet",
-                            meta_is_linked,
-                        )
-                    except OSError:
-                        pass
-                if staging_is_linked() and staging_anchor is not None:
-                    try:
-                        _remove_identity_below(
-                            staging_anchor.descriptor,
-                            tasks_identity,
-                            staging_is_linked,
-                        )
-                    except OSError:
-                        pass
-            if (
-                data_published
-                and staging_anchor is not None
-                and data_identity is not None
-            ):
-                if staging_is_linked():
-                    try:
-                        _remove_entry_at(
-                            staging_anchor.descriptor,
-                            "data",
-                            staging_is_linked,
-                        )
-                    except OSError:
-                        pass
-                if staging_is_linked():
-                    try:
-                        _remove_identity_below(
-                            staging_anchor.descriptor,
-                            data_identity,
-                            staging_is_linked,
-                        )
-                    except OSError:
-                        pass
+        if not success and staging_anchor is not None and staging_is_linked():
+            try:
+                _remove_owned_identities_below(
+                    staging_anchor.descriptor,
+                    owned,
+                    staging_is_linked,
+                )
+            except OSError:
+                pass
         if bundle is not None:
             bundle.close()
-            if staging_anchor is not None:
-                if staging_is_linked():
-                    try:
-                        _remove_entry_at(
-                            staging_anchor.descriptor,
-                            bundle.name,
-                            staging_is_linked,
-                        )
-                    except OSError:
-                        pass
-                if staging_is_linked():
-                    try:
-                        _remove_identity_below(
-                            staging_anchor.descriptor,
-                            bundle.identity,
-                            staging_is_linked,
-                        )
-                    except OSError:
-                        pass
+            if success and staging_anchor is not None and staging_is_linked():
+                try:
+                    _remove_owned_entry_at(
+                        staging_anchor.descriptor,
+                        bundle.name,
+                        bundle.identity,
+                        owned,
+                        staging_is_linked,
+                    )
+                except OSError:
+                    pass
         if meta is not None:
             if (
                 not success
@@ -1374,7 +1500,12 @@ def _publish(
                 and meta_is_linked()
             ):
                 try:
-                    os.rmdir("meta", dir_fd=staging_anchor.descriptor)
+                    _remove_owned_empty_directory_at(
+                        staging_anchor.descriptor,
+                        "meta",
+                        meta.identity,
+                        meta_is_linked,
+                    )
                 except OSError:
                     pass
             meta.close()

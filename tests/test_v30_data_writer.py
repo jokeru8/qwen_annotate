@@ -820,7 +820,7 @@ def test_publication_does_not_clobber_destination_created_at_publish_time(
 
 
 @pytest.mark.parametrize("replacement", ["directory", "symlink"])
-def test_replaced_published_data_is_removed_without_following_replacement(
+def test_replaced_published_data_preserves_non_owned_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     replacement: str,
@@ -853,7 +853,7 @@ def test_replaced_published_data_is_removed_without_following_replacement(
             if replacement == "directory":
                 (staging / "data").mkdir()
                 (staging / "data/intruder.txt").write_text(
-                    "remove me",
+                    "preserve competitor",
                     encoding="utf-8",
                 )
             else:
@@ -875,8 +875,12 @@ def test_replaced_published_data_is_removed_without_following_replacement(
     assert injected
     assert source_tree_digest(root) == before_source
     assert _tree_digest(sink) == before_sink
-    assert not (staging / "data").exists()
-    assert not (staging / "data").is_symlink()
+    if replacement == "directory":
+        assert (staging / "data/intruder.txt").read_text(encoding="utf-8") == (
+            "preserve competitor"
+        )
+    else:
+        assert (staging / "data").is_symlink()
     assert not (staging / "displaced-data").exists()
     assert not (staging / "meta/tasks.parquet").exists()
     assert list(staging.glob(".v30-data-*")) == []
@@ -1099,7 +1103,7 @@ def test_task_owned_inode_is_removed_after_meta_moves_within_attached_staging(
     assert list(staging.glob(".v30-data-*")) == []
 
 
-def test_renamed_tasks_are_removed_only_while_meta_remains_attached(
+def test_renamed_tasks_cleanup_preserves_attached_competitor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1128,7 +1132,7 @@ def test_renamed_tasks_are_removed_only_while_meta_remains_attached(
                 staging / "meta/displaced-tasks.parquet",
             )
             (staging / "meta/tasks.parquet").write_text(
-                "remove attached competitor",
+                "preserve attached competitor",
                 encoding="utf-8",
             )
             injected = True
@@ -1152,7 +1156,9 @@ def test_renamed_tasks_are_removed_only_while_meta_remains_attached(
     assert injected
     assert source_tree_digest(root) == before_source
     assert not (staging / "data").exists()
-    assert not (staging / "meta/tasks.parquet").exists()
+    assert (staging / "meta/tasks.parquet").read_text(encoding="utf-8") == (
+        "preserve attached competitor"
+    )
     assert not (staging / "meta/displaced-tasks.parquet").exists()
     assert list(staging.glob(".v30-data-*")) == []
 
@@ -1186,6 +1192,232 @@ def test_bundle_open_failure_removes_owned_bundle_and_new_staging(
 
     assert source_tree_digest(root) == before_source
     assert not staging.exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_staging_open_failure_preserves_replacement_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "marker.txt").write_text("unchanged", encoding="utf-8")
+    relocated = outside / "relocated-owned-staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_open = os.open
+    replacement_identity: tuple[int, int] | None = None
+
+    def fail_staging_open(path: object, *args: object, **kwargs: object) -> int:
+        nonlocal replacement_identity
+        if path == "staging" and staging.is_dir():
+            os.replace(staging, relocated)
+            staging.mkdir()
+            value = staging.stat()
+            replacement_identity = value.st_dev, value.st_ino
+            raise OSError(errno.EMFILE, "injected staging open failure")
+        return actual_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(v30_data_writer.os, "open", fail_staging_open)
+
+    with pytest.raises(ValueError, match="unable to anchor staging path"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert replacement_identity is not None
+    assert source_tree_digest(root) == before_source
+    assert relocated.is_dir()
+    value = staging.stat()
+    assert (value.st_dev, value.st_ino) == replacement_identity
+    assert (outside / "marker.txt").read_text(encoding="utf-8") == "unchanged"
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_meta_open_failure_preserves_non_owned_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "marker.txt").write_text("unchanged", encoding="utf-8")
+    relocated = outside / "relocated-owned-meta"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_open = os.open
+    injected = False
+
+    def fail_meta_open(path: object, *args: object, **kwargs: object) -> int:
+        nonlocal injected
+        parent_fd = kwargs.get("dir_fd")
+        try:
+            parent_path = Path(os.readlink(f"/proc/self/fd/{parent_fd}"))
+        except (OSError, TypeError):
+            parent_path = Path()
+        if path == "meta" and parent_path == staging and not injected:
+            os.replace(staging / "meta", relocated)
+            (staging / "meta").mkdir()
+            (staging / "meta/competitor.txt").write_bytes(b"preserve competitor")
+            injected = True
+            raise OSError(errno.EMFILE, "injected meta open failure")
+        return actual_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(v30_data_writer.os, "open", fail_meta_open)
+
+    with pytest.raises(ValueError, match="unable to open staging meta"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert source_tree_digest(root) == before_source
+    assert relocated.is_dir()
+    assert (staging / "meta/competitor.txt").read_bytes() == b"preserve competitor"
+    assert (outside / "marker.txt").read_text(encoding="utf-8") == "unchanged"
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_private_bundle_open_failure_preserves_non_owned_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "marker.txt").write_text("unchanged", encoding="utf-8")
+    relocated = outside / "relocated-owned-bundle"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_open = os.open
+    bundle_name: str | None = None
+    injected = False
+
+    def fail_bundle_open(path: object, *args: object, **kwargs: object) -> int:
+        nonlocal bundle_name, injected
+        if (
+            isinstance(path, str)
+            and path.startswith(".v30-data-")
+            and not injected
+        ):
+            bundle_name = path
+            os.replace(staging / path, relocated)
+            (staging / path).mkdir()
+            (staging / path / "competitor.txt").write_bytes(b"preserve competitor")
+            injected = True
+            raise OSError(errno.EMFILE, "injected bundle open failure")
+        return actual_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(v30_data_writer.os, "open", fail_bundle_open)
+
+    with pytest.raises(ValueError, match="unable to open staging bundle"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert bundle_name is not None
+    assert source_tree_digest(root) == before_source
+    assert relocated.is_dir()
+    assert (staging / bundle_name / "competitor.txt").read_bytes() == (
+        b"preserve competitor"
+    )
+    assert (outside / "marker.txt").read_text(encoding="utf-8") == "unchanged"
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+@pytest.mark.parametrize("failure_phase", ["write", "close"])
+def test_parquet_failure_preserves_replacement_output_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "marker.txt").write_text("unchanged", encoding="utf-8")
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    replacement: Path | None = None
+    displaced: Path | None = None
+
+    def replace_output() -> None:
+        nonlocal replacement, displaced
+        candidates = list(
+            staging.glob(".v30-data-*/data/chunk-000/file-000.parquet")
+        )
+        assert len(candidates) == 1
+        replacement = candidates[0]
+        displaced = replacement.with_name("owned-file-000.parquet")
+        os.replace(replacement, displaced)
+        replacement.write_bytes(b"preserve competitor")
+
+    if failure_phase == "write":
+        def replace_output_then_fail(*args: object, **kwargs: object) -> None:
+            replace_output()
+            raise RuntimeError("injected parquet write failure")
+
+        monkeypatch.setattr(
+            v30_data_writer.pq,
+            "write_table",
+            replace_output_then_fail,
+        )
+        expected_error = "injected parquet write failure"
+    else:
+        actual_fdopen = os.fdopen
+
+        class FailingClose:
+            def __init__(self, descriptor: int, mode: str) -> None:
+                self.handle = actual_fdopen(descriptor, mode)
+
+            def __enter__(self) -> object:
+                return self.handle
+
+            def __exit__(self, *args: object) -> None:
+                self.handle.close()
+                replace_output()
+                raise OSError(errno.EIO, "injected parquet close failure")
+
+        monkeypatch.setattr(v30_data_writer.os, "fdopen", FailingClose)
+        expected_error = "injected parquet close failure"
+
+    with pytest.raises((RuntimeError, OSError), match=expected_error):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert replacement is not None
+    assert displaced is not None
+    assert source_tree_digest(root) == before_source
+    assert replacement.read_bytes() == b"preserve competitor"
+    assert not displaced.exists()
+    assert (outside / "marker.txt").read_text(encoding="utf-8") == "unchanged"
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
     assert len(os.listdir("/proc/self/fd")) == before_fds
 
 
@@ -1235,6 +1467,8 @@ def test_identity_failure_closes_untracked_directory_descriptor(
                         parent_fd,
                         "tracked",
                         "tracked child",
+                        lambda: True,
+                        set(),
                     )
                 assert not (parent / "tracked").exists()
         finally:
