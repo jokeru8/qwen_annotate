@@ -1768,6 +1768,256 @@ def test_successful_publication_close_failure_rolls_back_and_closes_everything(
     assert len(os.listdir("/proc/self/fd")) == before_fds
 
 
+def test_private_directory_birth_uses_open_descriptor_as_ownership_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    relocated = outside / "relocated-private-directory"
+    before_source = source_tree_digest(root)
+    actual_stat = os.stat
+    injected = False
+
+    def replace_private_directory_before_first_path_observation(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal injected
+        directory_fd = kwargs.get("dir_fd")
+        if (
+            not injected
+            and isinstance(path, str)
+            and path.startswith(".v30-dir-")
+            and isinstance(directory_fd, int)
+        ):
+            parent = Path(os.readlink(f"/proc/self/fd/{directory_fd}"))
+            os.replace(parent / path, relocated)
+            (parent / path).mkdir()
+            (parent / path / "competitor.txt").write_bytes(b"preserve competitor")
+            injected = True
+        return actual_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        v30_data_writer.os,
+        "stat",
+        replace_private_directory_before_first_path_observation,
+    )
+
+    with pytest.raises(ValueError, match="unable to anchor staging path") as raised:
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert "changed while establishing ownership" in str(raised.value.__cause__)
+    assert relocated.is_dir()
+    competitors = list(tmp_path.glob(".v30-dir-*/competitor.txt"))
+    assert len(competitors) == 1
+    assert competitors[0].read_bytes() == b"preserve competitor"
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+
+
+@pytest.mark.parametrize("reserved_entry", ["data", "chunk-000"])
+def test_bundle_directories_reject_preexisting_entries_instead_of_adopting_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reserved_entry: str,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    actual_create = v30_data_writer._create_private_child_directory
+    actual_publish = v30_data_writer._publish_private_directory
+    injected = False
+
+    def create_then_preoccupy_data(*args: object, **kwargs: object):
+        nonlocal injected
+        directory = actual_create(*args, **kwargs)
+        context = str(args[2])
+        if reserved_entry == "data" and context == "staging bundle":
+            bundle = Path(os.readlink(f"/proc/self/fd/{directory.descriptor}"))
+            (bundle / "data").mkdir()
+            (bundle / "data/competitor.txt").write_bytes(b"preserve competitor")
+            injected = True
+        return directory
+
+    def publish_then_preoccupy_chunk(*args: object, **kwargs: object):
+        nonlocal injected
+        directory = actual_publish(*args, **kwargs)
+        destination_name = str(args[2])
+        if reserved_entry == "chunk-000" and destination_name == "data":
+            data = Path(os.readlink(f"/proc/self/fd/{directory.descriptor}"))
+            (data / "chunk-000").mkdir()
+            (data / "chunk-000/competitor.txt").write_bytes(
+                b"preserve competitor"
+            )
+            injected = True
+        return directory
+
+    monkeypatch.setattr(
+        v30_data_writer,
+        "_create_private_child_directory",
+        create_then_preoccupy_data,
+    )
+    monkeypatch.setattr(
+        v30_data_writer,
+        "_publish_private_directory",
+        publish_then_preoccupy_chunk,
+    )
+
+    with pytest.raises((FileExistsError, ValueError), match="already exists"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    competitors = list(staging.glob(".v30-data-*/**/competitor.txt"))
+    assert len(competitors) == 1
+    assert competitors[0].read_bytes() == b"preserve competitor"
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+
+
+def test_incomplete_private_bundle_retirement_rolls_back_published_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    actual_rmdir = os.rmdir
+    injected = False
+
+    def fail_private_bundle_retirement(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal injected
+        if (
+            not injected
+            and isinstance(path, str)
+            and path.startswith(".v30-data-")
+        ):
+            injected = True
+            raise OSError(errno.ENOTEMPTY, "injected incomplete bundle retirement")
+        actual_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(v30_data_writer.os, "rmdir", fail_private_bundle_retirement)
+
+    with pytest.raises(ValueError, match="cleanup failed"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+
+
+def test_final_staging_anchor_close_failure_rolls_back_published_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_close = v30_data_writer._AnchoredDirectoryPath.close
+    injected = False
+
+    def close_then_fail_final_staging(anchor: object) -> None:
+        nonlocal injected
+        actual_close(anchor)
+        if getattr(anchor, "label") == "staging path" and not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected final staging anchor close failure")
+
+    monkeypatch.setattr(
+        v30_data_writer._AnchoredDirectoryPath,
+        "close",
+        close_then_fail_final_staging,
+    )
+
+    with pytest.raises(ValueError, match="cleanup failed"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert injected
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_attachment_loss_preserves_cleanup_errors_already_accumulated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    owned = parent / "a-owned"
+    owned.write_bytes(b"owned")
+    (parent / "z-competitor").write_bytes(b"competitor")
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    identity = v30_data_writer._EntryIdentity.from_stat(
+        os.stat("a-owned", dir_fd=parent_fd, follow_symlinks=False)
+    )
+    registry = v30_data_writer._OwnershipRegistry()
+    registry.register(identity)
+    actual_unlink = os.unlink
+    removal_failed = False
+
+    def fail_owned_removal(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal removal_failed
+        if path == "a-owned":
+            removal_failed = True
+            raise OSError(errno.EIO, "injected owned cleanup failure")
+        actual_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(v30_data_writer.os, "unlink", fail_owned_removal)
+    try:
+        with pytest.raises(ValueError, match="injected owned cleanup failure"):
+            v30_data_writer._remove_owned_identities_below(
+                parent_fd,
+                registry,
+                lambda: not removal_failed,
+            )
+    finally:
+        os.close(parent_fd)
+
+    assert owned.read_bytes() == b"owned"
+    assert (parent / "z-competitor").read_bytes() == b"competitor"
+
+
 @pytest.mark.parametrize("opening", ["anchored path", "child directory"])
 def test_identity_failure_closes_untracked_directory_descriptor(
     tmp_path: Path,

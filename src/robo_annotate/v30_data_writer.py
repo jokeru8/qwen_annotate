@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import errno
 import io
 import json
 import math
@@ -943,6 +942,10 @@ class _AnchoredDirectoryPath:
     def remove_created_final(self, registry: _OwnershipRegistry) -> None:
         if not self.created_final:
             return
+        self.remove_final_if_owned(registry)
+
+    def remove_final_if_owned(self, registry: _OwnershipRegistry) -> None:
+        """Remove the anchored final entry only when its exact identity is owned."""
         parent_fd = self._descriptors[-2]
         name = self._names[-1]
         _remove_owned_empty_directory_at(
@@ -1126,14 +1129,7 @@ def _create_private_child_directory(
     parent_is_attached: Callable[[], bool],
     registry: _OwnershipRegistry,
 ) -> _ChildDirectory:
-    """Create an unpredictable child and establish its identity before use.
-
-    `mkdirat` succeeds only for the freshly generated, previously absent name.
-    The name has 96 random bits and is never a public dataset name. The first
-    no-follow stat is therefore the ownership provenance; the held directory
-    descriptor and a second no-follow stat must match it before any write or
-    deterministic-name publication.
-    """
+    """Create an unpredictable child and pin it before observing its pathname."""
     for _ in range(100):
         name = prefix + secrets.token_hex(12)
         if not parent_is_attached():
@@ -1144,22 +1140,35 @@ def _create_private_child_directory(
             continue
         expected: _EntryIdentity | None = None
         descriptor = -1
+        validation_descriptor = -1
         try:
-            expected = _directory_identity(
-                os.stat(name, dir_fd=parent_fd, follow_symlinks=False), context
+            # The bytes-path open is the first operation after mkdir and pins
+            # the just-created object.  All ownership facts come from fstat;
+            # the pathname is only compared with that authoritative identity.
+            descriptor = os.open(
+                os.fsencode(name),
+                _DIRECTORY_FLAGS,
+                dir_fd=parent_fd,
             )
+            expected = _directory_identity(os.fstat(descriptor), context)
             registry.register(expected)
-            descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
-            opened = _directory_identity(os.fstat(descriptor), context)
             current = _directory_identity(
                 os.stat(name, dir_fd=parent_fd, follow_symlinks=False), context
             )
-            if (
-                not parent_is_attached()
-                or expected != opened
-                or opened != current
-            ):
+            if not parent_is_attached() or expected != current:
                 raise ValueError(f"{context} changed while establishing ownership")
+            validation_descriptor = os.open(
+                name,
+                _DIRECTORY_FLAGS,
+                dir_fd=parent_fd,
+            )
+            validation_identity = _directory_identity(
+                os.fstat(validation_descriptor), context
+            )
+            if validation_identity != expected:
+                raise ValueError(f"{context} changed while establishing ownership")
+            os.close(validation_descriptor)
+            validation_descriptor = -1
             return _ChildDirectory(
                 parent_fd,
                 name,
@@ -1170,6 +1179,11 @@ def _create_private_child_directory(
             )
         except BaseException as exc:
             failures = _CleanupFailures()
+            if validation_descriptor >= 0:
+                failures.attempt(
+                    "private validation descriptor close",
+                    lambda current=validation_descriptor: os.close(current),
+                )
             if descriptor >= 0:
                 failures.attempt(
                     "private directory descriptor close",
@@ -1178,7 +1192,7 @@ def _create_private_child_directory(
             if expected is not None:
                 failures.attempt(
                     "private directory removal",
-                    lambda: _remove_owned_entry_at(
+                    lambda: _remove_owned_empty_directory_at(
                         parent_fd,
                         name,
                         expected,
@@ -1266,7 +1280,7 @@ def _create_published_child_directory(
             failures.attempt("private directory close", private.close)
             failures.attempt(
                 "private directory removal",
-                lambda: _remove_owned_entry_at(
+                lambda: _remove_owned_empty_directory_at(
                     parent_fd,
                     private.name,
                     private.identity,
@@ -1407,18 +1421,13 @@ def _remove_owned_empty_directory_at(
         return
     if _entry_at(parent_fd, name) != expected:
         return
-    try:
-        _retire_and_delete_owned_entry_at(
-            parent_fd,
-            name,
-            expected,
-            registry,
-            still_attached,
-        )
-    except OSError as exc:
-        if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
-            return
-        raise
+    _retire_and_delete_owned_entry_at(
+        parent_fd,
+        name,
+        expected,
+        registry,
+        still_attached,
+    )
 
 
 def _remove_owned_tree_at(
@@ -1444,13 +1453,6 @@ def _remove_owned_tree_at(
             still_attached,
         )
         return
-    _remove_owned_empty_directory_at(
-        parent_fd,
-        name,
-        expected,
-        registry,
-        still_attached,
-    )
     if not still_attached() or _entry_at(parent_fd, name) != expected:
         return
     descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
@@ -1544,7 +1546,7 @@ def _remove_owned_identities_below(
     failures = _CleanupFailures()
     for name in sorted(os.listdir(parent_fd)):
         if not still_attached():
-            return
+            break
         current = _entry_at(parent_fd, name)
         if current is None:
             continue
@@ -1676,7 +1678,7 @@ def _publish(
             staging_is_linked,
             registry,
         )
-        data = _open_or_create_child_directory(
+        data = _create_published_child_directory(
             bundle.descriptor,
             "data",
             "staging bundle data",
@@ -1695,7 +1697,7 @@ def _publish(
                 chunk_index = number // chunks_size
                 chunk = chunk_directories.get(chunk_index)
                 if chunk is None:
-                    chunk = _open_or_create_child_directory(
+                    chunk = _create_published_child_directory(
                         data.descriptor,
                         f"chunk-{chunk_index:03d}",
                         "staging data chunk",
@@ -1843,8 +1845,43 @@ def _publish(
                 "created staging root removal",
                 lambda: staging_anchor.remove_created_final(registry),
             )
+        staging_identity = (
+            staging_anchor.identity if staging_anchor is not None else None
+        )
+        before_staging_close = len(failures.errors)
         if staging_anchor is not None:
             failures.attempt("staging anchor close", staging_anchor.close)
+        if (
+            success
+            and len(failures.errors) > before_staging_close
+            and staging_identity is not None
+        ):
+            recovery: _AnchoredDirectoryPath | None = None
+            try:
+                recovery = _AnchoredDirectoryPath.open(
+                    staging,
+                    "staging rollback path",
+                    create_final=False,
+                )
+                if recovery.identity != staging_identity:
+                    raise ValueError("staging path changed before rollback recovery")
+                failures.attempt(
+                    "publication rollback after final anchor close failure",
+                    lambda: _remove_owned_identities_below(
+                        recovery.descriptor,
+                        registry,
+                        recovery.is_attached,
+                    ),
+                )
+                failures.attempt(
+                    "created staging root removal after final close failure",
+                    lambda: recovery.remove_final_if_owned(registry),
+                )
+            except BaseException as exc:
+                failures.errors.append(("staging rollback recovery", exc))
+            finally:
+                if recovery is not None:
+                    failures.attempt("staging rollback anchor close", recovery.close)
 
         if primary_error is None and not failures.errors:
             registry.release_all()
