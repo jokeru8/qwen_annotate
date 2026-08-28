@@ -26,6 +26,60 @@ export function localFrameForMediaTime(time, fps, source) {
   return Math.max(0, Math.min(lastFrame, localFrame));
 }
 
+export function installVideoSliceGuard(video, source, fps, onClamp = () => {}) {
+  const frameCount = Math.max(1, Math.round((source.to_timestamp - source.from_timestamp) * fps));
+  const lastFrame = frameCount - 1;
+  const endTarget = mediaTimeForFrame(lastFrame, fps, source);
+  const events = ["loadedmetadata", "pause", "play", "ratechange", "seeked", "seeking", "timeupdate"];
+  let cleaned = false;
+  let correcting = false;
+  let timer = null;
+
+  const clearTimer = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+  const stopAt = (frame, edge) => {
+    if (cleaned || correcting) return;
+    clearTimer(); correcting = true;
+    try {
+      if (!video.paused) video.pause();
+      const target = mediaTimeForFrame(frame, fps, source);
+      if (Math.abs(video.currentTime - target) > 1e-9) video.currentTime = target;
+      onClamp(frame, edge);
+    } finally {
+      correcting = false;
+    }
+  };
+  const inspect = () => {
+    if (cleaned || correcting) return;
+    clearTimer();
+    const time = video.currentTime;
+    if (!Number.isFinite(time)) return;
+    if (time < source.from_timestamp - 1e-9) {
+      stopAt(0, "start");
+      return;
+    }
+    if (time > endTarget + 1e-9 || (!video.paused && time >= endTarget - 1e-9)) {
+      stopAt(lastFrame, "end");
+      return;
+    }
+    if (video.paused) return;
+    const rate = Number.isFinite(video.playbackRate) && Math.abs(video.playbackRate) > 1e-9
+      ? Math.abs(video.playbackRate)
+      : 1;
+    timer = setTimeout(inspect, Math.max(4, (endTarget - time) / rate * 1000));
+  };
+
+  for (const event of events) video.addEventListener(event, inspect);
+  if (video.readyState !== 0) inspect();
+  return () => {
+    if (cleaned) return;
+    cleaned = true; clearTimer();
+    for (const event of events) video.removeEventListener(event, inspect);
+  };
+}
+
 export function segmentAt(frame, startSubtask, boundaries, subtaskCount) {
   let index = startSubtask;
   for (const boundary of boundaries) {
@@ -161,7 +215,8 @@ export function finishSelection(view, generation) {
 const palette = ["#45c4a0", "#56a8e8", "#a98aef", "#ef9f62", "#df6f8f", "#8dbb54"];
 const state = {session: null, episodes: [], detail: null, frame: 0, boundaries: [], start: 0,
   filter: "all", takeover: false, primary: null, videos: new Map(), syncing: false, drafts: new Map(),
-  loading: false, saving: false, selectionGeneration: 0, seekGeneration: 0, syncLoopId: null};
+  loading: false, saving: false, selectionGeneration: 0, seekGeneration: 0, syncLoopId: null,
+  videoGuardCleanups: [], sliceGuardActive: false};
 
 const $ = id => document.getElementById(id);
 const api = async (url, options) => {
@@ -242,6 +297,8 @@ async function selectEpisode(index) {
 }
 
 function renderVideos() {
+  for (const cleanup of state.videoGuardCleanups) cleanup();
+  state.videoGuardCleanups = [];
   state.videos.clear(); const root = $("video-grid"); root.replaceChildren(); root.className = "video-grid";
   const cameras = Object.keys(state.detail.videos);
   for (const camera of cameras) {
@@ -251,27 +308,49 @@ function renderVideos() {
     const frame = document.createElement("span"); frame.className = "camera-frame"; frame.textContent = "帧 0";
     card.append(video, label, frame); card.onclick = togglePlay;
     video.addEventListener("click", event => { event.preventDefault(); event.stopPropagation(); togglePlay(); });
-    state.videos.set(camera, video); root.append(card);
+    state.videos.set(camera, video);
+    state.videoGuardCleanups.push(installVideoSliceGuard(
+      video, state.detail.videos[camera], state.session.fps, frameIndex => clampPlaybackToFrame(frameIndex),
+    ));
+    root.append(card);
   }
 }
 
 function primaryVideo() { return state.videos.get(state.primary); }
+function clampPlaybackToFrame(frame) {
+  if (!state.detail || state.sliceGuardActive) return;
+  state.sliceGuardActive = true;
+  try {
+    pauseAll();
+    state.frame = Math.max(0, Math.min(state.detail.episode_length - 1, frame));
+    for (const [camera, video] of state.videos) {
+      if (video.readyState === 0) continue;
+      const targetTime = mediaTimeForFrame(state.frame, state.session.fps, state.detail.videos[camera]);
+      if (Math.abs(video.currentTime - targetTime) > 1e-9) video.currentTime = targetTime;
+    }
+    $("play-button").textContent = "▶";
+    updateFrameUI();
+  } finally {
+    state.sliceGuardActive = false;
+  }
+}
 function syncFromMaster(master) {
   const masterSource = state.detail.videos[state.primary];
-  const crossedEnd = master.currentTime >= masterSource.to_timestamp;
-  state.frame = crossedEnd
-    ? state.detail.episode_length - 1
-    : Math.min(state.detail.episode_length - 1, localFrameForMediaTime(master.currentTime, state.session.fps, masterSource));
-  if (crossedEnd) {
-    pauseAll();
-    $("play-button").textContent = "▶";
+  const endTarget = mediaTimeForFrame(state.detail.episode_length - 1, state.session.fps, masterSource);
+  if (master.currentTime < masterSource.from_timestamp) {
+    clampPlaybackToFrame(0);
+    return;
   }
+  if (master.currentTime >= endTarget) {
+    clampPlaybackToFrame(state.detail.episode_length - 1);
+    return;
+  }
+  state.frame = Math.min(state.detail.episode_length - 1, localFrameForMediaTime(master.currentTime, state.session.fps, masterSource));
   for (const [camera, video] of state.videos) {
     const targetTime = mediaTimeForFrame(state.frame, state.session.fps, state.detail.videos[camera]);
     if (video !== master && !video.seeking && needsFrameCorrection(video.currentTime, targetTime, state.session.fps)) {
       video.currentTime = targetTime;
     }
-    if (crossedEnd && video === master && needsFrameCorrection(video.currentTime, targetTime, state.session.fps)) video.currentTime = targetTime;
   }
   updateFrameUI();
 }
@@ -299,7 +378,14 @@ async function seek(frame) {
 function pauseAll() { stopSyncLoop(); for (const video of state.videos.values()) video.pause(); }
 async function togglePlay() {
   const master = primaryVideo(); if (!master) return;
-  if (master.paused) { await seek(state.frame); await Promise.all([...state.videos.values()].map(video => video.play().catch(() => {}))); $("play-button").textContent = "❚❚"; startSyncLoop(); }
+  if (master.paused) {
+    await seek(state.frame);
+    await Promise.all([...state.videos.values()].map(video => video.play().catch(() => {})));
+    if ([...state.videos.values()].some(video => video.paused)) {
+      pauseAll(); $("play-button").textContent = "▶"; return;
+    }
+    $("play-button").textContent = "❚❚"; startSyncLoop();
+  }
   else { pauseAll(); $("play-button").textContent = "▶"; }
 }
 function step(delta) { pauseAll(); $("play-button").textContent = "▶"; void seek(state.frame + delta); }

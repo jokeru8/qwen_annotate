@@ -21,6 +21,20 @@ def _run_js(expression: str) -> object:
     return json.loads(completed.stdout)
 
 
+def _run_slice_guard_js(body: str) -> object:
+    return _run_js("(async()=>{class Video{"
+        "constructor(time,{paused=true,seeking=false}={}){this._time=time;this.paused=paused;"
+        "this.seeking=seeking;this.playbackRate=1;this.pauseCalls=0;this.listeners=new Map();}"
+        "addEventListener(name,fn){if(!this.listeners.has(name))this.listeners.set(name,new Set());this.listeners.get(name).add(fn);}"
+        "removeEventListener(name,fn){this.listeners.get(name)?.delete(fn);}"
+        "emit(name){for(const fn of [...(this.listeners.get(name)||[])])fn();}"
+        "listenerCount(){return [...this.listeners.values()].reduce((total,items)=>total+items.size,0);}"
+        "pause(){this.pauseCalls+=1;this.paused=true;this.emit('pause');}"
+        "get currentTime(){return this._time;}set currentTime(value){this._time=value;}}"
+        f"{body}"
+        "})()")
+
+
 def test_timeline_helpers_use_boundary_as_first_frame_of_next_subtask() -> None:
     result = _run_js("({"
         "frames:[m.frameFromTime(1.26,20,100),m.frameFromTime(99,20,100)],"
@@ -116,6 +130,84 @@ def test_shared_seek_preserves_v21_zero_offset_behavior() -> None:
         "await m.seekVideosToFrame(videos,28,28,{eye:{from_timestamp:0,to_timestamp:2}});"
         "return [...videos.values()].map(v=>v.currentTime);})()")
     assert result == [1]
+
+
+def test_slice_guard_clamps_seeking_jump_without_animation_frame() -> None:
+    result = _run_slice_guard_js(
+        "const video=new Video(1.2);const events=[];"
+        "const cleanup=m.installVideoSliceGuard(video,{from_timestamp:1.2,to_timestamp:2.8},5,"
+        "(frame,edge)=>events.push({frame,edge}));"
+        "video.paused=false;video.seeking=true;video._time=2.91;video.emit('seeking');cleanup();"
+        "return {time:video.currentTime,paused:video.paused,seeking:video.seeking,"
+        "pauseCalls:video.pauseCalls,events};"
+    )
+
+    assert result == {
+        "time": pytest.approx(2.6),
+        "paused": True,
+        "seeking": True,
+        "pauseCalls": 1,
+        "events": [{"frame": 7, "edge": "end"}],
+    }
+    assert result["time"] < 2.8
+
+
+def test_slice_guards_use_each_camera_frame_safe_endpoint() -> None:
+    result = _run_slice_guard_js(
+        "const main=new Video(1.2,{paused:false});const wrist=new Video(3.4,{paused:false});"
+        "const events=[];"
+        "const cleanMain=m.installVideoSliceGuard(main,{from_timestamp:1.2,to_timestamp:2.8},5,"
+        "(frame,edge)=>events.push(['main',frame,edge]));"
+        "const cleanWrist=m.installVideoSliceGuard(wrist,{from_timestamp:3.4,to_timestamp:5.0},5,"
+        "(frame,edge)=>events.push(['wrist',frame,edge]));"
+        "main._time=3;wrist._time=5.2;"
+        "main.emit('timeupdate');wrist.emit('timeupdate');cleanMain();cleanWrist();"
+        "return {times:[main.currentTime,wrist.currentTime],paused:[main.paused,wrist.paused],events};"
+    )
+
+    assert result["times"] == pytest.approx([2.6, 4.8])
+    assert result["times"][0] < 2.8 and result["times"][1] < 5.0
+    assert result["paused"] == [True, True]
+    assert result["events"] == [["main", 7, "end"], ["wrist", 7, "end"]]
+
+
+def test_slice_guard_preboundary_timer_stops_without_media_or_animation_event() -> None:
+    result = _run_slice_guard_js(
+        "const video=new Video(0,{paused:false});const events=[];"
+        "const cleanup=m.installVideoSliceGuard(video,{from_timestamp:0,to_timestamp:0.04},100,"
+        "(frame,edge)=>events.push({frame,edge}));"
+        "setTimeout(()=>{video._time=0.031;},20);"
+        "await new Promise(resolve=>setTimeout(resolve,60));cleanup();"
+        "return {time:video.currentTime,paused:video.paused,pauseCalls:video.pauseCalls,events};"
+    )
+
+    assert result == {
+        "time": pytest.approx(0.03),
+        "paused": True,
+        "pauseCalls": 1,
+        "events": [{"frame": 3, "edge": "end"}],
+    }
+    assert result["time"] < 0.04
+
+
+def test_slice_guard_cleanup_removes_listeners_and_pending_timer() -> None:
+    result = _run_slice_guard_js(
+        "const video=new Video(0,{paused:false});"
+        "const cleanup=m.installVideoSliceGuard(video,{from_timestamp:0,to_timestamp:0.04},100,()=>{});"
+        "const installed=video.listenerCount();cleanup();const afterCleanup=video.listenerCount();"
+        "await new Promise(resolve=>setTimeout(resolve,60));"
+        "const cleanupAgain=m.installVideoSliceGuard(video,{from_timestamp:0,to_timestamp:0.04},100,()=>{});"
+        "const reinstalled=video.listenerCount();cleanupAgain();"
+        "return {installed,afterCleanup,reinstalled,final:video.listenerCount(),"
+        "time:video.currentTime,pauseCalls:video.pauseCalls};"
+    )
+
+    assert result["installed"] > 0
+    assert result["afterCleanup"] == 0
+    assert result["reinstalled"] == result["installed"]
+    assert result["final"] == 0
+    assert result["time"] == 0
+    assert result["pauseCalls"] == 0
 
 
 def test_episode_drafts_are_copied_and_restored_independently() -> None:
