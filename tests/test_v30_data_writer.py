@@ -12,7 +12,7 @@ import pytest
 from PIL import Image
 
 from robo_annotate.lerobot import inspect_dataset
-from robo_annotate import v30_data_writer, writer_publication
+from robo_annotate import secure_tree, v30_data_writer, writer_publication
 from robo_annotate.v30_data_writer import write_v30_data_subset
 from tests.v30_fixtures import (
     make_lerobot_v30_fixture,
@@ -1543,6 +1543,178 @@ def test_private_directory_publication_rejects_replacement_without_owning_it(
     assert (outside / "marker.txt").read_bytes() == b"unchanged"
 
 
+def test_private_directory_birth_rejects_replacement_before_first_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    relocated = outside / "relocated-newborn-bundle"
+    before_source = source_tree_digest(root)
+    actual_mkdir = writer_publication.os.mkdir
+    actual_register = writer_publication._OwnershipRegistry.register
+    registered: list[writer_publication._EntryIdentity] = []
+    bundle_name: str | None = None
+    competitor_identity: writer_publication._EntryIdentity | None = None
+
+    def replace_before_first_open(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal bundle_name, competitor_identity
+        actual_mkdir(path, *args, **kwargs)
+        if (
+            isinstance(path, str)
+            and path.startswith(".v30-data-")
+            and bundle_name is None
+        ):
+            parent_fd = kwargs.get("dir_fd")
+            assert isinstance(parent_fd, int)
+            parent = Path(os.readlink(f"/proc/self/fd/{parent_fd}"))
+            bundle_name = path
+            os.replace(parent / path, relocated)
+            actual_mkdir(path, 0o700, dir_fd=parent_fd)
+            (parent / path / "competitor.txt").write_bytes(
+                b"preserve newborn competitor"
+            )
+            competitor_identity = writer_publication._EntryIdentity.from_stat(
+                os.stat(path, dir_fd=parent_fd, follow_symlinks=False)
+            )
+
+    def record_registration(
+        registry: writer_publication._OwnershipRegistry,
+        identity: writer_publication._EntryIdentity,
+    ) -> None:
+        registered.append(identity)
+        actual_register(registry, identity)
+
+    monkeypatch.setattr(
+        writer_publication.os,
+        "mkdir",
+        replace_before_first_open,
+    )
+    monkeypatch.setattr(
+        writer_publication._OwnershipRegistry,
+        "register",
+        record_registration,
+    )
+
+    with pytest.raises(ValueError, match="changed while establishing ownership"):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    assert bundle_name is not None
+    assert competitor_identity is not None
+    assert competitor_identity not in registered
+    assert relocated.is_dir()
+    assert list(relocated.iterdir()) == []
+    assert (staging / bundle_name / "competitor.txt").read_bytes() == (
+        b"preserve newborn competitor"
+    )
+    assert list((staging / bundle_name).iterdir()) == [
+        staging / bundle_name / "competitor.txt"
+    ]
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert source_tree_digest(root) == before_source
+
+
+@pytest.mark.parametrize(
+    "replacement_kind",
+    ["file", "empty_directory", "nonempty_directory"],
+)
+def test_retirement_quarantines_before_deleting_and_preserves_a_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    target = parent / "owned"
+    if replacement_kind == "file":
+        target.write_bytes(b"owned bytes")
+    else:
+        target.mkdir()
+    displaced = parent / "displaced-owned"
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    identity = writer_publication._EntryIdentity.from_stat(
+        os.stat("owned", dir_fd=parent_fd, follow_symlinks=False)
+    )
+    registry = writer_publication._OwnershipRegistry()
+    registry.register(identity)
+    actual_rename = writer_publication.rename_noreplace_at
+    injected = False
+
+    def swap_at_quarantine_move(
+        source_fd: int,
+        source_name: str,
+        destination_fd: int,
+        destination_name: str,
+    ) -> None:
+        nonlocal injected
+        if (
+            not injected
+            and source_fd == parent_fd
+            and source_name == "owned"
+            and destination_fd == parent_fd
+            and destination_name.startswith(".writer-retire-")
+        ):
+            os.replace(target, displaced)
+            if replacement_kind == "file":
+                target.write_bytes(b"preserve replacement bytes")
+            else:
+                target.mkdir()
+                if replacement_kind == "nonempty_directory":
+                    (target / "competitor.txt").write_bytes(
+                        b"preserve replacement directory"
+                    )
+            injected = True
+        actual_rename(
+            source_fd,
+            source_name,
+            destination_fd,
+            destination_name,
+        )
+
+    monkeypatch.setattr(
+        writer_publication,
+        "rename_noreplace_at",
+        swap_at_quarantine_move,
+    )
+    try:
+        with pytest.raises(ValueError, match="changed during retirement"):
+            writer_publication._retire_and_delete_owned_entry_at(
+                parent_fd,
+                "owned",
+                identity,
+                registry,
+                lambda: True,
+            )
+    finally:
+        os.close(parent_fd)
+
+    assert injected
+    assert displaced.exists()
+    assert target.exists()
+    if replacement_kind == "file":
+        assert target.read_bytes() == b"preserve replacement bytes"
+    elif replacement_kind == "nonempty_directory":
+        assert (target / "competitor.txt").read_bytes() == (
+            b"preserve replacement directory"
+        )
+    assert registry.is_owned(identity)
+    assert list(parent.glob(".writer-retire-*")) == []
+
+
 @pytest.mark.parametrize("entry_kind", ["file", "directory"])
 def test_retiring_owned_identity_prevents_reentrant_inode_reuse_cleanup(
     tmp_path: Path,
@@ -1768,6 +1940,152 @@ def test_successful_publication_close_failure_rolls_back_and_closes_everything(
     assert len(os.listdir("/proc/self/fd")) == before_fds
 
 
+def test_source_close_only_failure_rolls_back_and_attempts_every_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_fsync = os.fsync
+    actual_close = secure_tree.SecureFile.close
+    close_phase = False
+    injected = False
+    attempted: list[str] = []
+
+    def mark_final_publication(descriptor: int) -> None:
+        nonlocal close_phase
+        actual_fsync(descriptor)
+        try:
+            target = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        except OSError:
+            return
+        if target == staging:
+            close_phase = True
+
+    def close_then_fail_first_source(item: secure_tree.SecureFile) -> None:
+        nonlocal injected
+        was_open = item._fd >= 0 or item._parent_fd >= 0
+        if close_phase and was_open:
+            attempted.append(item.relative)
+        actual_close(item)
+        if close_phase and was_open and not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected secure source close failure")
+
+    monkeypatch.setattr(v30_data_writer.os, "fsync", mark_final_publication)
+    monkeypatch.setattr(
+        secure_tree.SecureFile,
+        "close",
+        close_then_fail_first_source,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="injected secure source close failure",
+    ):
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    expected_data = dataset.episodes[0].data.path.relative_to(root).as_posix()
+    assert injected
+    assert {"meta/tasks.parquet", "meta/stats.json", expected_data} <= set(
+        attempted
+    )
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_source_close_failure_is_secondary_to_primary_publication_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    actual_publish = writer_publication.WriterPublication.publish
+    actual_close = secure_tree.SecureFile.close
+    close_phase = False
+    injected = False
+    attempted: list[str] = []
+
+    def publish_then_fail(
+        publication: writer_publication.WriterPublication,
+        source_parent_fd: int,
+        source_name: str,
+        expected: writer_publication._EntryIdentity,
+        destination_parent_fd: int,
+        destination_name: str,
+        destination_is_attached,
+        context: str,
+    ) -> None:
+        nonlocal close_phase
+        actual_publish(
+            publication,
+            source_parent_fd,
+            source_name,
+            expected,
+            destination_parent_fd,
+            destination_name,
+            destination_is_attached,
+            context,
+        )
+        if destination_name == "tasks.parquet":
+            close_phase = True
+            raise RuntimeError("primary publication failure")
+
+    def close_then_fail_first_source(item: secure_tree.SecureFile) -> None:
+        nonlocal injected
+        was_open = item._fd >= 0 or item._parent_fd >= 0
+        if close_phase and was_open:
+            attempted.append(item.relative)
+        actual_close(item)
+        if close_phase and was_open and not injected:
+            injected = True
+            raise OSError(errno.EIO, "secondary secure source close failure")
+
+    monkeypatch.setattr(
+        writer_publication.WriterPublication,
+        "publish",
+        publish_then_fail,
+    )
+    monkeypatch.setattr(
+        secure_tree.SecureFile,
+        "close",
+        close_then_fail_first_source,
+    )
+
+    with pytest.raises(RuntimeError, match="primary publication failure") as raised:
+        write_v30_data_subset(
+            root,
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    expected_data = dataset.episodes[0].data.path.relative_to(root).as_posix()
+    assert injected
+    assert {"meta/tasks.parquet", "meta/stats.json", expected_data} <= set(
+        attempted
+    )
+    assert any(
+        "secondary secure source close failure" in note
+        for note in getattr(raised.value, "__notes__", ())
+    )
+    assert not (staging / "data").exists()
+    assert not (staging / "meta/tasks.parquet").exists()
+
+
 def test_private_directory_birth_uses_open_descriptor_as_ownership_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1914,10 +2232,10 @@ def test_incomplete_private_bundle_retirement_rolls_back_published_outputs(
         if (
             not injected
             and isinstance(path, str)
-            and path.startswith(".v30-data-")
+            and path.startswith(".writer-retire-")
         ):
             injected = True
-            raise OSError(errno.ENOTEMPTY, "injected incomplete bundle retirement")
+            return
         actual_rmdir(path, *args, **kwargs)
 
     monkeypatch.setattr(v30_data_writer.os, "rmdir", fail_private_bundle_retirement)
@@ -1998,7 +2316,7 @@ def test_attachment_loss_preserves_cleanup_errors_already_accumulated(
 
     def fail_owned_removal(path: object, *args: object, **kwargs: object) -> None:
         nonlocal removal_failed
-        if path == "a-owned":
+        if isinstance(path, str) and path.startswith(".writer-retire-"):
             removal_failed = True
             raise OSError(errno.EIO, "injected owned cleanup failure")
         actual_unlink(path, *args, **kwargs)
@@ -2014,7 +2332,10 @@ def test_attachment_loss_preserves_cleanup_errors_already_accumulated(
     finally:
         os.close(parent_fd)
 
-    assert owned.read_bytes() == b"owned"
+    quarantined = list(parent.glob(".writer-retire-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_bytes() == b"owned"
+    assert not owned.exists()
     assert (parent / "z-competitor").read_bytes() == b"competitor"
 
 

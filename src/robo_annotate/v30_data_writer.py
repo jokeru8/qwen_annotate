@@ -762,6 +762,7 @@ def _publish(
         "v3 staging publication",
         bundle_context="staging bundle",
     )
+    publication.add_close_action("source tree close", source_tree.close)
     committed = False
     primary_error: BaseException | None = None
     try:

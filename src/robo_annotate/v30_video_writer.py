@@ -91,6 +91,7 @@ def write_v30_video_subset(
             "v3 video publication",
             bundle_context="staging video bundle",
         )
+        publication.add_close_action("source tree close", tree.close)
         committed = False
         primary_error: BaseException | None = None
         try:

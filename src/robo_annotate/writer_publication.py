@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import secrets
 import stat
+import struct
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +27,126 @@ _OUTPUT_FILE_FLAGS = (
     | getattr(os, "O_NOFOLLOW", 0)
 )
 _PRIVATE_DIRECTORY_PREFIX = ".writer-dir-"
+_RETIREMENT_PREFIX = ".writer-retire-"
+_IN_CREATE = 0x00000100
+_IN_DELETE = 0x00000200
+_IN_MOVED_FROM = 0x00000040
+_IN_MOVED_TO = 0x00000080
+_IN_DELETE_SELF = 0x00000400
+_IN_MOVE_SELF = 0x00000800
+_IN_Q_OVERFLOW = 0x00004000
+_IN_IGNORED = 0x00008000
+_IN_ISDIR = 0x40000000
+_IN_ONLYDIR = 0x01000000
+_INOTIFY_EVENT = struct.Struct("iIII")
+_BIRTH_WATCH_MASK = (
+    _IN_CREATE
+    | _IN_DELETE
+    | _IN_MOVED_FROM
+    | _IN_MOVED_TO
+    | _IN_DELETE_SELF
+    | _IN_MOVE_SELF
+    | _IN_ONLYDIR
+)
+
+
+class _DirectoryBirthWitness:
+    """Use an inode-bound inotify watch to prove one private mkdir birth."""
+
+    def __init__(self, descriptor: int, watch: int, context: str) -> None:
+        self.descriptor = descriptor
+        self.watch = watch
+        self.context = context
+        self._events: list[tuple[int, bytes]] = []
+
+    @classmethod
+    def open(cls, parent_fd: int, context: str) -> "_DirectoryBirthWitness":
+        libc = ctypes.CDLL(None, use_errno=True)
+        initialize = getattr(libc, "inotify_init1", None)
+        add_watch = getattr(libc, "inotify_add_watch", None)
+        if initialize is None or add_watch is None:
+            raise ValueError(
+                "private directory creation requires Linux inotify"
+            )
+        initialize.argtypes = [ctypes.c_int]
+        initialize.restype = ctypes.c_int
+        add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        add_watch.restype = ctypes.c_int
+        descriptor = initialize(os.O_NONBLOCK | os.O_CLOEXEC)
+        if descriptor < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), context)
+        watch = add_watch(
+            descriptor,
+            os.fsencode(f"/proc/self/fd/{parent_fd}"),
+            _BIRTH_WATCH_MASK,
+        )
+        if watch >= 0:
+            return cls(descriptor, watch, context)
+        error = ctypes.get_errno()
+        try:
+            os.close(descriptor)
+        except OSError as close_error:
+            failure = ValueError(
+                f"unable to witness {context} private directory creation"
+            )
+            failure.add_note(
+                f"Secondary inotify close failure: {close_error}"
+            )
+            raise failure from OSError(error, os.strerror(error), context)
+        raise OSError(error, os.strerror(error), context)
+
+    def verify_birth(self, name: str) -> None:
+        """Require one mkdir event and reject every mutation of its name."""
+        self._events.extend(self._read_events())
+        expected_name = os.fsencode(name)
+        relevant = [
+            mask
+            for mask, event_name in self._events
+            if event_name == expected_name
+        ]
+        global_failure = any(
+            mask & (_IN_Q_OVERFLOW | _IN_IGNORED | _IN_DELETE_SELF | _IN_MOVE_SELF)
+            for mask, _ in self._events
+        )
+        if global_failure or relevant != [_IN_CREATE | _IN_ISDIR]:
+            raise ValueError(
+                f"{self.context} changed while establishing ownership"
+            )
+
+    def _read_events(self) -> list[tuple[int, bytes]]:
+        events: list[tuple[int, bytes]] = []
+        while True:
+            try:
+                payload = os.read(self.descriptor, 64 * 1024)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                if exc.errno == errno.EAGAIN:
+                    break
+                raise ValueError(
+                    f"unable to witness {self.context} private directory creation"
+                ) from exc
+            if not payload:
+                break
+            offset = 0
+            while offset < len(payload):
+                if len(payload) - offset < _INOTIFY_EVENT.size:
+                    raise ValueError("truncated private directory birth event")
+                _, mask, _, length = _INOTIFY_EVENT.unpack_from(payload, offset)
+                offset += _INOTIFY_EVENT.size
+                if length > len(payload) - offset:
+                    raise ValueError("truncated private directory birth event")
+                raw_name = payload[offset : offset + length]
+                offset += length
+                events.append((mask, raw_name.split(b"\0", 1)[0]))
+        return events
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            descriptor = self.descriptor
+            self.descriptor = -1
+            os.close(descriptor)
 
 
 @dataclass(frozen=True)
@@ -537,29 +660,51 @@ def _create_private_child_directory(
     parent_is_attached: Callable[[], bool],
     registry: _OwnershipRegistry,
 ) -> _ChildDirectory:
-    """Create an unpredictable child and pin it before observing its pathname."""
+    """Create and witness one private child before accepting its pinned identity."""
     for _ in range(100):
         name = prefix + secrets.token_hex(12)
         if not parent_is_attached():
             raise ValueError(f"{context} parent changed before creation")
+        witness: _DirectoryBirthWitness | None = None
         try:
+            witness = _DirectoryBirthWitness.open(parent_fd, context)
+            if not parent_is_attached():
+                raise ValueError(f"{context} parent changed before creation")
             os.mkdir(name, 0o700, dir_fd=parent_fd)
         except FileExistsError:
+            if witness is not None:
+                witness.close()
             continue
+        except BaseException as exc:
+            failures = _CleanupFailures()
+            if witness is not None:
+                failures.attempt("private birth witness close", witness.close)
+            primary = (
+                exc
+                if isinstance(exc, ValueError)
+                else ValueError(f"unable to create {context}")
+            )
+            failures.finish(primary, context)
+            if primary is exc:
+                raise
+            raise primary from exc
         expected: _EntryIdentity | None = None
         descriptor = -1
         validation_descriptor = -1
+        registered = False
         try:
-            # The bytes-path open is the first operation after mkdir and pins
-            # the just-created object.  All ownership facts come from fstat;
-            # the pathname is only compared with that authoritative identity.
+            # Pin the first object reachable after mkdir, derive authority only
+            # from fstat, and let the event witness reject a replaced pathname.
             descriptor = os.open(
                 os.fsencode(name),
                 _DIRECTORY_FLAGS,
                 dir_fd=parent_fd,
             )
             expected = _directory_identity(os.fstat(descriptor), context)
+            assert witness is not None
+            witness.verify_birth(name)
             registry.register(expected)
+            registered = True
             current = _directory_identity(
                 os.stat(name, dir_fd=parent_fd, follow_symlinks=False), context
             )
@@ -577,6 +722,22 @@ def _create_private_child_directory(
                 raise ValueError(f"{context} changed while establishing ownership")
             os.close(validation_descriptor)
             validation_descriptor = -1
+            witness.verify_birth(name)
+            witness.close()
+            witness = None
+            if (
+                not parent_is_attached()
+                or _directory_identity(
+                    os.stat(
+                        name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    ),
+                    context,
+                )
+                != expected
+            ):
+                raise ValueError(f"{context} changed while establishing ownership")
             return _ChildDirectory(
                 parent_fd,
                 name,
@@ -587,6 +748,8 @@ def _create_private_child_directory(
             )
         except BaseException as exc:
             failures = _CleanupFailures()
+            if witness is not None:
+                failures.attempt("private birth witness close", witness.close)
             if validation_descriptor >= 0:
                 failures.attempt(
                     "private validation descriptor close",
@@ -597,7 +760,7 @@ def _create_private_child_directory(
                     "private directory descriptor close",
                     lambda current=descriptor: os.close(current),
                 )
-            if expected is not None:
+            if expected is not None and registered:
                 failures.attempt(
                     "private directory removal",
                     lambda: _remove_owned_empty_directory_at(
@@ -769,24 +932,147 @@ def _retire_and_delete_owned_entry_at(
     registry: _OwnershipRegistry,
     still_attached: Callable[[], bool],
 ) -> bool:
-    """Make an identity unmatchable before its deleting syscall can free it."""
+    """Quarantine one name atomically, then delete only its owned identity."""
     if not still_attached() or _entry_at(parent_fd, name) != expected:
         return False
     if not registry.begin_retirement(expected):
         return False
+    quarantine: str | None = None
+    retirement_descriptor = -1
+    retired = False
+    primary_error: BaseException | None = None
     try:
         if not still_attached() or _entry_at(parent_fd, name) != expected:
             registry.restore(expected)
             return False
+        for _ in range(100):
+            candidate = _RETIREMENT_PREFIX + secrets.token_hex(12)
+            if not still_attached():
+                raise ValueError("owned entry parent changed during retirement")
+            try:
+                rename_noreplace_at(
+                    parent_fd,
+                    name,
+                    parent_fd,
+                    candidate,
+                )
+            except FileExistsError:
+                continue
+            quarantine = candidate
+            break
+        if quarantine is None:
+            raise ValueError("unable to reserve an owned entry quarantine")
+        if not still_attached():
+            raise ValueError("owned entry parent changed during retirement")
+        flags = _DIRECTORY_FLAGS if stat.S_ISDIR(expected.mode) else (
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+        retirement_descriptor = os.open(
+            quarantine,
+            flags,
+            dir_fd=parent_fd,
+        )
+        pinned = _EntryIdentity.from_stat(os.fstat(retirement_descriptor))
+        quarantined = _entry_at(parent_fd, quarantine)
+        if pinned != expected or quarantined != expected:
+            error = ValueError("owned entry changed during retirement")
+            try:
+                _restore_quarantined_entry_at(
+                    parent_fd,
+                    quarantine,
+                    name,
+                    still_attached,
+                )
+            except BaseException as restore_error:
+                error.add_note(
+                    "Secondary quarantine restore failure: "
+                    f"{type(restore_error).__name__}: {restore_error}"
+                )
+            raise error
+        if not still_attached():
+            raise ValueError("owned entry parent changed during retirement")
         if stat.S_ISDIR(expected.mode):
-            os.rmdir(name, dir_fd=parent_fd)
+            os.rmdir(quarantine, dir_fd=parent_fd)
         else:
-            os.unlink(name, dir_fd=parent_fd)
-    except BaseException:
+            os.unlink(quarantine, dir_fd=parent_fd)
+        after = os.fstat(retirement_descriptor)
+        if _EntryIdentity.from_stat(after) != expected or after.st_nlink != 0:
+            raise ValueError("owned entry retirement was incomplete")
+        retired = True
+        if not still_attached():
+            raise ValueError("owned entry parent changed during retirement")
+        if _entry_at(parent_fd, quarantine) is not None:
+            raise ValueError("owned entry quarantine was reused during retirement")
+    except BaseException as exc:
+        primary_error = exc
+
+    if retirement_descriptor >= 0:
+        try:
+            os.close(retirement_descriptor)
+        except BaseException as close_error:
+            if primary_error is None:
+                primary_error = close_error
+            else:
+                primary_error.add_note(
+                    "Secondary retirement descriptor close failure: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )
+
+    if retired:
+        registry.finish_retirement(expected)
+    else:
         registry.restore(expected)
-        raise
-    registry.finish_retirement(expected)
+        quarantined_after_failure: _EntryIdentity | None = None
+        if quarantine is not None:
+            try:
+                quarantined_after_failure = _entry_at(parent_fd, quarantine)
+            except BaseException as inspection_error:
+                if primary_error is None:
+                    primary_error = inspection_error
+                else:
+                    primary_error.add_note(
+                        "Secondary owned quarantine inspection failure: "
+                        f"{type(inspection_error).__name__}: {inspection_error}"
+                    )
+        if quarantined_after_failure == expected:
+            assert quarantine is not None
+            try:
+                _restore_quarantined_entry_at(
+                    parent_fd,
+                    quarantine,
+                    name,
+                    still_attached,
+                )
+            except BaseException as restore_error:
+                assert primary_error is not None
+                primary_error.add_note(
+                    "Secondary owned quarantine restore failure: "
+                    f"{type(restore_error).__name__}: {restore_error}"
+                )
+    if primary_error is not None:
+        raise primary_error
     return True
+
+
+def _restore_quarantined_entry_at(
+    parent_fd: int,
+    quarantine: str,
+    original_name: str,
+    still_attached: Callable[[], bool],
+) -> None:
+    """Restore a quarantined entry without replacing any current original."""
+    if not still_attached():
+        raise ValueError("owned entry parent changed before quarantine restore")
+    if _entry_at(parent_fd, quarantine) is None:
+        return
+    if not still_attached():
+        raise ValueError("owned entry parent changed before quarantine restore")
+    rename_noreplace_at(
+        parent_fd,
+        quarantine,
+        parent_fd,
+        original_name,
+    )
 
 
 def _remove_owned_empty_directory_at(
@@ -1020,6 +1306,7 @@ class WriterPublication:
         self.bundle: _ChildDirectory | None = None
         self._children: list[_ChildDirectory] = []
         self._files: list[OwnedFile] = []
+        self._close_actions: list[tuple[str, Callable[[], None]]] = []
         self._finished = False
 
     @classmethod
@@ -1175,6 +1462,18 @@ class WriterPublication:
         self._files.append(output)
         return output
 
+    def add_close_action(
+        self,
+        context: str,
+        action: Callable[[], None],
+    ) -> None:
+        """Make an external descriptor closure part of transaction success."""
+        if self._finished:
+            raise ValueError(f"{self.context} publication was already finalized")
+        if not context or not callable(action):
+            raise TypeError("close action requires a context and callable")
+        self._close_actions.append((context, action))
+
     def finish(
         self,
         primary: BaseException | None,
@@ -1194,6 +1493,9 @@ class WriterPublication:
         self._children.clear()
         if self.bundle is not None:
             failures.attempt(f"{self.context} bundle close", self.bundle.close)
+        for context, action in self._close_actions:
+            failures.attempt(context, action)
+        self._close_actions.clear()
 
         if (
             committed

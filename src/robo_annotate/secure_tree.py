@@ -18,6 +18,26 @@ _READ_BLOCK = 1024 * 1024
 _RENAME_NOREPLACE = 1
 
 
+def _finish_close_failures(
+    errors: list[tuple[str, BaseException]],
+    primary: BaseException | None,
+    context: str,
+) -> None:
+    if not errors:
+        return
+    details = "; ".join(
+        f"{label}: {type(error).__name__}: {error}"
+        for label, error in errors
+    )
+    if primary is not None:
+        primary.add_note(f"Secondary {context} cleanup failures: {details}")
+        return
+    first = errors[0][1]
+    failure = ValueError(f"{context} cleanup failed: {first}")
+    failure.add_note(f"Cleanup failures: {details}")
+    raise failure from first
+
+
 def rename_noreplace_at(
     source_dir_fd: int,
     source_name: str,
@@ -115,7 +135,9 @@ class SecureFile:
                 os.stat(self._name, dir_fd=self._parent_fd, follow_symlinks=False)
             )
         except OSError as exc:
-            raise ValueError(f"{self._context} changed during validation: {self.relative}") from exc
+            raise ValueError(
+                f"{self._context} changed during validation: {self.relative}"
+            ) from exc
         if descriptor != self._identity or entry != self._identity:
             raise ValueError(f"{self._context} changed during validation: {self.relative}")
 
@@ -169,18 +191,37 @@ class SecureFile:
         return digest.hexdigest()
 
     def close(self) -> None:
+        errors: list[tuple[str, BaseException]] = []
         if self._fd >= 0:
-            os.close(self._fd)
+            descriptor = self._fd
             self._fd = -1
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                errors.append(("file descriptor close", exc))
         if self._parent_fd >= 0:
-            os.close(self._parent_fd)
+            descriptor = self._parent_fd
             self._parent_fd = -1
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                errors.append(("parent descriptor close", exc))
+        _finish_close_failures(errors, None, f"secure file {self.relative}")
 
     def __enter__(self) -> "SecureFile":
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        self.close()
+        try:
+            self.close()
+        except BaseException as close_error:
+            if exc is None:
+                raise
+            _finish_close_failures(
+                [("secure file close", close_error)],
+                exc,
+                f"secure file {self.relative}",
+            )
 
 
 class SecureTree:
@@ -229,21 +270,44 @@ class SecureTree:
         self._open_files: list[SecureFile] = []
 
     def close(self) -> None:
-        for item in self._open_files:
-            item.close()
+        errors: list[tuple[str, BaseException]] = []
+        opened = self._open_files.copy()
         self._open_files.clear()
+        for item in opened:
+            try:
+                item.close()
+            except BaseException as exc:
+                errors.append((f"source file {item.relative}", exc))
         if self._root_fd >= 0:
-            os.close(self._root_fd)
+            descriptor = self._root_fd
             self._root_fd = -1
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                errors.append(("source root descriptor close", exc))
         if self._root_parent_fd >= 0:
-            os.close(self._root_parent_fd)
+            descriptor = self._root_parent_fd
             self._root_parent_fd = -1
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                errors.append(("source parent descriptor close", exc))
+        _finish_close_failures(errors, None, f"secure tree {self.label}")
 
     def __enter__(self) -> "SecureTree":
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        self.close()
+        try:
+            self.close()
+        except BaseException as close_error:
+            if exc is None:
+                raise
+            _finish_close_failures(
+                [("secure tree close", close_error)],
+                exc,
+                f"secure tree {self.label}",
+            )
 
     @property
     def directory_identity(self) -> tuple[int, int]:
@@ -321,7 +385,8 @@ class SecureTree:
     def verify(self) -> None:
         """Prove every scanned entry still names the same object, without following links."""
         for relative in self.scan():
-            with self.open_file(relative, max(1, self._entries[relative].size), "tree entry") as opened:
+            size = max(1, self._entries[relative].size)
+            with self.open_file(relative, size, "tree entry") as opened:
                 opened.verify()
         if _Identity.from_stat(os.fstat(self._root_fd)) != self._root_identity:
             raise ValueError(f"{self.label} root changed during validation")

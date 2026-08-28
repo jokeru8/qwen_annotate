@@ -8,7 +8,7 @@ import av
 import numpy as np
 import pytest
 
-from robo_annotate import v30_video_writer, writer_publication
+from robo_annotate import secure_tree, v30_video_writer, writer_publication
 from robo_annotate.lerobot import inspect_dataset
 from robo_annotate.v30_video_writer import write_v30_video_subset
 from tests.v30_fixtures import (
@@ -496,6 +496,70 @@ def test_owned_video_descriptor_close_failure_rolls_back_published_videos(
         )
 
     assert injected
+    assert source_tree_digest(root) == before_source
+    assert not (staging / "videos").exists()
+    assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+def test_video_source_close_failure_rolls_back_and_attempts_every_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    staging = tmp_path / "staging"
+    before_source = source_tree_digest(root)
+    before_fds = len(os.listdir("/proc/self/fd"))
+    actual_fsync = os.fsync
+    actual_close = secure_tree.SecureFile.close
+    close_phase = False
+    injected = False
+    attempted: list[str] = []
+
+    def mark_final_publication(descriptor: int) -> None:
+        nonlocal close_phase
+        actual_fsync(descriptor)
+        try:
+            target = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+        except OSError:
+            return
+        if target == staging:
+            close_phase = True
+
+    def close_then_fail_first_source(item: secure_tree.SecureFile) -> None:
+        nonlocal injected
+        was_open = item._fd >= 0 or item._parent_fd >= 0
+        if close_phase and was_open:
+            attempted.append(item.relative)
+        actual_close(item)
+        if close_phase and was_open and not injected:
+            injected = True
+            raise OSError(errno.EIO, "injected video source close failure")
+
+    monkeypatch.setattr(v30_video_writer.os, "fsync", mark_final_publication)
+    monkeypatch.setattr(
+        secure_tree.SecureFile,
+        "close",
+        close_then_fail_first_source,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="injected video source close failure",
+    ):
+        write_v30_video_subset(
+            staging,
+            dataset,
+            [0],
+            read_v30_info(root),
+        )
+
+    expected_sources = {
+        reference.path.relative_to(root).as_posix()
+        for reference in dataset.episodes[0].videos.values()
+    }
+    assert injected
+    assert expected_sources <= set(attempted)
     assert source_tree_digest(root) == before_source
     assert not (staging / "videos").exists()
     assert len(os.listdir("/proc/self/fd")) == before_fds
