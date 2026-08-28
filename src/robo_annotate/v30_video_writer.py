@@ -21,6 +21,13 @@ from .lerobot import (
     video_fps_matches,
 )
 from .secure_tree import SecureFile, SecureTree
+from .v30_depth import (
+    DepthMetadata,
+    depth_codes,
+    depth_frame,
+    depth_metadata,
+    is_depth_feature,
+)
 from .writer_publication import (
     OwnedFile,
     WriterPublication,
@@ -59,6 +66,11 @@ class _VideoSpec:
     width: int
     height: int
     fps: float
+    depth: DepthMetadata | None
+
+    @property
+    def bytes_per_pixel(self) -> int:
+        return 2 if self.depth is not None else 3
 
 
 def write_v30_video_subset(
@@ -335,9 +347,14 @@ def _video_spec(camera: str, value: object, fps: float) -> _VideoSpec:
         fps,
     ):
         raise ValueError(f"video feature fps does not match info.fps: {camera}")
-    if shape not in ([height, width, 3], [3, height, width]):
+    depth = depth_metadata(value, camera) if is_depth_feature(value) else None
+    channels = 1 if depth is not None else 3
+    if shape not in ([height, width, channels], [channels, height, width]):
         raise ValueError(f"video feature shape is invalid: {camera}")
-    return _VideoSpec(width=width, height=height, fps=fps)
+    declared_channels = details.get("video.channels")
+    if declared_channels is not None and declared_channels != channels:
+        raise ValueError(f"video feature channel count is invalid: {camera}")
+    return _VideoSpec(width=width, height=height, fps=fps, depth=depth)
 
 
 def _positive_finite_number(value: object, context: str) -> float:
@@ -381,7 +398,7 @@ def _pack_episodes(
     current: list[EpisodeInfo] = []
     current_weight = 0
     for episode in selected:
-        weight = spec.width * spec.height * 3 * episode.length
+        weight = spec.width * spec.height * spec.bytes_per_pixel * episode.length
         if current and current_weight + weight > size_limit:
             groups.append(current)
             current = []
@@ -459,13 +476,18 @@ def _encode_video_file(
     episode_ranges: list[tuple[EpisodeInfo, int, int]] = []
     try:
         container = av.open(str(output.proc_path), mode="w", format="mp4")
-        stream = container.add_stream("libx264", rate=rate)
+        codec = spec.depth.codec if spec.depth is not None else "libx264"
+        stream = container.add_stream(codec, rate=rate)
         stream.width = spec.width
         stream.height = spec.height
-        stream.pix_fmt = "yuv420p"
+        stream.pix_fmt = spec.depth.pix_fmt if spec.depth is not None else "yuv420p"
         stream.time_base = Fraction(rate.denominator, rate.numerator)
         frame_time_base = stream.time_base
-        stream.options = {"crf": "0", "preset": "fast"}
+        stream.options = (
+            {"x265-params": "lossless=1"}
+            if spec.depth is not None
+            else {"crf": "0", "preset": "fast"}
+        )
         for episode in episodes:
             episode_start = frames_written
             reference = episode.videos[camera]
@@ -477,7 +499,11 @@ def _encode_video_file(
                 spec,
             )
             for array in frames:
-                frame = av.VideoFrame.from_ndarray(array, format="rgb24")
+                frame = (
+                    depth_frame(array, spec.depth.pix_fmt)
+                    if spec.depth is not None
+                    else av.VideoFrame.from_ndarray(array, format="rgb24")
+                )
                 frame.pts = frames_written
                 frame.time_base = frame_time_base
                 for packet in stream.encode(frame):
@@ -504,7 +530,7 @@ def _decode_episode_frames(
     reference: EpisodeVideoRef,
     expected_length: int,
     spec: _VideoSpec,
-) -> Iterator[np.ndarray[Any, np.dtype[np.uint8]]]:
+) -> Iterator[np.ndarray[Any, Any]]:
     if not isinstance(reference, EpisodeVideoRef):
         raise TypeError("video reference must be an EpisodeVideoRef")
     if type(expected_length) is not int or expected_length <= 0:
@@ -539,6 +565,11 @@ def _decode_episode_frames(
             raise ValueError("video shard has invalid stream time base")
         if (stream.width, stream.height) != (spec.width, spec.height):
             raise ValueError("video shard dimensions do not match feature shape")
+        if spec.depth is not None and (
+            stream.pix_fmt != spec.depth.pix_fmt
+            or stream.codec.canonical_name != spec.depth.codec
+        ):
+            raise ValueError("depth video codec or pixel format disagrees with metadata")
 
         seek_time = max(0.0, reference.from_timestamp - 1.0 / spec.fps)
         container.seek(
@@ -577,11 +608,16 @@ def _decode_episode_frames(
             if local_index > next_index:
                 missing = list(range(next_index, local_index))
                 raise ValueError(f"video shard is missing episode frame(s): {missing}")
-            array = frame.to_ndarray(format="rgb24")
-            if array.shape != (spec.height, spec.width, 3):
-                raise ValueError("decoded video frame has an invalid shape")
-            if array.dtype != np.uint8:
-                raise ValueError("decoded video frame must be uint8 RGB")
+            if spec.depth is not None:
+                array = depth_codes(frame)
+                if array.shape != (spec.height, spec.width):
+                    raise ValueError("decoded depth frame has an invalid shape")
+            else:
+                array = frame.to_ndarray(format="rgb24")
+                if array.shape != (spec.height, spec.width, 3):
+                    raise ValueError("decoded video frame has an invalid shape")
+                if array.dtype != np.uint8:
+                    raise ValueError("decoded video frame must be uint8 RGB")
             next_index += 1
             yield array
         if next_index != expected_length:
@@ -630,6 +666,11 @@ def _validate_output_video(
             raise ValueError("rebuilt video has invalid stream time base")
         if (stream.width, stream.height) != (spec.width, spec.height):
             raise ValueError("rebuilt video dimensions do not match feature shape")
+        if spec.depth is not None and (
+            stream.pix_fmt != spec.depth.pix_fmt
+            or stream.codec.canonical_name != spec.depth.codec
+        ):
+            raise ValueError("rebuilt depth codec or pixel format differs from metadata")
         frame_count = 0
         tolerance = 0.5 / spec.fps + 1e-9
         for frame_count, frame in enumerate(container.decode(stream), start=1):
@@ -644,6 +685,10 @@ def _validate_output_video(
                 abs_tol=tolerance,
             ):
                 raise ValueError("rebuilt video is not CFR")
+            if spec.depth is not None:
+                array = depth_codes(frame)
+                if array.shape != (spec.height, spec.width):
+                    raise ValueError("rebuilt depth frame has an invalid shape")
         if frame_count != expected_frames:
             raise ValueError("rebuilt video frame count does not match encoded frames")
     except BaseException as exc:

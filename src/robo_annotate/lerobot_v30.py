@@ -29,8 +29,10 @@ from .lerobot import (
     _positive_number,
     _require_configured_cameras,
     _required_string,
+    data_timestamp_matches,
     video_fps_matches,
 )
+from .v30_depth import depth_metadata, is_depth_feature
 
 
 DATA_FIELDS = {"chunk_index", "file_index"}
@@ -510,11 +512,7 @@ def _validate_data_slice(
             )
         timestamp = row["timestamp"]
         expected_timestamp = local_index / fps
-        if (
-            type(timestamp) not in (int, float)
-            or not math.isfinite(timestamp)
-            or not math.isclose(float(timestamp), expected_timestamp, abs_tol=1e-6)
-        ):
+        if not data_timestamp_matches(timestamp, local_index, fps):
             raise ValueError(
                 f"Malformed data row for episode {episode_index}: timestamp at local row "
                 f"{local_index} is {timestamp!r}, expected {expected_timestamp}"
@@ -550,10 +548,24 @@ def _validate_video_features(
             raise ValueError(
                 f"Malformed video feature {camera!r}: video.fps is {video_fps}, expected {fps}"
             )
-        if shape not in ([3, height, width], [height, width, 3]):
+        depth = is_depth_feature(feature)
+        channels = 1 if depth else 3
+        if depth:
+            depth_metadata(feature, camera)
+        if shape not in (
+            [channels, height, width],
+            [height, width, channels],
+        ):
+            kind = "depth" if depth else "RGB"
             raise ValueError(
                 f"Malformed video feature {camera!r}: shape {shape} disagrees with "
-                f"official CHW/HWC shape for {height}x{width} RGB video"
+                f"official CHW/HWC shape for {height}x{width} {kind} video"
+            )
+        declared_channels = video_info.get("video.channels")
+        if declared_channels is not None and declared_channels != channels:
+            raise ValueError(
+                f"Malformed video feature {camera!r}: video.channels is "
+                f"{declared_channels!r}, expected {channels}"
             )
         result[camera] = (width, height)
     return result

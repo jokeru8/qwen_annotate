@@ -17,6 +17,7 @@ from robo_annotate.publication_metadata import (
 )
 from robo_annotate.workspace import EpisodeRecord, RunManifest, WorkspaceStore
 from tests.v30_fixtures import (
+    decoded_depth_values,
     make_lerobot_v30_fixture,
     make_v30_config,
     official_core_file_digests,
@@ -200,8 +201,14 @@ def selectively_accepted_v30_workspace(
     accepted: tuple[int, ...],
     *,
     size_limits: tuple[int, int] | None = (100, 200),
+    depth_cameras: tuple[str, ...] = (),
+    depth_unit: str = "mm",
 ) -> tuple[Path, Path, dict]:
-    source = make_lerobot_v30_fixture(tmp_path)
+    source = make_lerobot_v30_fixture(
+        tmp_path,
+        depth_cameras=depth_cameras,
+        depth_unit=depth_unit,
+    )
     info_path = source / "meta/info.json"
     info = json.loads(info_path.read_text(encoding="utf-8"))
     if size_limits is None:
@@ -356,6 +363,53 @@ def test_v30_accepted_only_removes_middle_episode_and_rebuilds_every_reference(
         "Perform the selected manipulation for source episode 0.",
         "Perform the selected manipulation for source episode 2.",
     ]
+
+
+@pytest.mark.parametrize(
+    ("depth_unit", "minimum_mean"),
+    [("mm", 500.0), ("m", 0.5)],
+)
+def test_v30_accepted_only_repacks_official_depth_and_rebuilds_unit_stats(
+    tmp_path: Path,
+    depth_unit: str,
+    minimum_mean: float,
+) -> None:
+    from robo_annotate.converter import convert_dataset
+    from robo_annotate.release_validator import validate_release
+
+    depth = "observation.depth.main"
+    work, source, services = selectively_accepted_v30_workspace(
+        tmp_path,
+        accepted=(0, 2),
+        depth_cameras=(depth,),
+        depth_unit=depth_unit,
+    )
+
+    report = convert_dataset(
+        work,
+        tmp_path / "accepted-depth",
+        accepted_only=True,
+        services=services,
+    )
+
+    source_values = decoded_depth_values(
+        source / f"videos/{depth}/chunk-000/file-000.mp4"
+    )
+    output_values = decoded_depth_values(
+        report.output / f"videos/{depth}/chunk-000/file-000.mp4"
+    )
+    assert output_values == source_values[:6] + source_values[14:]
+    stats = json.loads(
+        (report.output / "meta/stats.json").read_text(encoding="utf-8")
+    )[depth]
+    assert (
+        len(stats["mean"])
+        == len(stats["mean"][0])
+        == len(stats["mean"][0][0])
+        == 1
+    )
+    assert stats["mean"][0][0][0] > minimum_mean
+    assert validate_release(report.output, services=services).valid
 
 
 def test_v30_accepted_only_rejects_empty_selection_without_output(

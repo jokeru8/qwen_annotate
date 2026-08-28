@@ -4,6 +4,7 @@ import json
 import math
 import os
 import stat
+import struct
 from collections.abc import Callable
 from pathlib import Path
 from string import Formatter
@@ -16,6 +17,7 @@ from robo_annotate.config import AnnotationConfig
 
 
 VIDEO_FPS_TOLERANCE = 0.01
+DATA_TIMESTAMP_ABS_TOLERANCE = 1e-6
 _MAX_INFO_JSON_BYTES = 16 * 1024 * 1024
 DatasetVersion = Literal["v2.1", "v3.0"]
 
@@ -32,6 +34,39 @@ def video_fps_matches(measured: float, expected: float) -> bool:
         and measured > 0
         and expected > 0
         and abs(float(measured) - float(expected)) <= VIDEO_FPS_TOLERANCE
+    )
+
+
+def data_timestamp_matches(measured: object, frame_index: int, fps: float) -> bool:
+    """Accept the exact or IEEE-754 float32-rounded official frame timestamp."""
+    if (
+        isinstance(measured, bool)
+        or not isinstance(measured, (int, float))
+        or not math.isfinite(float(measured))
+        or type(frame_index) is not int
+        or frame_index < 0
+        or isinstance(fps, bool)
+        or not isinstance(fps, (int, float))
+        or not math.isfinite(float(fps))
+        or fps <= 0
+    ):
+        return False
+    expected = frame_index / float(fps)
+    try:
+        rounded_float32 = struct.unpack("!f", struct.pack("!f", expected))[0]
+    except (OverflowError, struct.error):
+        return False
+    actual = float(measured)
+    return math.isclose(
+        actual,
+        expected,
+        rel_tol=0.0,
+        abs_tol=DATA_TIMESTAMP_ABS_TOLERANCE,
+    ) or math.isclose(
+        actual,
+        rounded_float32,
+        rel_tol=0.0,
+        abs_tol=DATA_TIMESTAMP_ABS_TOLERANCE,
     )
 
 

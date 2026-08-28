@@ -22,7 +22,11 @@ import numpy as np
 from robo_annotate.converter import convert_dataset
 from tests.test_converter_v30 import selectively_accepted_v30_workspace
 from tests.test_release_validator_v30 import accepted_v30_workspace
-from tests.v30_fixtures import expected_color, make_lerobot_v30_fixture
+from tests.v30_fixtures import (
+    expected_color,
+    expected_depth_mm,
+    make_lerobot_v30_fixture,
+)
 
 
 _EXPECTED_MAIN_CAMERA_FRAMES = {
@@ -51,6 +55,7 @@ _EXPECTED_MAIN_CAMERA_FRAMES = {
         10: (1, 2, 4),
     },
 }
+_DEPTH_CAMERA = "observation.depth.main"
 
 
 def _decoded_dominant_rgb(image: object) -> tuple[float, float, float]:
@@ -99,15 +104,22 @@ def _assert_decoded_color(
 def build_or_convert_artifact(tmp_path: Path, kind: str) -> tuple[Path, int]:
     """Build one local v3.0 artifact without consulting the Hub."""
     if kind == "source":
-        return make_lerobot_v30_fixture(tmp_path), 19
+        return make_lerobot_v30_fixture(
+            tmp_path,
+            depth_cameras=(_DEPTH_CAMERA,),
+        ), 19
     if kind == "full":
-        work, _, services = accepted_v30_workspace(tmp_path)
+        work, _, services = accepted_v30_workspace(
+            tmp_path,
+            depth_cameras=(_DEPTH_CAMERA,),
+        )
         report = convert_dataset(work, tmp_path / "full", services=services)
         return report.output, 19
     if kind == "accepted_only":
         work, _, services = selectively_accepted_v30_workspace(
             tmp_path,
             accepted=(0, 2),
+            depth_cameras=(_DEPTH_CAMERA,),
         )
         report = convert_dataset(
             work,
@@ -136,6 +148,7 @@ def test_official_lerobot_loads_v30_artifact(
     assert [int(sample["index"]) for sample in samples] == list(
         range(expected_length)
     )
+    assert tuple(dataset.meta.stats["observation.matrix"]["mean"].shape) == (2, 2)
     for index, (
         output_episode_index,
         source_episode_index,
@@ -147,6 +160,12 @@ def test_official_lerobot_loads_v30_artifact(
         _assert_decoded_color(
             image,
             expected_color(0, source_episode_index, local_frame_index),
+        )
+        depth = np.asarray(samples[index][_DEPTH_CAMERA])
+        assert depth.shape == (1, 24, 32)
+        assert float(np.median(depth)) == pytest.approx(
+            expected_depth_mm(0, source_episode_index, local_frame_index),
+            abs=2.0,
         )
 
 

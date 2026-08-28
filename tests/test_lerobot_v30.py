@@ -6,7 +6,11 @@ import pyarrow.parquet as pq
 import pytest
 
 from robo_annotate.lerobot import detect_dataset_version, inspect_dataset
-from robo_annotate.lerobot_v30 import read_v30_episode_table, read_v30_tasks
+from robo_annotate.lerobot_v30 import (
+    _validate_data_slice,
+    read_v30_episode_table,
+    read_v30_tasks,
+)
 from tests.v30_fixtures import make_lerobot_v30_fixture, make_v30_config
 
 
@@ -56,6 +60,47 @@ def test_inspects_shared_v30_slices(tmp_path: Path) -> None:
     assert main.from_timestamp == pytest.approx(6 / 5)
     assert main.to_timestamp == pytest.approx(14 / 5)
     assert main.path == dataset.episodes[0].videos["observation.images.main"].path
+
+
+def test_inspects_official_single_channel_depth_video(tmp_path: Path) -> None:
+    depth = "observation.depth.main"
+    root = make_lerobot_v30_fixture(tmp_path, depth_cameras=(depth,))
+
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+
+    assert depth in dataset.camera_keys
+    assert (
+        dataset.episodes[0].videos[depth].path
+        == dataset.episodes[2].videos[depth].path
+    )
+
+
+def test_accepts_official_float32_timestamps_in_long_episode() -> None:
+    length = 963
+    fps = 30.0
+    table = pa.table(
+        {
+            "index": pa.array(range(length), type=pa.int64()),
+            "episode_index": pa.array([0] * length, type=pa.int64()),
+            "frame_index": pa.array(range(length), type=pa.int64()),
+            "timestamp": pa.array(
+                [frame_index / fps for frame_index in range(length)],
+                type=pa.float32(),
+            ),
+            "task_index": pa.array([0] * length, type=pa.int64()),
+        }
+    )
+
+    _validate_data_slice(
+        table,
+        Path("data/chunk-000/file-000.parquet"),
+        0,
+        length,
+        0,
+        length,
+        0,
+        fps,
+    )
 
 
 def test_rejects_v30_data_range_length_mismatch(tmp_path: Path) -> None:

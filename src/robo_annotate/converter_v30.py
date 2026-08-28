@@ -33,6 +33,13 @@ from .v30_data_writer import (
     _stats_to_lists,
     write_v30_data_subset,
 )
+from .v30_depth import (
+    DepthMetadata,
+    dequantize_depth,
+    depth_metadata,
+    is_depth_feature,
+    iter_depth_codes,
+)
 from .v30_video_writer import (
     V30VideoWriteResult,
     VideoPlacement,
@@ -365,13 +372,20 @@ def _video_stats(
         or not isinstance(features, Mapping)
     ):
         raise ValueError("v3 video statistics metadata is invalid")
-    frame_iterator = _service(
+    rgb_frame_iterator = _service(
         services,
         "iter_video_rgb_frames",
         iter_video_rgb_frames,
     )
-    if not callable(frame_iterator):
+    depth_frame_iterator = _service(
+        services,
+        "iter_video_depth_frames",
+        iter_depth_codes,
+    )
+    if not callable(rgb_frame_iterator):
         raise TypeError("iter_video_rgb_frames service must be callable")
+    if not callable(depth_frame_iterator):
+        raise TypeError("iter_video_depth_frames service must be callable")
     lengths = {item.output_index: item.length for item in data_placements}
     aggregate: dict[str, Any] = {}
     by_episode: dict[int, dict[str, Any]] = {
@@ -386,6 +400,8 @@ def _video_stats(
             details = declaration.get("info")
             if not isinstance(details, Mapping):
                 raise ValueError(f"video feature declaration is invalid: {camera}")
+            depth = depth_metadata(declaration, camera) if is_depth_feature(declaration) else None
+            frame_iterator = depth_frame_iterator if depth is not None else rgb_frame_iterator
             width, height = details.get("video.width"), details.get("video.height")
             if type(width) is not int or type(height) is not int:
                 raise ValueError(f"video feature dimensions are invalid: {camera}")
@@ -421,6 +437,7 @@ def _video_stats(
                         width,
                         height,
                         frame_iterator,
+                        depth,
                     )
                 for output_index, values in samples.items():
                     numpy_episode[output_index] = _feature_stats(
@@ -467,6 +484,7 @@ def _decode_video_samples(
     width: int,
     height: int,
     frame_iterator: Any,
+    depth: DepthMetadata | None,
 ) -> dict[int, np.ndarray[Any, Any]]:
     opened.verify()
     requested: dict[int, int] = {}
@@ -483,18 +501,29 @@ def _decode_video_samples(
         for local_index in _sample_indices(length):
             requested[start + local_index] = placement.output_index
         expected_start = stop
-    iterator = iter(frame_iterator(opened.proc_path))
+    iterator = iter(
+        iter_depth_codes(opened.proc_path, depth)
+        if depth is not None and frame_iterator is iter_depth_codes
+        else frame_iterator(opened.proc_path)
+    )
     decoded_count = 0
     primary: BaseException | None = None
     try:
         for frame_index, frame in enumerate(iterator):
             array = np.asarray(frame)
-            if array.dtype != np.uint8 or array.shape != (height, width, 3):
+            if depth is not None:
+                if array.dtype != np.uint16 or array.shape != (height, width):
+                    raise ValueError("rebuilt depth frame shape or dtype is invalid")
+            elif array.dtype != np.uint8 or array.shape != (height, width, 3):
                 raise ValueError("rebuilt video frame shape or dtype is invalid")
             output_index = requested.get(frame_index)
             if output_index is not None:
-                sampled = _downsample_rgb(array).astype(np.float64) / 255.0
-                pixels[output_index].append(sampled.reshape(-1, 3))
+                if depth is not None:
+                    sampled = _downsample_depth(dequantize_depth(array, depth))
+                    pixels[output_index].append(sampled.reshape(-1, 1))
+                else:
+                    sampled = _downsample_rgb(array).astype(np.float64) / 255.0
+                    pixels[output_index].append(sampled.reshape(-1, 3))
             decoded_count += 1
     except BaseException as exc:
         primary = exc
@@ -514,6 +543,16 @@ def _decode_video_samples(
             raise ValueError("rebuilt video sampling coverage is incomplete")
         result[output_index] = np.concatenate(values, axis=0)
     return result
+
+
+def _downsample_depth(value: np.ndarray) -> np.ndarray:
+    if value.ndim != 2:
+        raise ValueError("depth frame must decode as one channel")
+    height, width = value.shape
+    if max(width, height) < 300:
+        return value
+    factor = int(width / 150) if width > height else int(height / 150)
+    return value[::factor, ::factor]
 
 
 def _image_stats_shape(stats: Mapping[str, Any]) -> dict[str, Any]:

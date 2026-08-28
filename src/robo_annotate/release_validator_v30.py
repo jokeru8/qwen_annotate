@@ -26,7 +26,7 @@ import pyarrow.parquet as pq
 from PIL import Image
 
 from .constraints import validate_annotation
-from .lerobot import EpisodeVideoRef, video_fps_matches
+from .lerobot import EpisodeVideoRef, data_timestamp_matches, video_fps_matches
 from .models import FinalAnnotation
 from .release_validator import (
     BoundaryPreview,
@@ -39,6 +39,14 @@ from .release_validator import (
     _subtasks,
 )
 from .secure_tree import SecureFile, SecureTree
+from .v30_depth import (
+    DepthMetadata,
+    dequantize_depth,
+    depth_metadata,
+    depth_quantization_tolerance,
+    is_depth_feature,
+    iter_depth_codes,
+)
 
 
 _DATA_COLUMNS = {"index", "episode_index", "frame_index", "timestamp", "task_index"}
@@ -96,7 +104,15 @@ class _DataFeature:
     dtype: str
     shape: tuple[int, ...]
     arrow_type: pa.DataType
-    stats_width: int | None
+    stats_shape: tuple[int, ...] | None
+    depth: DepthMetadata | None
+
+
+@dataclass(frozen=True)
+class _CameraFeature:
+    width: int
+    height: int
+    depth: DepthMetadata | None
 
 
 def validate_v30_release(
@@ -198,9 +214,9 @@ def _validate_v30_release_with_info(
         raise ValueError("features must be a nonempty object")
     data_features, camera_shapes = _feature_shapes(features, fps)
     numeric_shapes = {
-        feature.name: feature.stats_width
+        feature.name: feature.stats_shape
         for feature in data_features.values()
-        if feature.stats_width is not None
+        if feature.stats_shape is not None
     }
     cameras = list(camera_shapes)
     if not cameras:
@@ -259,7 +275,7 @@ def _validate_v30_release_with_info(
         _validate_episode_arrow_schema(
             table,
             data_features,
-            cameras,
+            camera_shapes,
             stats_profiles,
             context=f"episode metadata {relative}",
         )
@@ -416,7 +432,8 @@ def _validate_v30_release_with_info(
                 finally:
                     opened_video.verify()
             probe = video_probes[video_path]
-            width, height = camera_shapes[camera]
+            camera_feature = camera_shapes[camera]
+            width, height = camera_feature.width, camera_feature.height
             if (
                 not video_fps_matches(probe.fps, fps)
                 or probe.width != width
@@ -518,35 +535,49 @@ def _validate_v30_release_with_info(
         # semantic/statistical corruption.
         codec_tolerance = 4.0 / 255.0 + 1e-6
         for camera, actual in aggregate_video.items():
+            depth = camera_shapes[camera].depth
             _compare_stats(
                 published_stats[camera],
                 actual,
                 f"stats {camera}",
-                tolerance=codec_tolerance,
+                tolerance=1e-6 if depth is not None else codec_tolerance,
+                absolute_tolerance=(
+                    2.0 * depth_quantization_tolerance(depth)
+                    if depth is not None
+                    else 0.0
+                ),
             )
         for episode in episodes:
             for camera, actual in episode_video[episode.index].items():
+                depth = camera_shapes[camera].depth
                 _compare_stats(
                     _row_stats(episode.metadata, camera, stats_profiles[camera]),
                     actual,
                     f"episode {episode.index} stats {camera}",
-                    tolerance=codec_tolerance,
+                    tolerance=1e-6 if depth is not None else codec_tolerance,
+                    absolute_tolerance=(
+                        2.0 * depth_quantization_tolerance(depth)
+                        if depth is not None
+                        else 0.0
+                    ),
                 )
     else:
         sampled_total = sum(len(_sample_indices(episode.length)) for episode in episodes)
         for camera in cameras:
+            channels = 1 if camera_shapes[camera].depth is not None else 3
             _validate_stats_shape(
                 published_stats[camera],
-                3,
+                (channels, 1, 1),
                 sampled_total,
                 f"stats {camera}",
                 stats_profiles[camera],
             )
         for episode in episodes:
             for camera in cameras:
+                channels = 1 if camera_shapes[camera].depth is not None else 3
                 _validate_stats_shape(
                     _row_stats(episode.metadata, camera, stats_profiles[camera]),
-                    3,
+                    (channels, 1, 1),
                     len(_sample_indices(episode.length)),
                     f"episode {episode.index} stats {camera}",
                     stats_profiles[camera],
@@ -607,9 +638,9 @@ def _validate_v30_release_with_info(
 
 def _feature_shapes(
     features: Mapping[str, Any], fps: float
-) -> tuple[dict[str, _DataFeature], dict[str, tuple[int, int]]]:
+) -> tuple[dict[str, _DataFeature], dict[str, _CameraFeature]]:
     data: dict[str, _DataFeature] = {}
-    cameras: dict[str, tuple[int, int]] = {}
+    cameras: dict[str, _CameraFeature] = {}
     for name, value in features.items():
         if not isinstance(name, str) or not name or not isinstance(value, dict):
             raise ValueError("feature definitions must be named objects")
@@ -628,16 +659,21 @@ def _feature_shapes(
             video_fps = _positive_number(video_info.get("video.fps"), "video.fps")
             width = _strict_int(video_info.get("video.width"), "video.width", 1)
             height = _strict_int(video_info.get("video.height"), "video.height", 1)
+            depth = depth_metadata(value, name) if is_depth_feature(value) else None
+            channels = 1 if depth is not None else 3
             if not video_fps_matches(video_fps, fps) or shape not in (
-                [3, height, width],
-                [height, width, 3],
+                [channels, height, width],
+                [height, width, channels],
             ):
                 raise ValueError(f"video feature fps or shape is inconsistent: {name}")
-            cameras[name] = (width, height)
+            declared_channels = video_info.get("video.channels")
+            if declared_channels is not None and declared_channels != channels:
+                raise ValueError(f"video feature channel count is inconsistent: {name}")
+            cameras[name] = _CameraFeature(width, height, depth)
         elif dtype == "string":
             if shape != [1]:
                 raise ValueError(f"string feature shape must be [1]: {name}")
-            data[name] = _DataFeature(name, dtype, (1,), pa.string(), None)
+            data[name] = _DataFeature(name, dtype, (1,), pa.string(), None, None)
         elif dtype == "language":
             if name not in {"language_persistent", "language_events"} or shape != [1]:
                 raise ValueError(f"unsupported language feature declaration: {name}")
@@ -646,11 +682,21 @@ def _feature_shapes(
                 if name == "language_persistent"
                 else _language_events_arrow_type()
             )
-            data[name] = _DataFeature(name, dtype, (1,), arrow_type, None)
+            data[name] = _DataFeature(name, dtype, (1,), arrow_type, None, None)
         elif dtype == "image":
-            if len(shape) != 3 or (shape[0] != 3 and shape[-1] != 3):
-                raise ValueError(f"RGB image feature shape must be CHW or HWC: {name}")
-            data[name] = _DataFeature(name, dtype, tuple(shape), _image_arrow_type(), 3)
+            depth = depth_metadata(value, name) if is_depth_feature(value) else None
+            channels = 1 if depth is not None else 3
+            if len(shape) != 3 or (shape[0] != channels and shape[-1] != channels):
+                kind = "depth" if depth is not None else "RGB"
+                raise ValueError(f"{kind} image feature shape must be CHW or HWC: {name}")
+            data[name] = _DataFeature(
+                name,
+                dtype,
+                tuple(shape),
+                _image_arrow_type(),
+                (channels, 1, 1),
+                depth,
+            )
         else:
             try:
                 numpy_dtype = np.dtype(dtype)
@@ -664,7 +710,8 @@ def _feature_shapes(
                 dtype,
                 tuple(shape),
                 arrow_type,
-                shape[-1],
+                tuple(shape),
+                None,
             )
     official_defaults = {
         "timestamp": ("float32", (1,)),
@@ -821,7 +868,7 @@ def _validate_language_values(array: pa.ChunkedArray, feature_name: str) -> None
 def _validate_episode_arrow_schema(
     table: pa.Table,
     data_features: Mapping[str, _DataFeature],
-    cameras: Sequence[str],
+    cameras: Mapping[str, _CameraFeature],
     profiles: Mapping[str, tuple[str, ...]],
     *,
     context: str,
@@ -850,14 +897,26 @@ def _validate_episode_arrow_schema(
         for metric in profile:
             name = f"stats/{feature}/{metric}"
             field = table.schema.field(name)
-            expected = pa.list_(pa.int64()) if metric == "count" else pa.list_(pa.float64())
-            visual = feature in cameras or (
-                feature in data_features and data_features[feature].dtype == "image"
-            )
-            if visual and metric != "count":
-                expected = pa.list_(pa.list_(pa.list_(pa.float64())))
+            if metric == "count":
+                expected = pa.list_(pa.int64())
+            else:
+                if feature in cameras:
+                    channels = 1 if cameras[feature].depth is not None else 3
+                    stats_shape = (channels, 1, 1)
+                else:
+                    stats_shape = data_features[feature].stats_shape
+                if stats_shape is None:
+                    raise ValueError(f"{context} has statistics for nonnumeric feature {feature}")
+                expected = _nested_stats_arrow_type(stats_shape)
             if not field.nullable or not field.type.equals(expected) or table[name].null_count:
                 raise ValueError(f"{context} has nonofficial Arrow field {name}")
+
+
+def _nested_stats_arrow_type(shape: tuple[int, ...]) -> pa.DataType:
+    value: pa.DataType = pa.float64()
+    for _dimension in reversed(shape):
+        value = pa.list_(value)
+    return value
 
 
 def _read_tasks(tree: SecureTree, digests: dict[str, str]) -> dict[int, str]:
@@ -980,12 +1039,7 @@ def _validate_data_slice(
         if row["task_index"] != task_index:
             raise ValueError(f"episode {episode_index} data task_index mismatch")
         timestamp = row["timestamp"]
-        if (
-            isinstance(timestamp, bool)
-            or not isinstance(timestamp, (int, float))
-            or not math.isfinite(float(timestamp))
-            or not math.isclose(float(timestamp), local_index / fps, abs_tol=1e-6)
-        ):
+        if not data_timestamp_matches(timestamp, local_index, fps):
             raise ValueError(f"episode {episode_index} data timestamp mismatch")
     return offset
 
@@ -1056,21 +1110,23 @@ def _numeric_stats(
         numpy_by_episode[episode.index] = {}
         for feature, declaration in features.items():
             dtype = (
-                np.dtype(np.uint8)
+                np.dtype(np.float64 if declaration.depth is not None else np.uint8)
                 if declaration.dtype == "image"
                 else np.dtype(declaration.dtype)
             )
             matrix, count = _matrix(
                 table[feature],
                 dtype,
-                declaration.stats_width or 1,
+                declaration.stats_shape or (1,),
                 sample_images=declaration.dtype == "image",
+                depth=declaration.depth,
             )
             numpy_by_episode[episode.index][feature] = _stats(
                 matrix,
                 profiles[feature],
                 count,
-                image=declaration.dtype == "image",
+                image=declaration.dtype == "image" and declaration.depth is None,
+                depth=declaration.depth is not None,
             )
     numpy_aggregate = {
         feature: _aggregate_stats(
@@ -1096,7 +1152,7 @@ def _numeric_stats(
 def _video_stats(
     episodes: Sequence[_Episode],
     cameras: Sequence[str],
-    shapes: Mapping[str, tuple[int, int]],
+    shapes: Mapping[str, _CameraFeature],
     ranges: Mapping[_VideoShardIdentity, list[_VideoRange]],
     services: ReleaseServices,
     fps: float,
@@ -1114,7 +1170,9 @@ def _video_stats(
         ),
     )
     for (camera, _chunk_index, _file_index, path), slices in ordered_ranges:
-        width, height = shapes[camera]
+        camera_feature = shapes[camera]
+        width, height = camera_feature.width, camera_feature.height
+        depth = camera_feature.depth
         requested: dict[int, int] = {}
         sampled_pixels: dict[int, list[np.ndarray]] = defaultdict(list)
         for start, stop, episode_index in slices:
@@ -1125,18 +1183,32 @@ def _video_stats(
             for local_index in _sample_indices(expected):
                 requested[left + local_index] = episode_index
         video_file = files[path]
-        iterator = iter(services.iter_video_rgb_frames(video_file.proc_path))
+        iterator = iter(
+            iter_depth_codes(video_file.proc_path, depth)
+            if depth is not None
+            else services.iter_video_rgb_frames(video_file.proc_path)
+        )
         decoded_count = 0
         try:
             for decoded_index, frame in enumerate(iterator):
                 array = np.asarray(frame)
-                if array.dtype != np.uint8 or array.shape != (height, width, 3):
+                if depth is not None:
+                    valid = array.dtype == np.uint16 and array.shape == (height, width)
+                else:
+                    valid = array.dtype == np.uint8 and array.shape == (height, width, 3)
+                if not valid:
                     raise ValueError(f"decoded video frame shape or dtype mismatch: {path}")
                 if decoded_index in requested:
-                    sampled = _downsample_rgb(array).astype(np.float64) / 255.0
-                    sampled_pixels[requested[decoded_index]].append(
-                        sampled.reshape(-1, 3)
-                    )
+                    if depth is not None:
+                        sampled = _downsample_depth(dequantize_depth(array, depth))
+                        sampled_pixels[requested[decoded_index]].append(
+                            sampled.reshape(-1, 1)
+                        )
+                    else:
+                        sampled = _downsample_rgb(array).astype(np.float64)
+                        sampled_pixels[requested[decoded_index]].append(
+                            sampled.reshape(-1, 3)
+                        )
                 decoded_count += 1
         finally:
             close = getattr(iterator, "close", None)
@@ -1156,7 +1228,8 @@ def _video_stats(
                 episode_values[episode.index][camera],
                 profiles[camera],
                 len(_sample_indices(episode.length)),
-                image=False,
+                image=shapes[camera].depth is None,
+                depth=shapes[camera].depth is not None,
             )
             for camera in cameras
         }
@@ -1186,9 +1259,10 @@ def _video_stats(
 def _matrix(
     array: pa.ChunkedArray,
     dtype: np.dtype[Any],
-    width: int,
+    shape: tuple[int, ...],
     *,
     sample_images: bool,
+    depth: DepthMetadata | None,
 ) -> tuple[np.ndarray, int]:
     combined = array.combine_chunks()
     if combined.null_count:
@@ -1201,13 +1275,21 @@ def _matrix(
             value = rows[index]
             try:
                 with Image.open(io.BytesIO(value["bytes"])) as image:
-                    rgb = _downsample_rgb(np.asarray(image.convert("RGB")))
+                    if depth is not None:
+                        decoded = np.asarray(image)
+                        if decoded.ndim == 3 and decoded.shape[-1] == 1:
+                            decoded = decoded[..., 0]
+                        visual = _downsample_depth(decoded.astype(np.float64))
+                    else:
+                        visual = _downsample_rgb(np.asarray(image.convert("RGB")))
             except Exception as exc:
                 raise ValueError("unable to decode embedded image feature") from exc
-            pixels.append(rgb.reshape(-1, 3))
+            pixels.append(visual.reshape(-1, 1 if depth is not None else 3))
         return np.concatenate(pixels, axis=0), len(indices)
     try:
-        matrix = np.asarray(combined.to_pylist(), dtype=dtype).reshape(-1, width)
+        matrix = np.asarray(combined.to_pylist(), dtype=dtype).reshape(
+            (len(combined), *shape)
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError(
             "numeric feature values do not match their declared shape"
@@ -1229,15 +1311,26 @@ def _downsample_rgb(value: np.ndarray) -> np.ndarray:
     return value[::factor, ::factor]
 
 
+def _downsample_depth(value: np.ndarray) -> np.ndarray:
+    if value.ndim != 2:
+        raise ValueError("depth image must decode as one channel")
+    height, width = value.shape
+    if max(width, height) < 300:
+        return value
+    factor = int(width / 150) if width > height else int(height / 150)
+    return value[::factor, ::factor]
+
+
 def _stats(
     values: np.ndarray,
     profile: Sequence[str],
     count: int,
     *,
     image: bool,
+    depth: bool,
 ) -> dict[str, np.ndarray[Any, Any]]:
-    if values.ndim != 2 or not len(values) or not np.isfinite(values).all():
-        raise ValueError("statistics require a nonempty finite matrix")
+    if values.ndim < 2 or not len(values) or not np.isfinite(values).all():
+        raise ValueError("statistics require a nonempty finite array")
     if len(values) < 2:
         mean = np.mean(values, axis=0)
         result = {
@@ -1267,17 +1360,18 @@ def _stats(
         for metric in profile:
             if metric.startswith("q"):
                 quantile = int(metric[1:]) / 100.0
+                flattened = batch.reshape(len(batch), -1)
                 result[metric] = np.array(
                     [
-                        _histogram_quantile(batch[:, column], quantile)
-                        for column in range(batch.shape[1])
+                        _histogram_quantile(flattened[:, column], quantile)
+                        for column in range(flattened.shape[1])
                     ]
-                )
-    if image:
+                ).reshape(batch.shape[1:])
+    if image or depth:
         result = {
             metric: value
             if metric == "count"
-            else value.reshape(-1, 1, 1) / 255.0
+            else value.reshape(-1, 1, 1) / (1.0 if depth else 255.0)
             for metric, value in result.items()
         }
     return result
@@ -1355,11 +1449,12 @@ def _compare_stats(
     context: str,
     *,
     tolerance: float,
+    absolute_tolerance: float = 0.0,
 ) -> None:
-    width = len(_flatten(actual["min"]))
+    shape = _stats_value_shape(actual["min"])
     _validate_stats_shape(
         published,
-        width,
+        shape,
         round(actual["count"][0]),
         context,
         tuple(actual),
@@ -1371,16 +1466,16 @@ def _compare_stats(
         if len(left) != len(right):
             raise ValueError(f"{context} stats shape mismatch")
         differs = any(
-            abs(a - b) > tolerance * max(1.0, abs(b))
+            abs(a - b) > max(absolute_tolerance, tolerance * max(1.0, abs(b)))
             for a, b in zip(left, right, strict=True)
         )
         if differs:
-            raise ValueError(f"{context} differs from payload")
+            raise ValueError(f"{context} {metric} differs from payload")
 
 
 def _validate_stats_shape(
     value: Any,
-    width: int,
+    expected_shape: tuple[int, ...],
     expected_count: int,
     context: str,
     profile: Sequence[str],
@@ -1388,13 +1483,20 @@ def _validate_stats_shape(
     if not isinstance(value, dict) or set(value) != set(profile):
         raise ValueError(f"{context} metric coverage mismatch")
     count = _flatten(value["count"])
-    if len(count) != 1 or not math.isclose(count[0], expected_count):
+    if (
+        _stats_value_shape(value["count"]) != (1,)
+        or len(count) != 1
+        or not math.isclose(count[0], expected_count)
+    ):
         raise ValueError(f"{context} count differs from episode/frame count")
     for metric in profile:
         if metric == "count":
             continue
         numbers = _flatten(value[metric])
-        if len(numbers) != width or not all(math.isfinite(item) for item in numbers):
+        if (
+            _stats_value_shape(value[metric]) != expected_shape
+            or not all(math.isfinite(item) for item in numbers)
+        ):
             raise ValueError(f"{context} metric shape or values are invalid")
     minimum = _flatten(value["min"])
     maximum = _flatten(value["max"])
@@ -1414,6 +1516,20 @@ def _validate_stats_shape(
             for low, high in zip(_flatten(value[left]), _flatten(value[right]), strict=True)
         ):
             raise ValueError(f"{context} quantile ordering is invalid")
+
+
+def _stats_value_shape(value: Any) -> tuple[int, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("statistics must use nonempty declared-dimensional lists")
+    child_shapes = [
+        _stats_value_shape(item) if isinstance(item, list) else ()
+        for item in value
+    ]
+    if any(shape != child_shapes[0] for shape in child_shapes[1:]):
+        raise ValueError("statistics contain ragged dimensions")
+    if any(isinstance(item, list) != bool(child_shapes[0]) for item in value):
+        raise ValueError("statistics contain mixed dimensions")
+    return (len(value), *child_shapes[0])
 
 
 def _flatten(value: Any) -> list[float]:

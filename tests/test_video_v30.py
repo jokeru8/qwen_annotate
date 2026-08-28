@@ -1,3 +1,4 @@
+import io
 import math
 import sys
 from fractions import Fraction
@@ -33,6 +34,23 @@ def test_extracts_local_frames_from_middle_shared_video_slice(tmp_path: Path) ->
     ]
 
 
+def test_extracts_displayable_evidence_from_shared_depth_video_slice(
+    tmp_path: Path,
+) -> None:
+    depth = "observation.depth.main"
+    root = make_lerobot_v30_fixture(tmp_path, depth_cameras=(depth,))
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    ref = dataset.episodes[1].videos[depth]
+
+    samples = extract_frames(ref, depth, [0, 3, 7])
+
+    assert [sample.frame_index for sample in samples] == [0, 3, 7]
+    for sample in samples:
+        with Image.open(io.BytesIO(sample.jpeg)) as image:
+            assert image.mode == "RGB"
+            assert image.size == (32, 24)
+
+
 def test_preserves_requested_episode_local_frame_order(tmp_path: Path) -> None:
     root = make_lerobot_v30_fixture(tmp_path)
     dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
@@ -65,7 +83,7 @@ def test_rejects_slice_when_shared_video_has_insufficient_decoded_frames(tmp_pat
         update={"to_timestamp": 4.0}
     )
 
-    with pytest.raises(ValueError, match=r"missing requested frame.*5"):
+    with pytest.raises(ValueError, match=r"missing episode-local frame\(s\).*5"):
         extract_frames(ref, "observation.images.main", [5])
 
 
@@ -117,7 +135,7 @@ def test_rejects_decoded_pts_before_and_after_the_episode_slice(
         fps=2.0,
     )
 
-    with pytest.raises(ValueError, match=r"missing requested frame.*0"):
+    with pytest.raises(ValueError, match=r"missing episode-local frame\(s\).*0"):
         extract_frames(ref, "observation.images.main", [0])
 
     assert container.closed
@@ -135,7 +153,7 @@ def test_does_not_round_neighboring_episode_pts_into_local_frame_zero(
         fps=2.0,
     )
 
-    with pytest.raises(ValueError, match=r"missing requested frame.*0"):
+    with pytest.raises(ValueError, match=r"missing episode-local frame\(s\).*0"):
         extract_frames(ref, "observation.images.main", [0])
 
     assert container.closed
@@ -155,6 +173,24 @@ def test_rejects_duplicate_episode_local_pts(
 
     with pytest.raises(ValueError, match=r"duplicate episode-local frame 0"):
         extract_frames(ref, "observation.images.main", [0])
+
+    assert container.closed
+
+
+def test_rejects_missing_unrequested_middle_frame_in_video_slice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container = _PtsContainer([0, 2, 4, 5])
+    monkeypatch.setitem(sys.modules, "av", SimpleNamespace(open=lambda path: container))
+    ref = EpisodeVideoRef(
+        path=tmp_path / "shared.mp4",
+        from_timestamp=1.0,
+        to_timestamp=2.5,
+        fps=2.0,
+    )
+
+    with pytest.raises(ValueError, match=r"missing episode-local frame\(s\).*1"):
+        extract_frames(ref, "observation.images.main", [0, 2])
 
     assert container.closed
 

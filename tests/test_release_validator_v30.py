@@ -1,9 +1,10 @@
-import json
 import io
+import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -33,18 +34,41 @@ def test_v30_stats_sampling_matches_pinned_v061_profile() -> None:
     assert _sample_indices(1_000)[-1] == 999
 
 
+def test_v30_validator_accepts_official_float32_timestamps_in_long_episode() -> None:
+    from robo_annotate.release_validator_v30 import _validate_data_slice
+
+    length = 963
+    fps = 30.0
+    table = pa.table(
+        {
+            "index": pa.array(range(length), type=pa.int64()),
+            "episode_index": pa.array([0] * length, type=pa.int64()),
+            "frame_index": pa.array(range(length), type=pa.int64()),
+            "timestamp": pa.array(
+                [frame_index / fps for frame_index in range(length)],
+                type=pa.float32(),
+            ),
+            "task_index": pa.array([0] * length, type=pa.int64()),
+        }
+    )
+
+    assert _validate_data_slice(table, 0, length, 0, length, 0, fps) == 0
+
+
 def accepted_v30_workspace(
     tmp_path: Path,
     *,
     lengths: tuple[int, ...] = (6, 8, 5),
     video_shards_per_episode: bool = False,
     non_padded_video_template: bool = False,
+    depth_cameras: tuple[str, ...] = (),
 ) -> tuple[Path, Path, dict]:
     source = make_lerobot_v30_fixture(
         tmp_path,
         lengths=lengths,
         video_shards_per_episode=video_shards_per_episode,
         non_padded_video_template=non_padded_video_template,
+        depth_cameras=depth_cameras,
     )
     work = tmp_path / "work"
     base = make_v30_config(source, work)
@@ -86,12 +110,14 @@ def converted_v30_release(
     lengths: tuple[int, ...] = (6, 8, 5),
     video_shards_per_episode: bool = False,
     non_padded_video_template: bool = False,
+    depth_cameras: tuple[str, ...] = (),
 ) -> Path:
     work, _, services = accepted_v30_workspace(
         tmp_path,
         lengths=lengths,
         video_shards_per_episode=video_shards_per_episode,
         non_padded_video_template=non_padded_video_template,
+        depth_cameras=depth_cameras,
     )
     return convert_dataset(work, tmp_path / "converted", services=services).output
 
@@ -108,6 +134,20 @@ def test_v30_validator_accepts_pinned_v061_feature_and_stats_schema(
     assert info["features"]["language_persistent"]["dtype"] == "language"
     assert "q50" in json.loads((output / "meta/stats.json").read_text())["action"]
     assert validate_release(output, deep_video_stats=False).valid
+
+
+def test_v30_validator_rejects_depth_stream_metadata_mismatch(
+    tmp_path: Path,
+) -> None:
+    depth = "observation.depth.main"
+    output = converted_v30_release(tmp_path, depth_cameras=(depth,))
+    info_path = output / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["features"][depth]["info"]["video.pix_fmt"] = "gray10le"
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"depth video codec or pixel format"):
+        validate_release(output)
 
 
 def test_v30_validator_accepts_positive_rebuilt_subset_shard_size_limits(
@@ -255,10 +295,10 @@ def test_v30_validator_accepts_official_hf_array_shape_ranks(
     info["features"] = rebuilt
     info_path.write_text(json.dumps(info), encoding="utf-8")
 
-    def nested(dimensions: tuple[int, ...]):
+    def nested(dimensions: tuple[int, ...], value: float = 0.0):
         if len(dimensions) == 1:
-            return [0.0] * dimensions[0]
-        return [nested(dimensions[1:]) for _ in range(dimensions[0])]
+            return [value] * dimensions[0]
+        return [nested(dimensions[1:], value) for _ in range(dimensions[0])]
 
     def nested_type(dimensions: tuple[int, ...]) -> pa.DataType:
         value: pa.DataType = pa.float32()
@@ -278,7 +318,10 @@ def test_v30_validator_accepts_official_hf_array_shape_ranks(
 
     stats_path = output / "meta/stats.json"
     stats = json.loads(stats_path.read_text(encoding="utf-8"))
-    profile = {metric: ([19] if metric == "count" else [0.0, 0.0]) for metric in stats["action"]}
+    profile = {
+        metric: ([19] if metric == "count" else nested(shape))
+        for metric in stats["action"]
+    }
     stats[name] = profile
     stats_path.write_text(json.dumps(stats), encoding="utf-8")
 
@@ -287,10 +330,15 @@ def test_v30_validator_accepts_official_hf_array_shape_ranks(
     insertion = episodes.schema.get_field_index("meta/episodes/chunk_index")
     for metric in profile:
         values = [
-            [length] if metric == "count" else [0.0, 0.0]
+            [length] if metric == "count" else nested(shape)
             for length in episodes["length"].to_pylist()
         ]
-        value_type = pa.list_(pa.int64()) if metric == "count" else pa.list_(pa.float64())
+        if metric == "count":
+            value_type = pa.list_(pa.int64())
+        else:
+            value_type = pa.float64()
+            for _dimension in reversed(shape):
+                value_type = pa.list_(value_type)
         episodes = episodes.add_column(
             insertion,
             f"stats/{name}/{metric}",
@@ -347,6 +395,76 @@ def test_v30_validator_accepts_official_embedded_image_feature(tmp_path: Path) -
         else:
             values = [[[[0.0]], [[0.0]], [[0.0]]]] * episodes.num_rows
             value_type = pa.list_(pa.list_(pa.list_(pa.float64())))
+        episodes = episodes.add_column(
+            insertion,
+            f"stats/{name}/{metric}",
+            pa.array(values, type=value_type),
+        )
+        insertion += 1
+    pq.write_table(episodes, episode_path)
+
+    assert validate_release(output, deep_video_stats=False).valid
+
+
+def test_v30_validator_accepts_official_embedded_depth_image_feature(
+    tmp_path: Path,
+) -> None:
+    output = converted_v30_release(tmp_path)
+    name = "observation.depth.embedded"
+    info_path = output / "meta/info.json"
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    info["features"][name] = {
+        "dtype": "image",
+        "shape": [2, 2, 1],
+        "names": None,
+        "info": {"is_depth_map": True, "depth_unit": "mm"},
+    }
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+
+    encoded = io.BytesIO()
+    Image.fromarray(np.full((2, 2), 1234, dtype=np.uint16)).save(
+        encoded,
+        format="TIFF",
+    )
+    data_path = output / "data/chunk-000/file-000.parquet"
+    data = pq.read_table(data_path)
+    data = data.append_column(
+        name,
+        pa.array(
+            [{"bytes": encoded.getvalue(), "path": "depth.tiff"}] * data.num_rows,
+            type=pa.struct(
+                [pa.field("bytes", pa.binary()), pa.field("path", pa.string())]
+            ),
+        ),
+    )
+    pq.write_table(data, data_path)
+
+    stats_path = output / "meta/stats.json"
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    stats[name] = {
+        metric: (
+            [19]
+            if metric == "count"
+            else [[[0.0 if metric == "std" else 1234.0]]]
+        )
+        for metric in stats["action"]
+    }
+    stats_path.write_text(json.dumps(stats), encoding="utf-8")
+
+    episode_path = output / "meta/episodes/chunk-000/file-000.parquet"
+    episodes = pq.read_table(episode_path)
+    insertion = episodes.schema.get_field_index("meta/episodes/chunk_index")
+    for metric in stats[name]:
+        values = (
+            [[length] for length in episodes["length"].to_pylist()]
+            if metric == "count"
+            else [[[[0.0 if metric == "std" else 1234.0]]]] * episodes.num_rows
+        )
+        value_type = (
+            pa.list_(pa.int64())
+            if metric == "count"
+            else pa.list_(pa.list_(pa.list_(pa.float64())))
+        )
         episodes = episodes.add_column(
             insertion,
             f"stats/{name}/{metric}",
@@ -758,8 +876,8 @@ def test_v30_structural_validation_rejects_impossible_video_stats(
     path = output / "meta/stats.json"
     stats = json.loads(path.read_text(encoding="utf-8"))
     camera = "observation.images.main"
-    stats[camera]["min"] = [1.0, 1.0, 1.0]
-    stats[camera]["max"] = [0.0, 0.0, 0.0]
+    stats[camera]["min"] = [[[1.0]], [[1.0]], [[1.0]]]
+    stats[camera]["max"] = [[[0.0]], [[0.0]], [[0.0]]]
     path.write_text(json.dumps(stats), encoding="utf-8")
 
     with pytest.raises(ValueError, match=r"stats.*ordering"):

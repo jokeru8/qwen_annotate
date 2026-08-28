@@ -19,6 +19,7 @@ from PIL import Image
 
 from .lerobot import DatasetIndex, EpisodeInfo
 from .secure_tree import SecureTree, rename_noreplace_at
+from .v30_depth import depth_metadata, is_depth_feature
 from .writer_publication import (
     WriterPublication,
     _AnchoredDirectoryPath,
@@ -48,7 +49,7 @@ _OUTPUT_FLAGS = (
     | os.O_EXCL
     | getattr(os, "O_NOFOLLOW", 0)
 )
-StatValue = list[int | float] | list[list[list[float]]]
+StatValue = list[Any]
 FeatureStats = dict[str, StatValue]
 
 
@@ -98,8 +99,7 @@ def write_v30_data_subset(
         tables: dict[str, pa.Table] = {}
         source_schema: pa.Schema | None = None
         rewritten: list[tuple[EpisodeInfo, pa.Table, tuple[str, ...]]] = []
-        task_order: list[int] = []
-        seen_tasks: set[int] = set()
+        used_tasks: set[int] = set()
         output_offsets: list[int] = []
         global_offset = 0
 
@@ -114,10 +114,7 @@ def write_v30_data_subset(
             elif not table.schema.equals(source_schema, check_metadata=True):
                 raise ValueError("selected data shards must have one exact Arrow schema")
             sliced, source_tasks = _episode_slice(table, episode, task_by_text)
-            for task_index in source_tasks:
-                if task_index not in seen_tasks:
-                    task_order.append(task_index)
-                    seen_tasks.add(task_index)
+            used_tasks.update(source_tasks)
             rewritten.append(
                 (
                     episode,
@@ -128,6 +125,11 @@ def write_v30_data_subset(
             output_offsets.append(global_offset)
             global_offset += episode.length
 
+        task_order = [
+            int(source_index)
+            for source_index in tasks["task_index"].to_pylist()
+            if source_index in used_tasks
+        ]
         task_remap = {
             source_index: output_index
             for output_index, source_index in enumerate(task_order)
@@ -449,7 +451,7 @@ def _numeric_stats(
     features = info.get("features")
     if not isinstance(features, Mapping):
         raise ValueError("info.features must be an object")
-    specs: dict[str, tuple[np.dtype[Any], int, bool]] = {}
+    specs: dict[str, tuple[np.dtype[Any], tuple[int, ...], bool, bool]] = {}
     columns = set(tables[0].column_names)
     for name, profile in profiles.items():
         declaration = features.get(name)
@@ -462,9 +464,21 @@ def _numeric_stats(
         ):
             raise ValueError(f"numeric feature declaration is invalid: {name}")
         if dtype == "image":
-            if len(shape) != 3 or (shape[0] != 3 and shape[-1] != 3):
-                raise ValueError(f"embedded image feature must declare an RGB shape: {name}")
-            specs[name] = (np.dtype(np.uint8), 3, True)
+            depth = is_depth_feature(declaration)
+            if depth:
+                depth_metadata(declaration, name)
+            channels = 1 if depth else 3
+            if len(shape) != 3 or (shape[0] != channels and shape[-1] != channels):
+                kind = "depth" if depth else "RGB"
+                raise ValueError(
+                    f"embedded image feature must declare a {kind} shape: {name}"
+                )
+            specs[name] = (
+                np.dtype(np.float64 if depth else np.uint8),
+                (channels,),
+                True,
+                depth,
+            )
             continue
         try:
             numpy_dtype = np.dtype(dtype)
@@ -472,25 +486,27 @@ def _numeric_stats(
             raise ValueError(f"unsupported numeric feature dtype: {name}") from exc
         if numpy_dtype.kind not in "biuf":
             raise ValueError(f"unsupported numeric feature dtype: {name}")
-        specs[name] = (numpy_dtype, shape[-1], False)
+        specs[name] = (numpy_dtype, tuple(shape), False, False)
         if not profile:
             raise ValueError(f"numeric stats profile is empty for {name}")
 
     numpy_episode_stats: dict[int, dict[str, dict[str, np.ndarray[Any, Any]]]] = {}
     for episode_index, table in enumerate(tables):
         numpy_episode_stats[episode_index] = {}
-        for name, (dtype, width, is_image) in specs.items():
+        for name, (dtype, shape, is_image, is_depth) in specs.items():
             matrix, count = _numeric_matrix(
                 table[name],
                 dtype,
-                width,
+                shape,
                 sample_images=is_image,
+                depth=is_depth,
             )
             numpy_episode_stats[episode_index][name] = _feature_stats(
                 matrix,
                 profiles[name],
                 count,
-                image=is_image,
+                image=is_image and not is_depth,
+                depth=is_depth,
             )
 
     numpy_aggregate = {
@@ -515,9 +531,10 @@ def _numeric_stats(
 def _numeric_matrix(
     array: pa.ChunkedArray,
     dtype: np.dtype[Any],
-    width: int,
+    shape: tuple[int, ...],
     *,
     sample_images: bool,
+    depth: bool,
 ) -> tuple[np.ndarray, int]:
     combined = array.combine_chunks()
     if combined.null_count:
@@ -532,13 +549,21 @@ def _numeric_matrix(
                 raise ValueError("embedded image feature contains an invalid value")
             try:
                 with Image.open(io.BytesIO(value["bytes"])) as image:
-                    rgb = _downsample_rgb(np.asarray(image.convert("RGB")))
+                    if depth:
+                        decoded = np.asarray(image)
+                        if decoded.ndim == 3 and decoded.shape[-1] == 1:
+                            decoded = decoded[..., 0]
+                        visual = _downsample_depth(decoded.astype(np.float64))
+                    else:
+                        visual = _downsample_rgb(np.asarray(image.convert("RGB")))
             except Exception as exc:
                 raise ValueError("unable to decode embedded image feature") from exc
-            pixels.append(rgb.reshape(-1, 3))
+            pixels.append(visual.reshape(-1, 1 if depth else 3))
         return np.concatenate(pixels, axis=0), len(indices)
     try:
-        matrix = np.asarray(combined.to_pylist(), dtype=dtype).reshape(-1, width)
+        matrix = np.asarray(combined.to_pylist(), dtype=dtype).reshape(
+            (len(combined), *shape)
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError("numeric feature values do not match their declared shape") from exc
     return matrix, len(combined)
@@ -562,15 +587,26 @@ def _downsample_rgb(value: np.ndarray) -> np.ndarray:
     return value[::factor, ::factor]
 
 
+def _downsample_depth(value: np.ndarray) -> np.ndarray:
+    if value.ndim != 2:
+        raise ValueError("embedded depth image must decode as one channel")
+    height, width = value.shape
+    if max(width, height) < 300:
+        return value
+    factor = int(width / 150) if width > height else int(height / 150)
+    return value[::factor, ::factor]
+
+
 def _feature_stats(
     values: np.ndarray,
     profile: Sequence[str],
     count: int,
     *,
     image: bool,
+    depth: bool = False,
 ) -> dict[str, np.ndarray[Any, Any]]:
-    if values.ndim != 2 or not len(values) or not np.isfinite(values).all():
-        raise ValueError("statistics require a nonempty finite numeric matrix")
+    if values.ndim < 2 or not len(values) or not np.isfinite(values).all():
+        raise ValueError("statistics require a nonempty finite numeric array")
     if len(values) < 2:
         mean = np.mean(values, axis=0)
         result = {
@@ -597,17 +633,18 @@ def _feature_stats(
         for metric in profile:
             if metric.startswith("q"):
                 quantile = int(metric[1:]) / 100.0
+                flattened = batch.reshape(len(batch), -1)
                 result[metric] = np.array(
                     [
-                        _histogram_quantile(batch[:, column], quantile)
-                        for column in range(batch.shape[1])
+                        _histogram_quantile(flattened[:, column], quantile)
+                        for column in range(flattened.shape[1])
                     ]
-                )
-    if image:
+                ).reshape(batch.shape[1:])
+    if image or depth:
         result = {
             metric: value
             if metric == "count"
-            else value.reshape(-1, 1, 1) / 255.0
+            else value.reshape(-1, 1, 1) / (1.0 if depth else 255.0)
             for metric, value in result.items()
         }
     return result

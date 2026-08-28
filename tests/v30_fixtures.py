@@ -10,7 +10,7 @@ import io
 import json
 from fractions import Fraction
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import av
 import numpy as np
@@ -26,6 +26,10 @@ _TASK_TEXT = "Arrange the colored blocks."
 _STAT_METRICS = ("min", "max", "mean", "std", "count", "q01", "q10", "q50", "q90", "q99")
 _COLOR_FRAME_CAPACITY = 1 + (255 - 16) // 20
 _COLOR_EPISODE_CAPACITY = 1 + (255 - 32) // 16
+_DEPTH_QMAX = 4095
+_DEPTH_MIN = 0.01
+_DEPTH_MAX = 10.0
+_DEPTH_SHIFT = 3.5
 
 
 def make_lerobot_v30_fixture(
@@ -34,6 +38,8 @@ def make_lerobot_v30_fixture(
     lengths: tuple[int, ...] = (6, 8, 5),
     fps: float = 5.0,
     cameras: tuple[str, ...] = ("observation.images.main", "observation.images.wrist"),
+    depth_cameras: tuple[str, ...] = (),
+    depth_unit: str = "mm",
     video_shards_per_episode: bool = False,
     non_padded_video_template: bool = False,
 ) -> Path:
@@ -55,18 +61,21 @@ def make_lerobot_v30_fixture(
         )
     if not isinstance(fps, (int, float)) or isinstance(fps, bool) or fps <= 0:
         raise ValueError("fps must be positive")
-    if not cameras or len(set(cameras)) != len(cameras):
-        raise ValueError("cameras must be unique and nonempty")
+    all_cameras = (*cameras, *depth_cameras)
+    if not all_cameras or len(set(all_cameras)) != len(all_cameras):
+        raise ValueError("RGB and depth cameras must be unique and nonempty")
+    if depth_unit not in {"m", "mm"}:
+        raise ValueError("depth_unit must be 'm' or 'mm'")
 
     root = tmp_path / "lerobot-v30"
     root.mkdir(parents=True)
     all_rows: list[dict[str, object]] = []
     episode_rows: list[dict[str, object]] = []
-    episode_numeric_values: list[dict[str, list[tuple[float, ...]]]] = []
+    episode_numeric_values: list[dict[str, list[Any]]] = []
     global_offset = 0
 
     for episode_index, length in enumerate(lengths):
-        numeric_values: dict[str, list[tuple[float, ...]]] = {
+        numeric_values: dict[str, list[Any]] = {
             name: []
             for name in (
                 "observation.state",
@@ -92,7 +101,7 @@ def make_lerobot_v30_fixture(
             values = {
                 "observation.state": state,
                 "action": action,
-                "observation.matrix": tuple(value for row in matrix for value in row),
+                "observation.matrix": matrix,
                 "observation.enabled": (float(enabled),),
                 "timestamp": (frame_index / fps,),
                 "frame_index": (float(frame_index),),
@@ -164,7 +173,7 @@ def make_lerobot_v30_fixture(
             "dataset_from_index": global_offset,
             "dataset_to_index": global_offset + length,
         }
-        for camera in cameras:
+        for camera in all_cameras:
             video_index = episode_index if video_shards_per_episode else 0
             video_from = 0.0 if video_shards_per_episode else global_offset / fps
             row[f"videos/{camera}/chunk_index"] = 0
@@ -255,13 +264,56 @@ def make_lerobot_v30_fixture(
                 ]
                 offset += length
 
+    for camera_index, camera in enumerate(depth_cameras):
+        if video_shards_per_episode:
+            for episode_index, length in enumerate(lengths):
+                filename = (
+                    f"file-{episode_index}.mp4"
+                    if non_padded_video_template
+                    else f"file-{episode_index:03d}.mp4"
+                )
+                video_path = root / f"videos/{camera}/chunk-000/{filename}"
+                video_path.parent.mkdir(parents=True, exist_ok=True)
+                values = tuple(
+                    expected_depth_mm(camera_index, episode_index, frame_index)
+                    for frame_index in range(length)
+                )
+                _write_depth_video(video_path, values, fps)
+                decoded = decoded_depth_values(video_path)
+                if len(decoded) != len(values):
+                    raise RuntimeError("fixture depth encoder produced an unexpected frame count")
+                video_values[episode_index][camera] = [
+                    (value / 1000.0 if depth_unit == "m" else value,)
+                    for value in decoded
+                ]
+        else:
+            filename = "file-0.mp4" if non_padded_video_template else "file-000.mp4"
+            video_path = root / f"videos/{camera}/chunk-000/{filename}"
+            video_path.parent.mkdir(parents=True)
+            values = tuple(
+                expected_depth_mm(camera_index, episode_index, frame_index)
+                for episode_index, length in enumerate(lengths)
+                for frame_index in range(length)
+            )
+            _write_depth_video(video_path, values, fps)
+            decoded = decoded_depth_values(video_path)
+            if len(decoded) != len(values):
+                raise RuntimeError("fixture depth encoder produced an unexpected frame count")
+            offset = 0
+            for episode_index, length in enumerate(lengths):
+                video_values[episode_index][camera] = [
+                    (value / 1000.0 if depth_unit == "m" else value,)
+                    for value in decoded[offset : offset + length]
+                ]
+                offset += length
+
     episode_stats: list[dict[str, dict[str, list[float]]]] = []
     for episode_index in range(len(lengths)):
         values = episode_numeric_values[episode_index] | video_values[episode_index]
         stats = {
             feature: _feature_stats(
                 feature_values,
-                _stats_width(feature),
+                _stats_shape(feature),
                 _stats_dtype(feature),
             )
             for feature, feature_values in values.items()
@@ -271,7 +323,7 @@ def make_lerobot_v30_fixture(
             for metric, value in feature_stats.items():
                 episode_rows[episode_index][f"stats/{feature}/{metric}"] = (
                     value
-                    if feature not in cameras or metric == "count"
+                    if feature not in all_cameras or metric == "count"
                     else [[[channel]] for channel in value]
                 )
         episode_rows[episode_index]["meta/episodes/chunk_index"] = 0
@@ -287,7 +339,7 @@ def make_lerobot_v30_fixture(
         )
         for feature in episode_stats[0]
     }
-    for camera in cameras:
+    for camera in all_cameras:
         stats[camera] = _image_stats_shape(stats[camera])
     (meta / "stats.json").write_text(json.dumps(stats, sort_keys=True), encoding="utf-8")
 
@@ -341,6 +393,28 @@ def make_lerobot_v30_fixture(
                     },
                 }
                 for camera in cameras
+            },
+            **{
+                camera: {
+                    "dtype": "video",
+                    "shape": [_FRAME_HEIGHT, _FRAME_WIDTH, 1],
+                    "names": ["height", "width", "channels"],
+                    "info": {
+                        "video.codec": "hevc",
+                        "video.fps": fps,
+                        "video.height": _FRAME_HEIGHT,
+                        "video.pix_fmt": "gray12le",
+                        "video.width": _FRAME_WIDTH,
+                        "video.channels": 1,
+                        "is_depth_map": True,
+                        "depth_unit": depth_unit,
+                        "video.depth_min": _DEPTH_MIN,
+                        "video.depth_max": _DEPTH_MAX,
+                        "video.shift": _DEPTH_SHIFT,
+                        "video.use_log": True,
+                    },
+                }
+                for camera in depth_cameras
             },
             "timestamp": {"dtype": "float32", "shape": [1], "names": None},
             "frame_index": {"dtype": "int64", "shape": [1], "names": None},
@@ -396,6 +470,13 @@ def expected_color(camera_index: int, episode_index: int, frame_index: int) -> t
     return color
 
 
+def expected_depth_mm(camera_index: int, episode_index: int, frame_index: int) -> int:
+    """Return a stable millimetre value for one depth fixture frame."""
+    if min(camera_index, episode_index, frame_index) < 0:
+        raise ValueError("depth indices must be nonnegative")
+    return 700 + camera_index * 100 + episode_index * 250 + frame_index * 20
+
+
 def colors_for_episode(camera_index: int, episode_index: int, length: int) -> tuple[tuple[int, int, int], ...]:
     """Return the expected decoded color sequence for one fixture episode."""
     return tuple(expected_color(camera_index, episode_index, frame_index) for frame_index in range(length))
@@ -405,6 +486,17 @@ def decoded_colors(path: Path) -> tuple[tuple[int, int, int], ...]:
     """Decode an MP4 and normalize each uniform test frame to its RGB code."""
     with av.open(str(path)) as container:
         return tuple(_normalized_rgb(frame.to_ndarray(format="rgb24")) for frame in container.decode(video=0))
+
+
+def decoded_depth_values(path: Path) -> tuple[float, ...]:
+    """Decode uniform fixture depth frames into their recorded millimetres."""
+    result = []
+    with av.open(str(path)) as container:
+        for frame in container.decode(video=0):
+            codes = frame.to_ndarray(format="gray12le")
+            values = _dequantize_depth_codes(codes)
+            result.append(float(np.median(values)))
+    return tuple(result)
 
 
 def dominant_test_color(jpeg: bytes) -> tuple[int, int, int]:
@@ -452,17 +544,58 @@ def _write_video(path: Path, colors: Iterable[tuple[int, int, int]], fps: float)
             container.mux(packet)
 
 
+def _write_depth_video(path: Path, values_mm: Iterable[int], fps: float) -> None:
+    rate = Fraction(fps).limit_denominator(10_000)
+    with av.open(str(path), mode="w", format="mp4") as container:
+        stream = container.add_stream("hevc", rate=rate)
+        stream.width = _FRAME_WIDTH
+        stream.height = _FRAME_HEIGHT
+        stream.pix_fmt = "gray12le"
+        stream.time_base = Fraction(rate.denominator, rate.numerator)
+        stream.options = {"x265-params": "lossless=1"}
+        for index, value in enumerate(values_mm):
+            depth = np.full((_FRAME_HEIGHT, _FRAME_WIDTH), value, dtype=np.float32)
+            codes = _quantize_depth_mm(depth)
+            frame = av.VideoFrame.from_ndarray(codes, format="gray12le")
+            stride = frame.planes[0].line_size // np.dtype(np.uint16).itemsize
+            plane = np.frombuffer(frame.planes[0], dtype=np.uint16).reshape(
+                _FRAME_HEIGHT, stride
+            )
+            plane[:, :_FRAME_WIDTH] = codes
+            frame.pts = index
+            frame.time_base = stream.time_base
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+
+def _quantize_depth_mm(values: np.ndarray) -> np.ndarray:
+    shift_mm = np.float32(_DEPTH_SHIFT * 1000.0)
+    low = np.log(np.float32(_DEPTH_MIN * 1000.0) + shift_mm)
+    high = np.log(np.float32(_DEPTH_MAX * 1000.0) + shift_mm)
+    normalized = (np.log(values.astype(np.float32) + shift_mm) - low) / (high - low)
+    return np.rint(normalized * _DEPTH_QMAX).clip(0, _DEPTH_QMAX).astype(np.uint16)
+
+
+def _dequantize_depth_codes(codes: np.ndarray) -> np.ndarray:
+    low = np.log(_DEPTH_MIN + _DEPTH_SHIFT)
+    high = np.log(_DEPTH_MAX + _DEPTH_SHIFT)
+    metres = np.exp(codes.astype(np.float32) / _DEPTH_QMAX * (high - low) + low) - _DEPTH_SHIFT
+    return np.rint(np.clip(metres, _DEPTH_MIN, _DEPTH_MAX) * 1000.0)
+
+
 def _feature_stats(
-    values: list[tuple[float, ...]],
-    width: int,
+    values: list[Any],
+    shape: tuple[int, ...],
     dtype: np.dtype,
-) -> dict[str, list[float]]:
+) -> dict[str, Any]:
     if not values:
         raise ValueError("statistics require at least one value")
-    dimensions = len(values[0])
-    if width <= 0 or dimensions % width or any(len(value) != dimensions for value in values):
-        raise ValueError("statistics require equally shaped values")
-    samples = np.asarray(values, dtype=dtype).reshape(-1, width)
+    try:
+        samples = np.asarray(values, dtype=dtype).reshape((len(values), *shape))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("statistics require values matching the declared shape") from exc
     batch = samples.astype(np.result_type(samples.dtype, np.float32), copy=False)
     means = np.mean(batch, axis=0)
     mean_of_squares = np.mean(batch**2, axis=0)
@@ -475,24 +608,29 @@ def _feature_stats(
         ).tolist(),
         "count": [len(values)],
     }
+    flattened = batch.reshape(len(batch), -1)
     for quantile in (0.01, 0.10, 0.50, 0.90, 0.99):
-        result[f"q{int(quantile * 100):02d}"] = [
-            _official_histogram_quantile(batch[:, column], quantile)
-            for column in range(width)
-        ]
+        result[f"q{int(quantile * 100):02d}"] = np.asarray(
+            [
+                _official_histogram_quantile(flattened[:, column], quantile)
+                for column in range(flattened.shape[1])
+            ]
+        ).reshape(shape).tolist()
     return result
 
 
-def _stats_width(feature: str) -> int:
+def _stats_shape(feature: str) -> tuple[int, ...]:
     if feature in {"observation.state", "action"} or feature.startswith("observation.images."):
-        return 3
+        return (3,)
+    if feature.startswith("observation.depth."):
+        return (1,)
     if feature == "observation.matrix":
-        return 2
-    return 1
+        return (2, 2)
+    return (1,)
 
 
 def _stats_dtype(feature: str) -> np.dtype:
-    if feature.startswith("observation.images."):
+    if feature.startswith(("observation.images.", "observation.depth.")):
         return np.dtype(np.float64)
     if feature in {
         "observation.state",

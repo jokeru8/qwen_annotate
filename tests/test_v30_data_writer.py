@@ -798,7 +798,7 @@ def test_locates_global_episode_range_at_local_zero_in_a_later_shard(
     assert output["index"].to_pylist() == list(range(5))
 
 
-def test_preserves_caller_order_and_compacts_mixed_tasks_by_first_use(
+def test_preserves_caller_order_and_compacts_mixed_tasks_by_source_order(
     tmp_path: Path,
 ) -> None:
     root = make_lerobot_v30_fixture(tmp_path)
@@ -809,21 +809,21 @@ def test_preserves_caller_order_and_compacts_mixed_tasks_by_first_use(
         root,
         tmp_path / "staging",
         dataset,
-        [2, 0],
+        [0, 2],
         read_v30_info(root),
     )
 
     output = pq.read_table(result.parquet_files[0])
-    assert [placement.source_index for placement in result.placements] == [2, 0]
+    assert [placement.source_index for placement in result.placements] == [0, 2]
     assert [placement.tasks for placement in result.placements] == [
-        (_SECOND_TASK,),
         ("Arrange the colored blocks.",),
+        (_SECOND_TASK,),
     ]
     assert output["note"].to_pylist() == [
-        *(f"episode 2, frame {index}" for index in range(5)),
         *(f"episode 0, frame {index}" for index in range(6)),
+        *(f"episode 2, frame {index}" for index in range(5)),
     ]
-    assert output["task_index"].to_pylist() == [0] * 5 + [1] * 6
+    assert output["task_index"].to_pylist() == [1] * 6 + [0] * 5
     assert result.task_table.to_pylist() == [
         {"task_index": 0, "task": _SECOND_TASK},
         {"task_index": 1, "task": "Arrange the colored blocks."},
@@ -959,6 +959,18 @@ def test_recomputes_selected_numeric_episode_and_aggregate_stats(
     )
     assert "note" not in result.aggregate_stats
     assert "language_events" not in result.aggregate_stats
+    np.testing.assert_allclose(
+        result.episode_stats[0]["observation.matrix"]["mean"],
+        [[2.0, 2.0], [4.0, 0.0]],
+    )
+    np.testing.assert_allclose(
+        result.episode_stats[1]["observation.matrix"]["mean"],
+        [[0.0, 2.5], [2.5, 2.5]],
+    )
+    np.testing.assert_allclose(
+        result.aggregate_stats["observation.matrix"]["mean"],
+        [[10 / 11, 25 / 11], [35 / 11, 15 / 11]],
+    )
 
 
 def test_retains_basic_only_stats_profile_declared_by_source(tmp_path: Path) -> None:
@@ -1018,17 +1030,18 @@ def test_all_selected_numeric_stats_match_pinned_fixture_metadata(
     ).to_pylist()
     for feature, actual in result.aggregate_stats.items():
         for metric, values in actual.items():
-            assert values == pytest.approx(
+            np.testing.assert_allclose(
+                values,
                 expected_aggregate[feature][metric],
-                rel=1e-6,
-                abs=1e-6,
+                rtol=1e-6,
+                atol=1e-6,
             )
         for episode_index, episode in result.episode_stats.items():
             for metric, values in episode[feature].items():
                 expected = expected_episodes[episode_index][
                     f"stats/{feature}/{metric}"
                 ]
-                assert values == pytest.approx(expected, rel=1e-6, abs=1e-6)
+                np.testing.assert_allclose(values, expected, rtol=1e-6, atol=1e-6)
 
 
 def test_preserves_embedded_image_feature_and_recomputes_rgb_stats(
@@ -1099,6 +1112,62 @@ def test_preserves_embedded_image_feature_and_recomputes_rgb_stats(
         type=image_stats_type,
     )
     assert episode_stat_column.type.equals(image_stats_type)
+
+
+def test_preserves_embedded_depth_image_stats_in_recorded_units(
+    tmp_path: Path,
+) -> None:
+    root = make_lerobot_v30_fixture(tmp_path)
+    name = "observation.depth.embedded"
+    encoded = io.BytesIO()
+    Image.fromarray(np.full((2, 2), 1234, dtype=np.uint16)).save(
+        encoded,
+        format="TIFF",
+    )
+    data_path = root / "data/chunk-000/file-000.parquet"
+    data = pq.read_table(data_path)
+    image_type = pa.struct(
+        [pa.field("bytes", pa.binary()), pa.field("path", pa.string())]
+    )
+    data = data.add_column(
+        data.schema.get_field_index("timestamp"),
+        name,
+        pa.array(
+            [{"bytes": encoded.getvalue(), "path": "depth.tiff"}] * data.num_rows,
+            type=image_type,
+        ),
+    )
+    pq.write_table(data, data_path)
+    info = read_v30_info(root)
+    features = info["features"]
+    assert isinstance(features, dict)
+    features[name] = {
+        "dtype": "image",
+        "shape": [2, 2, 1],
+        "names": None,
+        "info": {"is_depth_map": True, "depth_unit": "mm"},
+    }
+    (root / "meta/info.json").write_text(json.dumps(info), encoding="utf-8")
+    stats_path = root / "meta/stats.json"
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    stats[name] = {
+        metric: ([19] if metric == "count" else [[[1234.0]]])
+        for metric in stats["action"]
+    }
+    stats_path.write_text(json.dumps(stats), encoding="utf-8")
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+
+    result = write_v30_data_subset(
+        root,
+        tmp_path / "staging",
+        dataset,
+        [2],
+        read_v30_info(root),
+    )
+
+    assert result.aggregate_stats[name]["mean"] == [[[1234.0]]]
+    assert result.episode_stats[0][name]["mean"] == [[[1234.0]]]
+    assert result.aggregate_stats[name]["count"] == [5]
 
 
 @pytest.mark.parametrize(

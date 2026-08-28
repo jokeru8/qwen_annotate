@@ -153,6 +153,11 @@ def extract_frames(
         except Exception as exc:
             raise ValueError(f"Unable to decode video {video.path}: {exc}") from exc
 
+        missing_local = sorted(set(range(episode_frame_count)) - seen_local)
+        if missing_local:
+            raise ValueError(
+                f"Video {video.path} is missing episode-local frame(s): {missing_local}"
+            )
         missing = [frame_index for frame_index in requested if frame_index not in found]
         if missing:
             raise ValueError(f"Video {video.path} is missing requested frame(s): {missing}")
