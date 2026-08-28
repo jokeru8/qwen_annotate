@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
+from pathlib import Path
 
 import pytest
 
@@ -30,3 +31,16 @@ def test_robo_annotate_console_command_loads_the_cli() -> None:
     assert len(commands) == 1
     cli = commands[0].load()
     assert cli.info.no_args_is_help is True
+
+
+def test_documentation_explains_lerobot_version_compatibility() -> None:
+    """Release docs must describe the supported LeRobot compatibility contract."""
+    readme = Path("README.md").read_text(encoding="utf-8")
+    operations = Path("docs/operations.md").read_text(encoding="utf-8")
+
+    assert "LeRobot v2.1" in readme
+    assert "LeRobot v3.0" in readme
+    assert "自动识别" in readme
+    assert "--accepted-only" in operations
+    assert "重新编码" in operations
+    assert "v3-validation" in operations

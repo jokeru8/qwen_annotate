@@ -1,6 +1,6 @@
 # Robo-annotate 操作手册
 
-本文描述当前代码已经实现的可复现流程。所有示例均以官方仓库 `Qwen/Qwen3.8-27B`、固定安装目录 `/mnt/data/user/zhoukr/models/Qwen3.8-27B` 和 LeRobot v2.1 为准。
+本文描述当前代码已经实现的可复现流程。所有主流程示例均以官方仓库 `Qwen/Qwen3.8-27B`、固定安装目录 `/mnt/data/user/zhoukr/models/Qwen3.8-27B` 和默认优先的 LeRobot v2.1 为准；LeRobot v3.0 使用相同 CLI 与配置接口。
 
 ## 1. 环境与只读预检
 
@@ -14,7 +14,31 @@ uv run pytest -q
 uv run Robo-annotate inspect examples/complete.yaml
 ```
 
-`inspect` 在推理前严格检查 v2.1 版本、连续 episode index、parquet 行数、任务引用、相机集合、每路视频 frame/FPS/尺寸和 metadata 总数。它不创建 workspace。
+`inspect` 在推理前从 `meta/info.json` 自动识别严格的 `v2.1` 或 `v3.0`，不需要命令行版本参数或 YAML 版本字段。未知或缺失版本会 fail closed。两种格式都会检查连续 episode index、数据行、任务引用、相机集合、每路视频 frame/FPS/尺寸和 metadata 总数；v3.0 还会解析多个 episode 共用的 Parquet/MP4 分片及其行区间和时间区间。它不创建 workspace。
+
+v2.1 仍是默认、主要和文档优先格式。v3.0 配置中的路径和标注同样使用英文，例如可把第 2 节完整配置的对应字段改为：
+
+```yaml
+source: /path/to/lerobot-v30-source
+work_dir: /path/to/v30-annotation-workspace
+high_level_instruction: arrange the orange juice and green tea neatly
+subtasks:
+  - {skill: pick, text: Pick up the green tea with the right hand.}
+  - {skill: place, text: Place the green tea on the tray.}
+```
+
+随后直接运行相同命令；不需要也不能指定输出版本：
+
+```bash
+uv run Robo-annotate inspect config-v30.yaml
+uv run Robo-annotate annotate config-v30.yaml --episodes 0 --max-concurrency 1
+uv run Robo-annotate convert /path/to/v30-annotation-workspace \
+  --output /path/to/lerobot-v30-annotated
+uv run Robo-annotate validate /path/to/lerobot-v30-annotated \
+  --source /path/to/lerobot-v30-source
+```
+
+发布结果始终保持源数据集版本：v2.1 输入生成 v2.1 输出，v3.0 输入生成 v3.0 输出。本项目不执行 v2.1 与 v3.0 之间的迁移。
 
 2026-08-22 的只读预检结果如下，不能视为模型 smoke 结果：
 
@@ -182,7 +206,7 @@ workspace 内 `episodes/*.json` 是权威状态，`summary.json` 可恢复，`lo
 
 ```bash
 uv run Robo-annotate review WORK_DIR
-# stdout 是 WORK_DIR/previews/needs_review/index.html
+# stdout points to WORK_DIR/previews/needs_review/index.html
 uv run Robo-annotate review WORK_DIR --apply decision_episode_000003.json
 ```
 
@@ -193,7 +217,7 @@ decision 文件必须只含 `episode_index`、`source_fingerprint`、`run_finger
 ```bash
 UV_PROJECT_ENVIRONMENT=/tmp/Robo-annotate-latest-env \
   uv run Robo-annotate review WORK_DIR --serve
-# 浏览器打开 http://127.0.0.1:8765
+# Open http://127.0.0.1:8765 in a browser.
 ```
 
 界面会列出全部状态，并以整齐的 2×2 等大网格同步显示四路相机；共享帧进度条独占整行，与视频网格左右边缘对齐。Space 播放/暂停，左右方向键逐帧，Shift+方向键跳 10 帧，`B` 在当前帧添加边界，Delete/Backspace 删除最近边界；时间线边界手柄可直接拖动，也可聚焦后用方向键微调。时间线中的边界帧属于后一个 subtask。未提交的边界、起始任务、说明和接管状态会按 episode 保存在当前页面内存中，切换 episode 不会丢失；刷新/关闭页面仍会清空草稿。
@@ -210,14 +234,14 @@ ssh -L 8765:127.0.0.1:8765 USER@HOST
 
 ## 7. 转换与独立验证
 
-完整发布保留源 payload 字节和编号，要求每个 episode 都已接受：
+完整发布要求每个 episode 都已接受，并保留源 payload 字节、编号和数据集版本：
 
 ```bash
 uv run Robo-annotate convert WORK_DIR --output /path/to/dataset_annotated
 uv run Robo-annotate validate /path/to/dataset_annotated --source /path/to/source
 ```
 
-输出兼容参考公开格式：`meta/info.json` 增加 `subtask_template`/逐 episode instruction；新增 `meta/lerobot_annotations.json` 和 `meta/task_info/task_0.json`。complete episode 省略 `start_subtask_index`，DAgger episode 明确保存它（包括 0）。不会发布内部 confidence、prompt 或 decision source。
+对于 v2.1，输出继续在 `meta/info.json` 中增加 `subtask_template`/逐 episode instruction。对于 v3.0，普通转换保留官方核心 metadata 和共享 Parquet/MP4 payload 字节，不向官方 `info.json` 注入自定义字段。两种版本都新增 `meta/lerobot_annotations.json` 和 `meta/task_info/task_0.json`；complete episode 省略 `start_subtask_index`，DAgger episode 明确保存它（包括 0）。不会发布内部 confidence、prompt 或 decision source。
 
 只发布 accepted 子集：
 
@@ -226,7 +250,7 @@ uv run Robo-annotate convert WORK_DIR --accepted-only --output /path/to/accepted
 uv run Robo-annotate validate /path/to/accepted_subset
 ```
 
-accepted-only 会连续重编号 episode、`frame_index`/`episode_index`/全局 `index`，复制选中视频并对 parquet 与全部视频像素重新计算 stats。因此它是新数据集；原 source 不能作为同编号 payload checksum 基准，验证时通常省略 `--source`。
+`--accepted-only` 会连续重编号 episode、`frame_index`/`episode_index`/全局 `index`，并从输出 payload 重新计算 stats。对于 v2.1，它复制选中的独立 episode 视频；对于 v3.0，共享分片可能同时包含已接受和未接受的 episode，因此转换会截取并重建 Parquet、压缩实际引用的 task，再解码选中的共享 MP4 时间切片并重新编码新视频。v3.0 accepted-only 的视频是重新编码结果，不能描述为字节不变或无损复制。accepted-only 在两种版本下都是新数据集；原 source 不能作为同编号 payload checksum 基准，验证时通常省略 `--source`。
 
 默认 `validate` 是 `strict_deep`：独立读取发布目录，校验 metadata/schema/index/timestamp、视频、annotation/task_info、payload 集、完整数值 quantile 和逐像素视频统计。可用 `--no-deep-video-stats` 得到 `strict_structural`，它会明确报告跳过 `video_payload_stat_equality`。
 
@@ -238,6 +262,17 @@ uv run Robo-annotate validate LEGACY_DATASET \
 ```
 
 该模式报告 `legacy_structural`（无 source）或 `source_backed_legacy`（提供 source），并明确列出跳过的 numeric quantile/video payload stats checks。`--allow-legacy-sampled-image-stats` 与默认 deep 互斥，不能省略 `--no-deep-video-stats`。转换与验证都拒绝覆盖、symlink/特殊文件、缺失/额外 payload 和 source checksum 变化。
+
+### 可选的 LeRobot v3.0 官方 loader 验证
+
+默认安装不会引入官方 `lerobot` 包；v3.0 运行时只使用项目已有依赖。需要执行额外兼容性 oracle 时，安装固定为 `lerobot[dataset]==0.6.1` 的 `v3-validation` extra：
+
+```bash
+uv sync --extra dev --extra v3-validation
+uv run pytest tests/test_lerobot_v30_oracle.py -v
+```
+
+oracle 会让官方 loader 分别加载严格合成的共享分片 v3.0 源数据、普通转换结果和 accepted-only 重建结果，并读取实际视频帧。当前首版没有真实 v3.0 数据样本，兼容性门槛来自官方 schema、严格合成 fixture 和上述固定版本 loader；取得真实样本后仍应补做 inspect、少量标注、review、两种 convert、独立 validate 与 oracle 验收。
 
 ## 8. Golden 评测门槛
 
@@ -297,7 +332,7 @@ concurrency | model_revision | episodes/hour | peak GPU MiB | decode CPU % | err
 
 - timeout/临时 5xx/限流：客户端在有限预算内退避重试。服务恢复后再次执行相同 annotate 命令，`pending`/中间状态会恢复；`failed` 是终态，需要新 workspace 重跑。
 - OOM：多相机 broad 首次 OOM 时会退化为仅主相机并加大 stride；再次 OOM 或 dense OOM 记为 `failed/model_oom`。降低 `--max-concurrency`，或在显存已被占用时降低 vLLM `--gpu-memory-utilization`；后者会改变容量，必须重新验证单 episode/并发。然后用新 workspace 重跑，不要手改 episode JSON。
-- 损坏/缺失视频：`inspect` 或推理记为 `source_or_video`。先在 source 所属采集/修复流程恢复合法 v2.1 payload，再重新 inspect，并使用新 workspace；source 指纹改变时旧结果会被拒绝。
+- 损坏/缺失视频：`inspect` 或推理记为 `source_or_video`。先在 source 所属采集/修复流程恢复合法的原版本 payload，再重新 inspect，并使用新 workspace；source 指纹改变时旧结果会被拒绝。v3.0 中共享分片变化会使所有引用它的 episode 指纹失效。
 - 中断/进程退出：原子 stage 状态保留；直接重复 annotate。status 的 summary 可由权威 episode 文件恢复。
 - workspace/provenance 损坏：保留目录取证，使用新空 workspace。不要删除 manifest 后继续写旧 episode。
 - conversion 失败：最终 output 不会部分覆盖；修复原因后换一个不存在的 output 路径重跑。只删除工具创建且确认属于本次失败的 staging 目录。
@@ -306,11 +341,17 @@ concurrency | model_revision | episodes/hour | peak GPU MiB | decode CPU % | err
 
 ```bash
 uv run pytest -q
+uv run pytest tests/test_lerobot_v30.py tests/test_video_v30.py \
+  tests/test_converter_v30.py tests/test_release_validator_v30.py -v
 uv run Robo-annotate inspect examples/complete.yaml
 uv run Robo-annotate status WORK_DIR --json
 uv run Robo-annotate convert WORK_DIR --output DATASET_ANNOTATED
 uv run Robo-annotate validate DATASET_ANNOTATED --source SOURCE_DATASET
 uv run Robo-annotate evaluate WORK_DIR --golden GOLDEN_DATASET --output WORK_DIR/metrics.json
+
+# Optional official LeRobot v3.0 compatibility oracle.
+uv sync --extra dev --extra v3-validation
+uv run pytest tests/test_lerobot_v30_oracle.py -v
 ```
 
 确认所有 episode 已接受（或明确选择 accepted-only）、source tree hash 未变、release 独立验证通过、launch gates 全部 PASS，并把实际模型 SHA、vLLM server version、单 episode smoke 与吞吐数据补回本手册后再发布。
