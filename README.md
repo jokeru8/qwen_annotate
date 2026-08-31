@@ -7,7 +7,7 @@
 *The open annotation engine for embodied AI.*
 
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![LeRobot v2.1](https://img.shields.io/badge/LeRobot-v2.1-7C3AED)](https://github.com/huggingface/lerobot)
+[![LeRobot v2.1 + v3.0](https://img.shields.io/badge/LeRobot-v2.1%20%2B%20v3.0-7C3AED)](https://github.com/huggingface/lerobot)
 [![Qwen3.8 27B](https://img.shields.io/badge/Qwen3.8-27B-615CED)](https://huggingface.co/Qwen)
 [![测试框架](https://img.shields.io/badge/测试-pytest-0A9EDC?logo=pytest&logoColor=white)](#开发与测试)
 
@@ -19,7 +19,7 @@
 
 ---
 
-Robo-annotate 是一个面向具身智能数据的半自动标注引擎。当前内置的首个工作流支持 **LeRobot v2.1** 数据集，并通过 OpenAI-compatible API 接入 Qwen3.8-27B：你只需要提供高层任务、按顺序排列的子任务模板和相机名称，系统就会完成整段理解、边界精修、约束检查和结果持久化。
+Robo-annotate 是一个面向具身智能数据的半自动标注引擎。当前工作流完整支持 **LeRobot v2.1** 和 **LeRobot v3.0** 数据集，其中 v2.1 仍是默认、主要和文档优先格式。系统会自动识别输入版本，并通过 OpenAI-compatible API 接入 Qwen3.8-27B：你只需要提供高层任务、按顺序排列的子任务模板和相机名称，系统就会完成整段理解、边界精修、约束检查和结果持久化。
 
 它不是“模型给出一个答案就直接写回数据集”的一次性脚本。每个自动结果都有采样来源、模型版本、配置指纹和状态记录；低置信度、结果冲突或违反硬约束的 episode 会进入人工复核，而不会被静默发布。
 
@@ -27,6 +27,7 @@ Robo-annotate 是一个面向具身智能数据的半自动标注引擎。当前
 
 | 能力 | 说明 |
 | --- | --- |
+| LeRobot 双版本 | 自动识别 v2.1 或使用共享 Parquet/MP4 分片的 v3.0，并以源版本发布结果 |
 | 两阶段自动标注 | 先对完整 episode 做稀疏粗定位，再围绕候选边界进行高密度精修 |
 | 多相机联合判断 | 使用主视角理解全局任务，并结合眼部、左右腕部等相机定位动作切换 |
 | 模板约束输出 | 模型只能从 YAML 中给出的有序子任务选择，不能临时发明标签 |
@@ -40,15 +41,15 @@ Robo-annotate 是一个面向具身智能数据的半自动标注引擎。当前
 
 ```mermaid
 flowchart LR
-    A["检查数据集<br/>inspect"] --> B["整集粗标<br/>coarse"]
-    B --> C["多相机精修<br/>refine"]
-    C --> D{"硬约束与<br/>一致性检查"}
-    D -->|通过| E["自动接受<br/>accepted"]
-    D -->|冲突或不确定| F["人工复核<br/>review"]
+    A["Inspect dataset"] --> B["Coarse annotation"]
+    B --> C["Multi-camera refinement"]
+    C --> D{"Constraints and consistency"}
+    D -->|Pass| E["Accepted"]
+    D -->|Conflict or uncertainty| F["Manual review"]
     F --> E
-    E --> G["转换数据集<br/>convert"]
-    G --> H["独立校验<br/>validate"]
-    H --> I["Golden 评测<br/>evaluate"]
+    E --> G["Convert dataset"]
+    G --> H["Independent validation"]
+    H --> I["Golden-set evaluation"]
 ```
 
 ### 两阶段推理
@@ -76,9 +77,9 @@ flowchart LR
 `boundaries: [220]` 表示：
 
 ```text
-前一个子任务：[0, 220)
-后一个子任务：[220, ...)
-                      ↑ frame 220 属于后一个子任务
+Previous subtask: [0, 220)
+Next subtask:     [220, ...)
+                  ↑ frame 220 belongs to the next subtask
 ```
 
 > 图中使用真实机器人数据与真实 workspace 结果展示标注形式。单个示例不代表完整精度评测；正式发布前请使用自己的 golden set 执行 `evaluate`。
@@ -110,7 +111,7 @@ uv run Robo-annotate review ./runs/drink-arrangement --serve
 
 - Python `3.12`
 - [uv](https://docs.astral.sh/uv/)
-- 可读取的 LeRobot `v2.1` 数据集
+- 可读取的 LeRobot `v2.1` 或 `v3.0` 数据集
 - 能提供 OpenAI-compatible 接口的 Qwen3.8-27B 推理服务
 - 下载模型时需要可用的 `hf` 命令行工具
 
@@ -151,11 +152,11 @@ CUDA_VISIBLE_DEVICES=0 vllm serve "$QWEN_MODEL_DIR" \
 ### 4. 创建配置
 
 ```yaml
-source: ./data/lerobot-source
+source: ./data/lerobot-v21-source
 work_dir: ./runs/drink-arrangement
 mode: complete
 
-high_level_instruction: 将橙汁和绿茶整齐摆放
+high_level_instruction: arrange the orange juice and green tea neatly
 primary_camera: observation.images.right_eye
 refine_cameras:
   - observation.images.right_eye
@@ -164,13 +165,13 @@ refine_cameras:
 
 subtasks:
   - skill: pick
-    text: 用右手拿起绿茶
+    text: Pick up the green tea with the right hand.
   - skill: handover
-    text: 用左手接过右手中的绿茶
+    text: Take the green tea from the right hand with the left hand.
   - skill: place
-    text: 用右手拿起橙汁并放到正确位置
+    text: Pick up the orange juice with the right hand and place it correctly.
   - skill: place
-    text: 用右手接过绿茶并放到正确位置
+    text: Take the green tea with the right hand and place it correctly.
 
 model:
   name: Qwen/Qwen3.8-27B
@@ -204,29 +205,58 @@ augmentation:
 ### 5. 运行完整流程
 
 ```bash
-# 推理前只读检查
+# Inspect the source without creating a workspace.
 uv run Robo-annotate inspect config.yaml
 
-# 先用单个 episode 做 smoke test
+# Run a single-episode smoke test first.
 uv run Robo-annotate annotate config.yaml \
   --episodes 0 \
   --max-concurrency 1
 
-# 确认无误后再批量运行
+# Continue with the batch after checking the smoke-test result.
 uv run Robo-annotate annotate config.yaml --max-concurrency 2
 
-# 查看状态与人工复核
+# Inspect status and open manual review.
 uv run Robo-annotate status ./runs/drink-arrangement
 uv run Robo-annotate review ./runs/drink-arrangement --serve
 
-# 创建新的已标注数据集并做独立校验
+# Publish a new annotated dataset and validate it independently.
 uv run Robo-annotate convert ./runs/drink-arrangement \
   --output ./data/lerobot-annotated
 uv run Robo-annotate validate ./data/lerobot-annotated \
-  --source ./data/lerobot-source
+  --source ./data/lerobot-v21-source
 ```
 
 完整转换要求所有 episode 都为 `accepted`。如果只想发布已接受子集，需要显式使用 `--accepted-only`；系统会连续重编号 episode、frame 和全局 index，并重新计算统计量。
+
+## LeRobot 格式兼容
+
+上面的快速开始首先展示 LeRobot v2.1，这是项目默认采用和优先介绍的格式。CLI 不需要版本参数，YAML 也没有版本字段；`inspect`、`annotate`、`convert` 和 `validate` 都会自动识别版本。`meta/info.json` 的 `codebase_version` 仅接受精确值 `v2.1` 或 `v3.0`，字段缺失或其他值都会 fail closed。
+
+LeRobot v3.0 允许多个 episode 共用 Parquet 与 MP4 分片。Robo-annotate 会根据 episode 元数据把共享分片解析成 episode 局部的数据行与视频时间切片。每个 boundary 和模型可见的 frame index 都采用 episode 局部半开坐标 `[0, length)`，其中 `length` 是该 episode 的帧数；边界帧属于后一个 subtask。要使用 v3.0，可复用前面的完整配置，只替换数据路径、workspace 和英文标注内容，例如：
+
+```yaml
+source: ./data/lerobot-v30-source
+work_dir: ./runs/v30-drink-arrangement
+mode: complete
+high_level_instruction: arrange the orange juice and green tea neatly
+subtasks:
+  - {skill: pick, text: Pick up the green tea with the right hand.}
+  - {skill: place, text: Place the green tea on the tray.}
+```
+
+检查和发布命令与 v2.1 相同：
+
+```bash
+uv run Robo-annotate inspect config-v30.yaml
+uv run Robo-annotate annotate config-v30.yaml --episodes 0 --max-concurrency 1
+uv run Robo-annotate convert ./runs/v30-drink-arrangement \
+  --output ./data/lerobot-v30-annotated
+uv run Robo-annotate validate ./data/lerobot-v30-annotated \
+  --source ./data/lerobot-v30-source
+```
+
+输出始终保持源数据集版本：v2.1 输入生成 v2.1 输出，v3.0 输入生成 v3.0 输出；项目不提供跨版本转换选项。普通 v3.0 转换保留官方核心元数据和共享 payload 字节。v3.0 的 `--accepted-only` 会从共享分片中重建独立数据集，其中 MP4 切片需要重新编码，不能视为无损复制。详细限制和可选官方 loader 验证见[操作手册](docs/operations.md)。
 
 ## 两种数据模式
 
@@ -243,13 +273,13 @@ uv run Robo-annotate validate ./data/lerobot-annotated \
 
 ```text
 runs/drink-arrangement/
-├── manifest.json          # 数据、配置、模型与 prompt 来源
-├── summary.json           # 可恢复的状态摘要
+├── manifest.json          # Dataset, config, model, and prompt provenance
+├── summary.json           # Recoverable status summary
 ├── episodes/
 │   └── episode_000000.json
 ├── logs/
-│   └── run.jsonl          # 状态转换审计链
-└── previews/              # 离线复核页面
+│   └── run.jsonl          # Status-transition audit log
+└── previews/              # Offline review pages
 ```
 
 `episodes/*.json` 是权威状态。重复执行相同标注命令时，系统会跳过终态 episode，并从已保存阶段继续；如果 source、配置、prompt 或模型来源不一致，则拒绝继续运行。
@@ -319,28 +349,28 @@ uv run Robo-annotate evaluate ./runs/drink-arrangement \
 
 ```text
 src/robo_annotate/
-├── pipeline.py          # episode 与批处理编排
-├── coarse.py            # 整集稀疏粗标
-├── refine.py            # 多相机边界精修
-├── constraints.py       # complete / DAgger 硬约束
-├── review_server.py     # 本地可视化复核 API
-├── review_web/          # 多相机复核前端
-├── converter.py         # 完整 / accepted-only 数据集转换
-├── release_validator.py # 发布一致性校验
-├── evaluation.py        # golden / DAgger 评测
-└── workspace.py         # 指纹、恢复与审计
+├── pipeline.py          # Episode and batch orchestration
+├── coarse.py            # Sparse whole-episode annotation
+├── refine.py            # Multi-camera boundary refinement
+├── constraints.py       # Complete and DAgger constraints
+├── review_server.py     # Local visual-review API
+├── review_web/          # Multi-camera review frontend
+├── converter.py         # Full and accepted-only conversion
+├── release_validator.py # Release consistency validation
+├── evaluation.py        # Golden-set and DAgger evaluation
+└── workspace.py         # Fingerprinting, recovery, and audit
 ```
 
 ## 开发与测试
 
 ```bash
-# 克隆仓库后安装开发依赖
+# Install development dependencies after cloning the repository.
 uv sync --extra dev
 
-# 全量测试
+# Run the complete default test suite.
 NODE_OPTIONS=--experimental-default-type=module uv run pytest -q
 
-# 命令行 smoke test
+# Run CLI smoke tests.
 uv run Robo-annotate --help
 uv run Robo-annotate inspect examples/complete.yaml
 ```

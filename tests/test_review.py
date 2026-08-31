@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from robo_annotate.cli import app
 from robo_annotate.config import AnnotationConfig
-from robo_annotate.lerobot import DatasetIndex, EpisodeInfo
+from robo_annotate.lerobot import DatasetIndex
 from robo_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
 from robo_annotate.prompts import PROMPT_VERSION
 from robo_annotate.review import (
@@ -23,6 +23,7 @@ from robo_annotate.review import (
 )
 from robo_annotate.video import FrameSample
 from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
+from tests.fixtures import make_episode_info
 
 
 NOW = datetime(2026, 8, 22, tzinfo=UTC)
@@ -38,7 +39,14 @@ def _workspace(tmp_path: Path, *, mode: str = "dagger_patch", reasons=None, issu
         path = source / f"{camera.replace('/', '_')}.mp4"
         path.write_bytes(b"video")
         videos[camera] = path
-    episode = EpisodeInfo(episode_index=0, length=240, task="task", parquet=parquet, videos=videos)
+    episode = make_episode_info(
+        episode_index=0,
+        length=240,
+        task="task",
+        parquet=parquet,
+        videos=videos,
+        fps=20.0,
+    )
     dataset = DatasetIndex(root=source, version="v2.1", fps=20.0, camera_keys=list(videos), episodes=[episode])
     config = AnnotationConfig.model_validate({
         "source": source, "work_dir": tmp_path / "work", "mode": mode,
@@ -92,9 +100,9 @@ def _workspace(tmp_path: Path, *, mode: str = "dagger_patch", reasons=None, issu
     store.save_episode(record)
     calls = []
 
-    def sample(path, camera, indices, fps):
-        calls.append((path, camera, list(indices), fps))
-        return [FrameSample(camera_key=camera, frame_index=i, timestamp_seconds=i / fps,
+    def sample(video, camera, indices):
+        calls.append((video, camera, list(indices)))
+        return [FrameSample(camera_key=camera, frame_index=i, timestamp_seconds=i / video.fps,
                             jpeg=f"jpeg:{camera}:{i}".encode()) for i in indices]
 
     services = ReviewServices(inspect_dataset=lambda cfg: dataset, sampler=sample, clock=lambda: NOW.replace(microsecond=2))
@@ -145,7 +153,10 @@ def test_review_renders_safe_evidence_json_and_exact_aliases(tmp_path: Path) -> 
     assert payload["candidates"] == [183, 184]
     assert (page.parent / "episode_000000" / "boundary-184-before.jpg").read_bytes() == b"jpeg:cam.eye:183"
     assert (page.parent / "episode_000000" / "boundary-184-after.jpg").read_bytes() == b"jpeg:cam.eye:184"
-    assert any(camera == "cam/wrist" and indices[0] == 164 and indices[-1] == 204 for _, camera, indices, _ in calls)
+    assert any(
+        camera == "cam/wrist" and indices[0] == 164 and indices[-1] == 204
+        for _, camera, indices in calls
+    )
 
 
 def test_empty_review_set_is_clear_and_does_not_sample(tmp_path: Path) -> None:
@@ -386,10 +397,10 @@ def test_source_change_during_sampling_never_publishes_new_bundle(tmp_path: Path
     destination = work / "previews/needs_review"
     calls = 0
 
-    def mutating_sampler(path, camera, indices, fps):
+    def mutating_sampler(video, camera, indices):
         nonlocal calls
         calls += 1
-        result = services.sampler(path, camera, indices, fps)
+        result = services.sampler(video, camera, indices)
         if calls == 1:
             source.joinpath("cam.eye.mp4").write_bytes(b"mutated-during-sample")
         return result

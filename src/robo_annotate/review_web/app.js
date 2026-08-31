@@ -3,6 +3,83 @@ export function frameFromTime(time, fps, length) {
   return Math.max(0, Math.min(length - 1, Math.round(time * fps)));
 }
 
+export function clampMediaTime(time, source) {
+  const from = source?.from_timestamp;
+  const to = source?.to_timestamp;
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return 0;
+  const upper = Math.max(from, to - Math.max(Number.MIN_VALUE, Math.abs(to) * Number.EPSILON));
+  if (!Number.isFinite(time)) return from;
+  return Math.max(from, Math.min(upper, time));
+}
+
+export function mediaTimeForFrame(frame, fps, source) {
+  if (!Number.isFinite(frame) || !Number.isFinite(fps) || fps <= 0) {
+    return clampMediaTime(source?.from_timestamp, source);
+  }
+  return clampMediaTime(source.from_timestamp + Math.max(0, frame) / fps, source);
+}
+
+export function localFrameForMediaTime(time, fps, source) {
+  if (!Number.isFinite(fps) || fps <= 0) return 0;
+  const localFrame = Math.round((clampMediaTime(time, source) - source.from_timestamp) * fps);
+  const lastFrame = Math.max(0, Math.round((source.to_timestamp - source.from_timestamp) * fps) - 1);
+  return Math.max(0, Math.min(lastFrame, localFrame));
+}
+
+export function installVideoSliceGuard(video, source, fps, onClamp = () => {}) {
+  const frameCount = Math.max(1, Math.round((source.to_timestamp - source.from_timestamp) * fps));
+  const lastFrame = frameCount - 1;
+  const endTarget = mediaTimeForFrame(lastFrame, fps, source);
+  const events = ["loadedmetadata", "pause", "play", "ratechange", "seeked", "seeking", "timeupdate"];
+  let cleaned = false;
+  let correcting = false;
+  let timer = null;
+
+  const clearTimer = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+  const stopAt = (frame, edge) => {
+    if (cleaned || correcting) return;
+    clearTimer(); correcting = true;
+    try {
+      if (!video.paused) video.pause();
+      const target = mediaTimeForFrame(frame, fps, source);
+      if (Math.abs(video.currentTime - target) > 1e-9) video.currentTime = target;
+      onClamp(frame, edge);
+    } finally {
+      correcting = false;
+    }
+  };
+  const inspect = () => {
+    if (cleaned || correcting) return;
+    clearTimer();
+    const time = video.currentTime;
+    if (!Number.isFinite(time)) return;
+    if (time < source.from_timestamp - 1e-9) {
+      stopAt(0, "start");
+      return;
+    }
+    if (time > endTarget + 1e-9 || (!video.paused && time >= endTarget - 1e-9)) {
+      stopAt(lastFrame, "end");
+      return;
+    }
+    if (video.paused) return;
+    const rate = Number.isFinite(video.playbackRate) && Math.abs(video.playbackRate) > 1e-9
+      ? Math.abs(video.playbackRate)
+      : 1;
+    timer = setTimeout(inspect, Math.max(4, (endTarget - time) / rate * 1000));
+  };
+
+  for (const event of events) video.addEventListener(event, inspect);
+  if (video.readyState !== 0) inspect();
+  return () => {
+    if (cleaned) return;
+    cleaned = true; clearTimer();
+    for (const event of events) video.removeEventListener(event, inspect);
+  };
+}
+
 export function segmentAt(frame, startSubtask, boundaries, subtaskCount) {
   let index = startSubtask;
   for (const boundary of boundaries) {
@@ -79,9 +156,15 @@ function seekOneVideo(video, targetTime) {
   });
 }
 
-export function seekVideosToFrame(videos, frame, fps) {
-  const targetTime = frame / fps;
-  return Promise.all([...videos].map(video => seekOneVideo(video, targetTime)));
+export function seekVideosToFrame(videos, frame, fps, sources) {
+  const entries = videos instanceof Map
+    ? [...videos.entries()]
+    : [...videos].map((video, index) => [String(index), video]);
+  return Promise.all(entries.map(([camera, video]) => {
+    const source = sources instanceof Map ? sources.get(camera) : sources?.[camera];
+    const targetTime = source ? mediaTimeForFrame(frame, fps, source) : frame / fps;
+    return seekOneVideo(video, targetTime);
+  }));
 }
 
 export function validateDraft(context, startSubtask, boundaries) {
@@ -132,7 +215,8 @@ export function finishSelection(view, generation) {
 const palette = ["#45c4a0", "#56a8e8", "#a98aef", "#ef9f62", "#df6f8f", "#8dbb54"];
 const state = {session: null, episodes: [], detail: null, frame: 0, boundaries: [], start: 0,
   filter: "all", takeover: false, primary: null, videos: new Map(), syncing: false, drafts: new Map(),
-  loading: false, saving: false, selectionGeneration: 0, seekGeneration: 0, syncLoopId: null};
+  loading: false, saving: false, selectionGeneration: 0, seekGeneration: 0, syncLoopId: null,
+  videoGuardCleanups: [], sliceGuardActive: false};
 
 const $ = id => document.getElementById(id);
 const api = async (url, options) => {
@@ -204,7 +288,7 @@ async function selectEpisode(index) {
   state.detail = detail; state.frame = 0;
   const draft = restoreDraft(state.drafts, detail);
   state.start = draft.start; state.boundaries = draft.boundaries; state.takeover = draft.takeover;
-  state.primary = state.session.primary_camera in state.detail.video_urls ? state.session.primary_camera : Object.keys(state.detail.video_urls)[0];
+  state.primary = state.session.primary_camera in state.detail.videos ? state.session.primary_camera : Object.keys(state.detail.videos)[0];
   $("start-subtask").value = String(state.start); $("decision-note").value = draft.note;
   $("frame-slider").max = String(state.detail.episode_length - 1);
   setText("episode-label", `EPISODE ${String(index).padStart(6,"0")}`); setText("task-title", state.detail.task);
@@ -213,24 +297,57 @@ async function selectEpisode(index) {
 }
 
 function renderVideos() {
+  for (const cleanup of state.videoGuardCleanups) cleanup();
+  state.videoGuardCleanups = [];
   state.videos.clear(); const root = $("video-grid"); root.replaceChildren(); root.className = "video-grid";
-  const cameras = Object.keys(state.detail.video_urls);
+  const cameras = Object.keys(state.detail.videos);
   for (const camera of cameras) {
     const card = document.createElement("button"); card.type = "button"; card.dataset.camera = camera; card.className = "video-card";
-    const video = document.createElement("video"); video.src = state.detail.video_urls[camera]; video.preload = "metadata"; video.muted = true; video.playsInline = true;
+    const video = document.createElement("video"); video.src = state.detail.videos[camera].url; video.preload = "metadata"; video.muted = true; video.playsInline = true;
     const label = document.createElement("span"); label.className = "camera-label"; label.textContent = camera;
     const frame = document.createElement("span"); frame.className = "camera-frame"; frame.textContent = "帧 0";
     card.append(video, label, frame); card.onclick = togglePlay;
     video.addEventListener("click", event => { event.preventDefault(); event.stopPropagation(); togglePlay(); });
-    state.videos.set(camera, video); root.append(card);
+    state.videos.set(camera, video);
+    state.videoGuardCleanups.push(installVideoSliceGuard(
+      video, state.detail.videos[camera], state.session.fps, frameIndex => clampPlaybackToFrame(frameIndex),
+    ));
+    root.append(card);
   }
 }
 
 function primaryVideo() { return state.videos.get(state.primary); }
+function clampPlaybackToFrame(frame) {
+  if (!state.detail || state.sliceGuardActive) return;
+  state.sliceGuardActive = true;
+  try {
+    pauseAll();
+    state.frame = Math.max(0, Math.min(state.detail.episode_length - 1, frame));
+    for (const [camera, video] of state.videos) {
+      if (video.readyState === 0) continue;
+      const targetTime = mediaTimeForFrame(state.frame, state.session.fps, state.detail.videos[camera]);
+      if (Math.abs(video.currentTime - targetTime) > 1e-9) video.currentTime = targetTime;
+    }
+    $("play-button").textContent = "▶";
+    updateFrameUI();
+  } finally {
+    state.sliceGuardActive = false;
+  }
+}
 function syncFromMaster(master) {
-  state.frame = frameFromTime(master.currentTime, state.session.fps, state.detail.episode_length);
-  const targetTime = state.frame / state.session.fps;
-  for (const video of state.videos.values()) {
+  const masterSource = state.detail.videos[state.primary];
+  const endTarget = mediaTimeForFrame(state.detail.episode_length - 1, state.session.fps, masterSource);
+  if (master.currentTime < masterSource.from_timestamp) {
+    clampPlaybackToFrame(0);
+    return;
+  }
+  if (master.currentTime >= endTarget) {
+    clampPlaybackToFrame(state.detail.episode_length - 1);
+    return;
+  }
+  state.frame = Math.min(state.detail.episode_length - 1, localFrameForMediaTime(master.currentTime, state.session.fps, masterSource));
+  for (const [camera, video] of state.videos) {
+    const targetTime = mediaTimeForFrame(state.frame, state.session.fps, state.detail.videos[camera]);
     if (video !== master && !video.seeking && needsFrameCorrection(video.currentTime, targetTime, state.session.fps)) {
       video.currentTime = targetTime;
     }
@@ -247,6 +364,7 @@ function startSyncLoop() {
     const master = primaryVideo();
     if (!master || master.paused) { state.syncLoopId = null; return; }
     if (!state.syncing) syncFromMaster(master);
+    if (master.paused) { state.syncLoopId = null; return; }
     state.syncLoopId = requestAnimationFrame(tick);
   };
   state.syncLoopId = requestAnimationFrame(tick);
@@ -254,13 +372,20 @@ function startSyncLoop() {
 async function seek(frame) {
   if (!state.detail) return; state.frame = Math.max(0, Math.min(state.detail.episode_length - 1, frame));
   const generation = ++state.seekGeneration; state.syncing = true; updateFrameUI();
-  try { await seekVideosToFrame(state.videos.values(), state.frame, state.session.fps); }
+  try { await seekVideosToFrame(state.videos, state.frame, state.session.fps, state.detail.videos); }
   finally { if (generation === state.seekGeneration) { state.syncing = false; updateFrameUI(); } }
 }
 function pauseAll() { stopSyncLoop(); for (const video of state.videos.values()) video.pause(); }
 async function togglePlay() {
   const master = primaryVideo(); if (!master) return;
-  if (master.paused) { await seek(state.frame); await Promise.all([...state.videos.values()].map(video => video.play().catch(() => {}))); $("play-button").textContent = "❚❚"; startSyncLoop(); }
+  if (master.paused) {
+    await seek(state.frame);
+    await Promise.all([...state.videos.values()].map(video => video.play().catch(() => {})));
+    if ([...state.videos.values()].some(video => video.paused)) {
+      pauseAll(); $("play-button").textContent = "▶"; return;
+    }
+    $("play-button").textContent = "❚❚"; startSyncLoop();
+  }
   else { pauseAll(); $("play-button").textContent = "▶"; }
 }
 function step(delta) { pauseAll(); $("play-button").textContent = "▶"; void seek(state.frame + delta); }

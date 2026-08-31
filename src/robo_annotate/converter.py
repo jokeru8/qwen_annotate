@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
-import errno
 import fcntl
 import hashlib
 import json
@@ -15,24 +13,32 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .augmentation import (
-    AUGMENTATION_PROMPT_VERSION,
-    EpisodeSubtasks,
-    augment_episodes,
-    valid_augmented_text,
-)
+from .augmentation import EpisodeSubtasks, augment_episodes, valid_augmented_text
 from .config import AnnotationConfig
 from .constraints import validate_annotation
 from .lerobot import DatasetIndex, inspect_dataset
+from .publication_metadata import (
+    SelectedEpisode,
+    atomic_json as _atomic_json,
+    read_bounded_json as _read_source_json,
+    write_public_annotations,
+)
 from .release_validator import ReleaseReport, validate_release
+from .secure_tree import rename_noreplace_at
 from .stats import iter_video_rgb_frames, recompute_stats, recompute_video_stats
 from .workspace import EpisodeRecord, RunManifest, WorkspaceStore, compute_run_fingerprint, compute_source_fingerprint
+from .writer_publication import (
+    _CleanupFailures,
+    capture_owned_directory_identity,
+    remove_owned_published_tree,
+    remove_owned_staging_tree,
+)
 
 
 @dataclass(frozen=True)
@@ -69,6 +75,7 @@ class ConversionReport(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     output: Path
+    dataset_version: Literal["v2.1", "v3.0"]
     accepted_only: bool
     episode_count: int = Field(ge=0)
     frame_count: int = Field(ge=0)
@@ -90,8 +97,14 @@ class ConversionReport(BaseModel):
     def canonical_public_facts(self) -> "ConversionReport":
         if self.payload_files != sorted(set(self.payload_files)):
             raise ValueError("payload_files must be sorted and unique")
-        if self.annotation_path != "meta/lerobot_annotations.json" or self.annotation_schema_version != "reference-v2.1":
+        expected_schema = f"reference-{self.dataset_version}"
+        if (
+            self.annotation_path != "meta/lerobot_annotations.json"
+            or self.annotation_schema_version != expected_schema
+        ):
             raise ValueError("unsupported public annotation schema")
+        if self.validation.dataset_version != self.dataset_version:
+            raise ValueError("validation report version must match conversion")
         if not self.validation.valid or self.validation.episode_count != self.episode_count or self.validation.frame_count != self.frame_count:
             raise ValueError("validation report counts must match conversion")
         return self
@@ -129,6 +142,8 @@ def convert_dataset(
     lock_path = out.parent / f".{out.name}.conversion.lock"
     lock_fd = _open_lock(lock_path)
     staging: Path | None = None
+    staging_identity: tuple[int, int, int] | None = None
+    published = False
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         _reject_existing(out)
@@ -139,59 +154,131 @@ def convert_dataset(
         augmented_texts = _augment_selected(config, manifest, records, services)
         staging = out.parent / f"{out.name}.staging-{secrets.token_hex(16)}"
         os.mkdir(staging, 0o700)
-        _copy_tree(source, staging, include_payload=not accepted_only)
+        staging_identity = capture_owned_directory_identity(staging)
+        if not (accepted_only and manifest.dataset_version == "v3.0"):
+            _copy_tree(source, staging, include_payload=not accepted_only)
         converted_at = datetime.now(UTC)
         if accepted_only:
-            frame_count = _rewrite_accepted_subset(
-                staging, source, out, manifest, dataset, records, converted_at, services,
-                augmented_texts,
-            )
+            if manifest.dataset_version == "v3.0":
+                from .converter_v30 import rewrite_accepted_v30_release
+
+                frame_count = rewrite_accepted_v30_release(
+                    staging,
+                    source,
+                    out,
+                    manifest,
+                    dataset,
+                    records,
+                    converted_at,
+                    augmented_texts,
+                    services,
+                )
+            else:
+                frame_count = _rewrite_accepted_subset(
+                    staging,
+                    source,
+                    out,
+                    manifest,
+                    dataset,
+                    records,
+                    converted_at,
+                    services,
+                    augmented_texts,
+                )
         else:
             frame_count = manifest.total_frames
-            _write_payload_sizes(staging)
-            _write_public_metadata(
-                staging, out, manifest, records, converted_at, augmented_texts
-            )
+            if manifest.dataset_version == "v3.0":
+                from .converter_v30 import write_full_v30_release
+
+                write_full_v30_release(
+                    staging,
+                    out,
+                    manifest,
+                    records,
+                    converted_at,
+                    augmented_texts,
+                )
+            else:
+                _write_payload_sizes(staging)
+                selected = [
+                    SelectedEpisode(
+                        record=record,
+                        source_index=record.episode_index,
+                        output_index=record.episode_index,
+                        length=manifest.episode_lengths[record.episode_index],
+                    )
+                    for record in records
+                ]
+                write_public_annotations(
+                    staging,
+                    out,
+                    manifest,
+                    selected,
+                    converted_at,
+                    augmented_texts,
+                    extend_info=True,
+                )
         validation = validate_release(
             staging,
             source=None if accepted_only else source,
             services=services,
             _expected_output_root=out,
             _expected_stats_source=source,
-            allow_legacy_sampled_image_stats=not accepted_only,
-            deep_video_stats=accepted_only,
+            allow_legacy_sampled_image_stats=(
+                manifest.dataset_version == "v2.1" and not accepted_only
+            ),
+            deep_video_stats=(manifest.dataset_version == "v3.0" or accepted_only),
         )
         if _tree_digest(source) != source_before:
             raise ValueError("source dataset changed during conversion")
+        if capture_owned_directory_identity(staging) != staging_identity:
+            raise ValueError("owned staging directory changed before publication")
         _rename_noreplace(staging, out)
+        published = True
+        if capture_owned_directory_identity(out) != staging_identity:
+            raise ValueError("published output identity differs from owned staging")
         staging = None
         parent_fd = os.open(out.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        _fsync_and_close_directory(parent_fd, "publication parent")
         published_validation = validation.model_copy(update={"path": out.resolve()})
         return ConversionReport(
-            output=out.resolve(), accepted_only=accepted_only, episode_count=len(records),
+            output=out.resolve(), dataset_version=manifest.dataset_version,
+            accepted_only=accepted_only, episode_count=len(records),
             frame_count=frame_count, payload_files=validation.payload_files,
-            annotation_path="meta/lerobot_annotations.json", annotation_schema_version="reference-v2.1",
+            annotation_path="meta/lerobot_annotations.json",
+            annotation_schema_version=f"reference-{manifest.dataset_version}",
             converted_at=converted_at, source_tree_digest=source_before,
             validation=published_validation,
         )
     finally:
-        primary = None
+        active_error = sys.exc_info()[1]
+        failures = _CleanupFailures()
         if staging is not None:
-            try:
-                _remove_owned_staging(staging, out.parent, out.name)
-            except Exception as cleanup_error:
-                primary = cleanup_error
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_fd)
-        # A cleanup error is surfaced only when there was no active primary exception.
-        if primary is not None and sys.exc_info()[0] is None:
-            raise primary
+            failures.attempt(
+                "staging cleanup",
+                lambda: remove_owned_staging_tree(
+                    staging,
+                    out.parent,
+                    out.name,
+                    staging_identity,
+                ),
+            )
+        failures.attempt(
+            "output lock release",
+            lambda: fcntl.flock(lock_fd, fcntl.LOCK_UN),
+        )
+        failures.attempt("output lock close", lambda: os.close(lock_fd))
+        if published and (active_error is not None or failures.errors):
+            failures.attempt(
+                "published output rollback",
+                lambda: remove_owned_published_tree(
+                    out,
+                    out.parent,
+                    out.name,
+                    staging_identity,
+                ),
+            )
+        failures.finish(active_error, "conversion finalization")
 
 
 def _guard_workspace(
@@ -299,99 +386,6 @@ def _augment_selected(
     return validated
 
 
-def _write_public_metadata(
-    staging: Path,
-    output: Path,
-    manifest: RunManifest,
-    records: list,
-    converted_at: datetime,
-    augmented_texts: dict[int, list[str]] | None,
-) -> None:
-    selected = [
-        (record, record.episode_index, manifest.episode_lengths[record.episode_index])
-        for record in records
-    ]
-    _write_selection_metadata(
-        staging, output, manifest, selected, converted_at, augmented_texts
-    )
-
-
-def _write_selection_metadata(
-    staging: Path,
-    output: Path,
-    manifest: RunManifest,
-    selected: list[tuple[EpisodeRecord, int, int]],
-    converted_at: datetime,
-    augmented_texts: dict[int, list[str]] | None,
-) -> None:
-    info_path = staging / "meta/info.json"
-    info = _read_source_json(info_path)
-    template = [item.model_dump(mode="json") for item in manifest.subtasks]
-    instruction_map = {str(index): manifest.high_level_instruction for index in range(len(selected))}
-    info["subtask_template"] = template
-    info["high_level_instruction"] = instruction_map
-    _atomic_json(info_path, info)
-    episodes = {}
-    task_info = []
-    for record, output_index, length in selected:
-        annotation = record.final_annotation
-        entry = {"episode_index": output_index}
-        if manifest.mode == "dagger_patch":
-            entry["start_subtask_index"] = annotation.start_subtask_index
-        entry.update({
-            "boundaries": list(annotation.boundaries),
-            "high_level_instruction": manifest.high_level_instruction,
-            "saved_at": record.updated_at.astimezone(UTC).isoformat(),
-        })
-        episodes[str(output_index)] = entry
-        starts = [0, *annotation.boundaries]
-        ends = [*annotation.boundaries, length]
-        selected_subtasks = manifest.subtasks[
-            annotation.start_subtask_index:annotation.start_subtask_index + len(starts)
-        ]
-        action_texts = (
-            [subtask.text for subtask in selected_subtasks]
-            if augmented_texts is None else augmented_texts[record.episode_index]
-        )
-        actions = [
-            {
-                "start_frame": start,
-                "end_frame": end,
-                "action_text": action_text,
-                "skill": subtask.skill,
-            }
-            for start, end, subtask, action_text in zip(
-                starts, ends, selected_subtasks, action_texts, strict=True
-            )
-        ]
-        task_info.append({
-            "episode_id": output_index,
-            "task_id": 0,
-            "task_name": manifest.high_level_instruction,
-            "label_info": {"action_config": actions},
-        })
-    annotations = {
-        "source_root": str(manifest.dataset_root),
-        "work_dir": str(output / "meta"),
-        "subtask_template": template,
-        "episodes": episodes,
-        "primary_camera": manifest.effective_config["primary_camera"],
-        "updated_at": converted_at.isoformat(),
-    }
-    if augmented_texts is not None:
-        annotations["augmentation"] = {
-            "enabled": True,
-            "language": manifest.effective_config["augmentation"]["language"],
-            "model_repo": manifest.model_repo,
-            "model_revision": manifest.model_revision,
-            "prompt_version": AUGMENTATION_PROMPT_VERSION,
-        }
-    _atomic_json(staging / "meta/lerobot_annotations.json", annotations, sort_keys=False)
-    task_dir = staging / "meta/task_info"
-    task_dir.mkdir(exist_ok=True)
-    _atomic_json(task_dir / "task_0.json", task_info, sort_keys=False)
-
-
 def _rewrite_accepted_subset(
     staging: Path,
     source: Path,
@@ -434,7 +428,7 @@ def _rewrite_accepted_subset(
         }
         parquet_relative = _render_payload_path(data_template, values, "data_path", "data")
         parquet_destination = staging / parquet_relative
-        rewrite_episode_parquet(episode.parquet, parquet_destination, remap)
+        rewrite_episode_parquet(episode.data.path, parquet_destination, remap)
         rewritten_parquets.append(parquet_destination)
         for camera in manifest.camera_keys:
             video_relative = _render_payload_path(
@@ -442,7 +436,7 @@ def _rewrite_accepted_subset(
             )
             destination = staging / video_relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(episode.videos[camera], destination, follow_symlinks=False)
+            shutil.copy2(episode.videos[camera].path, destination, follow_symlinks=False)
             rewritten_videos[camera].append(destination)
 
     source_episode_rows = _read_source_jsonl(source / "meta/episodes.jsonl")
@@ -475,11 +469,22 @@ def _rewrite_accepted_subset(
     })
     _atomic_json(info_path, info)
     selected = [
-        (record, remap.output_index, remap.length)
+        SelectedEpisode(
+            record=record,
+            source_index=remap.source_index,
+            output_index=remap.output_index,
+            length=remap.length,
+        )
         for record, remap in zip(selected_records, remaps, strict=True)
     ]
-    _write_selection_metadata(
-        staging, output, manifest, selected, converted_at, augmented_texts
+    write_public_annotations(
+        staging,
+        output,
+        manifest,
+        selected,
+        converted_at,
+        augmented_texts,
+        extend_info=manifest.dataset_version == "v2.1",
     )
     return offset
 
@@ -597,26 +602,6 @@ def _payload_size_mb(directory: Path, suffix: str) -> float:
     ) / (2**20)
 
 
-def _read_source_json(path: Path) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
-        raise ValueError("unsafe info.json")
-    def unique(pairs):
-        result = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError(f"duplicate key {key}")
-            result[key] = value
-        return result
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique,
-                           parse_constant=lambda constant: (_ for _ in ()).throw(ValueError(constant)))
-    except Exception as exc:
-        raise ValueError("invalid source info.json") from exc
-    if not isinstance(value, dict):
-        raise ValueError("info.json must be an object")
-    return value
-
-
 def _read_source_jsonl(path: Path) -> list[dict[str, Any]]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
         raise ValueError(f"unsafe {path.name}")
@@ -645,30 +630,6 @@ def _unique_pairs(pairs: list[tuple[str, Any]], context: str) -> dict[str, Any]:
             raise ValueError(f"duplicate key {key} in {context}")
         result[key] = value
     return result
-
-
-def _atomic_json(path: Path, value: Any, *, sort_keys: bool = True) -> None:
-    encoded = (json.dumps(value, ensure_ascii=False, sort_keys=sort_keys, separators=(",", ":"), allow_nan=False) + "\n").encode()
-    directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
-    name = f".{path.name}.{secrets.token_hex(12)}.tmp"
-    fd = None
-    try:
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=directory_fd)
-        with os.fdopen(fd, "wb") as handle:
-            fd = None
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(name, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-        name = ""
-        os.fsync(directory_fd)
-    finally:
-        if fd is not None:
-            os.close(fd)
-        if name:
-            try: os.unlink(name, dir_fd=directory_fd)
-            except FileNotFoundError: pass
-        os.close(directory_fd)
 
 
 def _atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -754,23 +715,28 @@ def _open_lock(path: Path) -> int:
 
 
 def _rename_noreplace(source: Path, destination: Path) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise RuntimeError("atomic no-replace directory publication requires Linux renameat2")
-    result = renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
-    if result != 0:
-        error = ctypes.get_errno()
-        if error == errno.EEXIST:
-            raise FileExistsError(f"output already exists: {destination}")
-        raise OSError(error, os.strerror(error), destination)
+    rename_noreplace_at(
+        -100,
+        os.fspath(source),
+        -100,
+        os.fspath(destination),
+    )
 
 
-def _remove_owned_staging(staging: Path, parent: Path, output_name: str) -> None:
-    if staging.parent != parent or not staging.name.startswith(f"{output_name}.staging-"):
-        raise ValueError("refusing to clean an unowned path")
-    if staging.exists() and not staging.is_symlink():
-        shutil.rmtree(staging)
+def _fsync_and_close_directory(descriptor: int, context: str) -> None:
+    primary: BaseException | None = None
+    try:
+        os.fsync(descriptor)
+    except BaseException as exc:
+        primary = exc
+    failures = _CleanupFailures()
+    failures.attempt(
+        f"{context} descriptor close",
+        lambda: os.close(descriptor),
+    )
+    failures.finish(primary, context)
+    if primary is not None:
+        raise primary
 
 
 def _service(services: Any, name: str, default: Any) -> Any:

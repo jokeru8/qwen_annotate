@@ -15,6 +15,7 @@ def test_release_validator_is_independent_and_strict(tmp_path: Path) -> None:
     convert_dataset(work, output, services=services)
     report = validate_release(output, source=source, services=services)
     assert report.valid is True and report.episode_count == 2 and report.frame_count == 40
+    assert report.dataset_version == "v2.1"
     assert report.validation_level == "strict_deep" and report.skipped_checks == ()
     assert report.payload_files == sorted(report.payload_files)
     assert report.payload_checksum
@@ -24,6 +25,28 @@ def test_release_validator_is_independent_and_strict(tmp_path: Path) -> None:
         ReleaseReport.model_validate(report.model_dump() | {"episode_count": "2"})
     with pytest.raises(ValidationError):
         ReleaseReport.model_validate(report.model_dump() | {"skipped_checks": ("invented",)})
+
+
+def test_release_dispatch_reads_bounded_info_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from robo_annotate.secure_tree import SecureFile
+
+    _, work, services = _fixture(tmp_path)
+    output = tmp_path / "release"
+    convert_dataset(work, output, services=services)
+    original = SecureFile.read_bytes
+    reads = []
+
+    def counting_reader(opened: SecureFile):
+        if opened.relative == "meta/info.json":
+            reads.append(opened.relative)
+        return original(opened)
+
+    monkeypatch.setattr(SecureFile, "read_bytes", counting_reader)
+    assert validate_release(output, services=services).valid
+    assert reads == ["meta/info.json"]
 
 
 def test_release_validator_requires_both_stats_artifacts(tmp_path: Path) -> None:
@@ -138,7 +161,9 @@ def test_real_reference_dataset_is_accepted_read_only() -> None:
         episode = int(path.stem.split("_")[-1])
         return VideoProbe(frames=lengths[episode], fps=28, width=960, height=744)
 
-    extractor = lambda path, camera, indices, fps: [type("S", (), {"frame_index": n, "camera_key": camera})() for n in indices]
+    extractor = lambda video, camera, indices: [
+        type("S", (), {"frame_index": n, "camera_key": camera})() for n in indices
+    ]
     with pytest.raises(ValueError, match="stats"):
         validate_release(REFERENCE, services={"probe_video": probe, "extract_frames": extractor})
     report = validate_release(

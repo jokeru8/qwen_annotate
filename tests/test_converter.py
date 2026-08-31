@@ -12,10 +12,11 @@ import pytest
 
 from robo_annotate.config import AnnotationConfig
 from robo_annotate.converter import ConversionReport, convert_dataset
-from robo_annotate.lerobot import DatasetIndex, EpisodeInfo, VideoProbe
+from robo_annotate.lerobot import DatasetIndex, VideoProbe
 from robo_annotate.models import FinalAnnotation
 from robo_annotate.release_validator import validate_release
 from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
+from tests.fixtures import make_episode_info
 
 
 NOW = datetime(2026, 8, 22, 12, tzinfo=UTC)
@@ -61,10 +62,17 @@ def _fixture(
         video = source / f"videos/chunk-000/cam.eye/episode_{i:06d}.mp4"
         video.parent.mkdir(parents=True, exist_ok=True)
         video.write_bytes((f"video-{i}").encode())
-        episodes.append(EpisodeInfo(episode_index=i, length=length, task="Arrange.", parquet=parquet, videos={"cam.eye": video}))
+        episodes.append(make_episode_info(
+            episode_index=i,
+            length=length,
+            task="Arrange.",
+            parquet=parquet,
+            videos={"cam.eye": video},
+            fps=10.0,
+        ))
     (source / "meta/episodes.jsonl").write_text("\n".join(rows) + "\n")
     from robo_annotate.stats import recompute_stats
-    aggregate_stats = recompute_stats([episode.parquet for episode in episodes])
+    aggregate_stats = recompute_stats([episode.data.path for episode in episodes])
     image_values = (
         {"min": 0.0, "max": 1.0, "mean": 0.5, "std": 0.1,
          "q01": 0.0, "q10": 0.1, "q50": 0.5, "q90": 0.9, "q99": 1.0}
@@ -77,7 +85,7 @@ def _fixture(
     } | {"count": [24 if legacy_stats else 40 * 4 * 6]}
     (source / "meta/stats.json").write_text(json.dumps(aggregate_stats))
     episode_stats = [
-        {"episode_index": i, "stats": recompute_stats([episode.parquet])}
+        {"episode_index": i, "stats": recompute_stats([episode.data.path])}
         for i, episode in enumerate(episodes)
     ]
     (source / "meta/episodes_stats.jsonl").write_text(
@@ -103,7 +111,9 @@ def _fixture(
         (work / f"episodes/episode_{i:06d}.json").write_text(accepted.model_dump_json())
     services = {
         "probe_video": lambda path: VideoProbe(frames=20, fps=10, width=6, height=4),
-        "extract_frames": lambda path, camera, indices, fps: [type("S", (), {"frame_index": n, "camera_key": camera})() for n in indices],
+        "extract_frames": lambda video, camera, indices: [
+            type("S", (), {"frame_index": n, "camera_key": camera})() for n in indices
+        ],
         "iter_video_rgb_frames": lambda path: iter([
             np.full((4, 6, 3), int(path.read_bytes().decode().split("-")[-1]) * 50, dtype=np.uint8)
             for _ in range(20)
@@ -122,6 +132,7 @@ def test_full_conversion_preserves_payload_and_writes_reference_schema(tmp_path:
     report = convert_dataset(work, output, services=services)
     annotations = json.loads((output / "meta/lerobot_annotations.json").read_text())
     info = json.loads((output / "meta/info.json").read_text())
+    assert report.dataset_version == "v2.1"
     assert report.episode_count == 2 and report.frame_count == 40
     assert annotations["episodes"]["0"]["boundaries"] == [10]
     assert "start_subtask_index" not in annotations["episodes"]["0"]
@@ -129,6 +140,7 @@ def test_full_conversion_preserves_payload_and_writes_reference_schema(tmp_path:
     assert set(annotations["episodes"]["0"]) == {"episode_index", "boundaries", "high_level_instruction", "saved_at"}
     assert annotations["work_dir"] == str(output.resolve() / "meta")
     assert info["subtask_template"] == annotations["subtask_template"]
+    assert info["high_level_instruction"] == {"0": "Arrange.", "1": "Arrange."}
     assert info["custom_key"] == {"preserved": True}
     assert report.payload_files == sorted(report.payload_files)
     for relative in report.payload_files:

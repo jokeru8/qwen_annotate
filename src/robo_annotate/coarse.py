@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, SkipValidation, field_validat
 
 from .config import AnnotationConfig
 from .constraints import coarse_sequence_is_legal
-from .lerobot import EpisodeInfo
+from .lerobot import EpisodeInfo, EpisodeVideoRef
 from .models import CoarseBoundary, CoarseResult, SemanticUncertaintyCode
 from .prompts import build_coarse_prompt
 from .qwen_client import QwenClient
@@ -51,7 +51,7 @@ class _Completer(Protocol):
     ) -> CoarseResult: ...
 
 
-Sampler = Callable[[Path, str, list[int], float], list[FrameSample]]
+Sampler = Callable[[EpisodeVideoRef, str, list[int]], list[FrameSample]]
 
 
 @dataclass(frozen=True)
@@ -251,14 +251,14 @@ async def run_coarse(
         for pass_id in (0, 1)
     ]
     union = sorted(set(grids[0]) | set(grids[1]))
+    video = episode.videos[camera].model_copy(update={"path": source.video_resolved})
     union_samples = await asyncio.to_thread(
         sampler,
-        source.video_resolved,
+        video,
         camera,
         union,
-        effective_fps,
     )
-    _validate_samples(union_samples, union, camera, effective_fps)
+    _validate_samples(union_samples, union, camera, video.fps)
     _assert_source_unchanged(source, episode, expected_source_fingerprint)
     by_index = {sample.frame_index: sample for sample in union_samples}
 
@@ -320,7 +320,7 @@ def _validate_inputs(config: AnnotationConfig, episode: EpisodeInfo) -> None:
         raise ValueError("episode length must be a positive integer")
     if config.primary_camera not in episode.videos:
         raise ValueError(f"configured primary camera {config.primary_camera!r} is missing from episode")
-    video = episode.videos[config.primary_camera]
+    video = episode.videos[config.primary_camera].path
     if not isinstance(video, Path):
         raise TypeError("primary camera video path must be a Path")
     target_fps = config.sampling.coarse_fps
@@ -348,7 +348,7 @@ def _prepare_source(
     info_entry = root / "meta" / "info.json"
     video_entry, video_resolved = _contained_regular_file(
         root,
-        episode.videos[config.primary_camera],
+        episode.videos[config.primary_camera].path,
         "primary video",
     )
     info_entry, _ = _contained_regular_file(root, info_entry, "source info.json")

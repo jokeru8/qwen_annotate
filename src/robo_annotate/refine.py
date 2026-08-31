@@ -26,7 +26,7 @@ from pydantic import (
 from .coarse import CoarseDecision
 from .config import AnnotationConfig
 from .constraints import coarse_sequence_is_legal, validate_annotation
-from .lerobot import EpisodeInfo
+from .lerobot import EpisodeInfo, EpisodeVideoRef
 from .models import FinalAnnotation, RefineResult
 from .prompts import build_refine_prompt
 from .qwen_client import ModelOutOfMemory, QwenClient
@@ -67,7 +67,7 @@ class _Completer(Protocol):
     ) -> RefineResult: ...
 
 
-Sampler = Callable[[Path, str, list[int], float], list[FrameSample]]
+Sampler = Callable[[EpisodeVideoRef, str, list[int]], list[FrameSample]]
 
 
 class _ImmutableRefineResult(RefineResult):
@@ -591,7 +591,11 @@ def _prepare_source(config, episode, cameras, source_fps, expected_fingerprint):
         effective = metadata_fps
     videos = []
     for camera in cameras:
-        entry, resolved = _contained_regular(root, episode.videos[camera], f"camera {camera!r} video")
+        entry, resolved = _contained_regular(
+            root,
+            episode.videos[camera].path,
+            f"camera {camera!r} video",
+        )
         identity, _ = _capture(entry, False)
         videos.append((camera, _FileState(entry, resolved, identity)))
     if expected_fingerprint is not None:
@@ -697,14 +701,21 @@ def _evidence_indices(center, radius, stride, frame_count):
 
 
 async def _sample_stage(source, cameras, indices, sampler, episode, expected_fingerprint):
-    by_camera = dict(source.videos)
+    source_videos = dict(source.videos)
     batches = await asyncio.gather(*(
-        asyncio.to_thread(sampler, by_camera[camera].resolved, camera, indices, source.fps)
+        asyncio.to_thread(
+            sampler,
+            episode.videos[camera].model_copy(
+                update={"path": source_videos[camera].resolved}
+            ),
+            camera,
+            indices,
+        )
         for camera in cameras
     ))
     combined = []
     for camera, batch in zip(cameras, batches):
-        _validate_samples(batch, indices, camera, source.fps)
+        _validate_samples(batch, indices, camera, episode.videos[camera].fps)
         combined.extend(batch)
     order = {camera: index for index, camera in enumerate(cameras)}
     combined.sort(key=lambda item: (item.frame_index, order[item.camera_key]))

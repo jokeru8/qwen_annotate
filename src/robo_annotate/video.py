@@ -3,11 +3,12 @@
 import base64
 import io
 import math
-from pathlib import Path
 from typing import Any
 
 from PIL import ImageDraw, ImageFont
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .lerobot import EpisodeVideoRef, video_fps_matches
 
 
 class FrameSample(BaseModel):
@@ -64,12 +65,28 @@ def window_indices(center: int, radius_frames: int, stride: int, frame_count: in
     return sorted({*range(lower, upper + 1, stride), center})
 
 
-def extract_frames(video_path: Path, camera_key: str, indices: list[int], fps: float) -> list[FrameSample]:
-    """Decode requested absolute frame numbers once and return JPEG evidence samples."""
+def extract_frames(
+    video: EpisodeVideoRef,
+    camera_key: str,
+    indices: list[int],
+) -> list[FrameSample]:
+    """Decode requested episode-local frames from a whole or shared video file."""
+    if not isinstance(video, EpisodeVideoRef):
+        raise TypeError("video must be an EpisodeVideoRef")
     if not isinstance(camera_key, str) or not camera_key:
         raise ValueError("camera_key must be a nonempty string")
     requested = _validate_requested_indices(indices)
-    fps = _require_positive_finite_number(fps, "fps")
+    requested_set = set(requested)
+    fps = _require_positive_finite_number(video.fps, "video fps")
+    episode_frame_count = round((video.to_timestamp - video.from_timestamp) * fps)
+    if episode_frame_count < 1:
+        raise ValueError("episode video slice must contain at least one frame")
+    outside = [frame_index for frame_index in requested if frame_index >= episode_frame_count]
+    if outside:
+        raise ValueError(
+            f"Requested frame(s) are outside episode video slice of length "
+            f"{episode_frame_count}: {outside}"
+        )
     if not requested:
         return []
 
@@ -79,31 +96,71 @@ def extract_frames(video_path: Path, camera_key: str, indices: list[int], fps: f
         raise RuntimeError("PyAV is required to extract video frames") from exc
 
     try:
-        container = av.open(str(video_path))
+        container = av.open(str(video.path))
     except Exception as exc:  # PyAV exposes codec and I/O specific exceptions.
-        raise ValueError(f"Unable to open video {video_path}: {exc}") from exc
+        raise ValueError(f"Unable to open video {video.path}: {exc}") from exc
 
     try:
         stream = next((item for item in container.streams if item.type == "video"), None)
         if stream is None:
-            raise ValueError(f"Video {video_path} has no video stream")
+            raise ValueError(f"Video {video.path} has no video stream")
+        try:
+            measured_fps = float(stream.average_rate)
+        except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+            raise ValueError(f"Video {video.path} has invalid fps") from None
+        if not video_fps_matches(measured_fps, fps):
+            raise ValueError(f"Video {video.path} fps does not match episode reference")
+        try:
+            time_base = float(stream.time_base)
+        except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+            raise ValueError(f"Video {video.path} has invalid stream time base") from None
+        if not math.isfinite(time_base) or time_base <= 0:
+            raise ValueError(f"Video {video.path} has invalid stream time base")
 
         found: dict[int, FrameSample] = {}
+        seen_local: set[int] = set()
         try:
-            for frame_index, frame in enumerate(container.decode(stream)):
-                if frame_index not in requested:
-                    continue
-                found[frame_index] = _make_sample(frame, camera_key, frame_index, fps)
-                if len(found) == len(requested):
+            seek_time = max(0.0, video.from_timestamp - 1.0 / fps)
+            seek_pts = math.floor(seek_time / time_base)
+            container.seek(seek_pts, backward=True, any_frame=False, stream=stream)
+            stop_time = video.to_timestamp + 1.0 / fps
+            for frame in container.decode(stream):
+                if frame.pts is None:
+                    raise ValueError(f"Video {video.path} contains a frame without PTS")
+                media_time = float(frame.pts * stream.time_base)
+                if not math.isfinite(media_time):
+                    raise ValueError(f"Video {video.path} contains a frame with invalid PTS")
+                if media_time > stop_time:
                     break
+                if not video.from_timestamp <= media_time < video.to_timestamp:
+                    continue
+                local_index = round((media_time - video.from_timestamp) * fps)
+                if not 0 <= local_index < episode_frame_count:
+                    continue
+                expected_time = video.from_timestamp + local_index / fps
+                if not math.isclose(media_time, expected_time, rel_tol=0.0, abs_tol=0.5 / fps):
+                    raise ValueError(f"Video {video.path} contains a frame with invalid episode-local PTS")
+                if local_index in seen_local:
+                    raise ValueError(
+                        f"Video {video.path} contains duplicate episode-local frame {local_index}"
+                    )
+                seen_local.add(local_index)
+                if local_index not in requested_set:
+                    continue
+                found[local_index] = _make_sample(frame, camera_key, local_index, fps)
         except ValueError:
             raise
         except Exception as exc:
-            raise ValueError(f"Unable to decode video {video_path}: {exc}") from exc
+            raise ValueError(f"Unable to decode video {video.path}: {exc}") from exc
 
+        missing_local = sorted(set(range(episode_frame_count)) - seen_local)
+        if missing_local:
+            raise ValueError(
+                f"Video {video.path} is missing episode-local frame(s): {missing_local}"
+            )
         missing = [frame_index for frame_index in requested if frame_index not in found]
         if missing:
-            raise ValueError(f"Video {video_path} is missing requested frame(s): {missing}")
+            raise ValueError(f"Video {video.path} is missing requested frame(s): {missing}")
         return [found[frame_index] for frame_index in requested]
     finally:
         container.close()
@@ -140,19 +197,20 @@ def _validate_requested_indices(indices: list[int]) -> list[int]:
         _require_int(frame_index, "indices", minimum=0)
     if len(indices) != len(set(indices)):
         raise ValueError("indices must be unique")
-    return sorted(indices)
+    return list(indices)
 
 
 def _make_sample(frame: Any, camera_key: str, frame_index: int, fps: float) -> FrameSample:
     image = frame.to_image().convert("RGB")
     timestamp_seconds = frame_index / fps
     label = f"{camera_key}\nframe {frame_index}\ntime {timestamp_seconds:.3f}s"
-    draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()
-    left, top, right, bottom = draw.multiline_textbbox((0, 0), label, font=font, spacing=2)
-    padding = 3
-    draw.rectangle((0, 0, right - left + 2 * padding, bottom - top + 2 * padding), fill="black")
-    draw.multiline_text((padding, padding), label, fill="white", font=font, spacing=2)
+    if image.width >= 64 and image.height >= 48:
+        draw = ImageDraw.Draw(image)
+        font = ImageFont.load_default()
+        left, top, right, bottom = draw.multiline_textbbox((0, 0), label, font=font, spacing=2)
+        padding = 3
+        draw.rectangle((0, 0, right - left + 2 * padding, bottom - top + 2 * padding), fill="black")
+        draw.multiline_text((padding, padding), label, fill="white", font=font, spacing=2)
     output = io.BytesIO()
     image.save(output, format="JPEG", quality=90)
     return FrameSample(

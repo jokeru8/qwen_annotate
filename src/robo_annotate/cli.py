@@ -53,14 +53,29 @@ def _config(path: Path):
 
 
 @app.command("inspect")
-def inspect_command(config: Path) -> None:
+def inspect_command(
+    config: Path,
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
     cfg = _config(config)
     try:
         dataset = inspect_dataset(cfg)
     except Exception:
         typer.echo("Dataset inspection failed.", err=True)
         raise typer.Exit(1)
+    facts = {
+        "dataset_version": dataset.version,
+        "fps": dataset.fps,
+        "cameras": dataset.camera_keys,
+        "episodes": len(dataset.episodes),
+        "frames": sum(item.length for item in dataset.episodes),
+        "inspection": "OK",
+    }
+    if as_json:
+        typer.echo(json.dumps(facts, sort_keys=True, separators=(",", ":")))
+        return
     typer.echo(f"version: {dataset.version}")
+    typer.echo(f"dataset_version: {dataset.version}")
     typer.echo(f"fps: {dataset.fps}")
     typer.echo(f"cameras: {', '.join(dataset.camera_keys)}")
     typer.echo(f"episodes: {len(dataset.episodes)}")

@@ -9,7 +9,8 @@ from pydantic import ValidationError
 
 from robo_annotate.coarse import CoarseDecision
 from robo_annotate.config import Subtask
-from robo_annotate.lerobot import DatasetIndex, EpisodeInfo
+from robo_annotate.lerobot import DatasetIndex, inspect_dataset
+from robo_annotate import workspace as workspace_module
 from robo_annotate.models import CoarseBoundary, CoarseResult, FinalAnnotation, RefineResult, ValidationIssue
 from robo_annotate.prompts import PROMPT_VERSION
 from robo_annotate.refine import RefineDecision
@@ -20,7 +21,8 @@ from robo_annotate.workspace import (
     compute_run_fingerprint,
     compute_source_fingerprint,
 )
-from tests.fixtures import make_config, make_legacy_v4_workspace
+from tests.fixtures import make_config, make_episode_info, make_legacy_v4_workspace
+from tests.v30_fixtures import make_lerobot_v30_fixture, make_v30_config
 
 
 SHA = "a" * 40
@@ -44,7 +46,14 @@ def make_index(tmp_path: Path, lengths: list[int] = [10, 12]) -> DatasetIndex:
         video.parent.mkdir(parents=True, exist_ok=True)
         parquet.write_bytes(bytes([index + 1]) * 7)
         video.write_bytes(bytes([index + 2]) * 11)
-        episodes.append(EpisodeInfo(episode_index=index, length=length, task="arrange", parquet=parquet, videos={"cam.eye": video}))
+        episodes.append(make_episode_info(
+            episode_index=index,
+            length=length,
+            task="arrange",
+            parquet=parquet,
+            videos={"cam.eye": video},
+            fps=5.0,
+        ))
     return DatasetIndex(root=root.resolve(), version="v2.1", fps=5.0, camera_keys=["cam.eye"], episodes=episodes)
 
 
@@ -598,7 +607,7 @@ def test_manifest_invalidation_recomputes_source_and_enforces_run_integrity(tmp_
     store = WorkspaceStore(config.work_dir, clock=lambda: NOW)
     manifest = store.initialize(config, index, SHA)
     episode = index.episodes[0]
-    video = next(iter(episode.videos.values()))
+    video = next(iter(episode.videos.values())).path
     video.write_bytes(b"source changed to a different size")
     reset = store.invalidate_episode(0, episode=episode)
     assert reset.source_fingerprint == compute_source_fingerprint(index.root, episode)
@@ -631,7 +640,7 @@ def test_source_fingerprint_is_stable_and_tracks_required_dimensions(tmp_path: P
     episode = index.episodes[0]
     first = compute_source_fingerprint(index.root, episode)
     assert first == compute_source_fingerprint(index.root, episode)
-    video = next(iter(episode.videos.values()))
+    video = next(iter(episode.videos.values())).path
     stat = video.stat()
     os.utime(video, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
     assert compute_source_fingerprint(index.root, episode) != first
@@ -639,10 +648,39 @@ def test_source_fingerprint_is_stable_and_tracks_required_dimensions(tmp_path: P
     video.write_bytes(b"different-size")
     assert compute_source_fingerprint(index.root, episode) != first
     video.write_bytes(bytes([2]) * 11)
-    episode.parquet.write_bytes(b"different")
+    episode.data.path.write_bytes(b"different")
     assert compute_source_fingerprint(index.root, episode) != first
     changed_length = episode.model_copy(update={"length": 11})
     assert compute_source_fingerprint(index.root, changed_length) != compute_source_fingerprint(index.root, episode)
+
+
+def test_v30_manifest_round_trips_and_slices_change_fingerprint(tmp_path: Path) -> None:
+    """Catches shared video files being fingerprinted without their episode slice."""
+    root = make_lerobot_v30_fixture(tmp_path)
+    config = make_v30_config(root, tmp_path / "work")
+    dataset = inspect_dataset(config)
+    store = WorkspaceStore(config.work_dir)
+    manifest = store.initialize(config, dataset, model_revision="a" * 40)
+
+    assert manifest.dataset_version == "v3.0"
+    first = compute_source_fingerprint(root, dataset.episodes[0])
+    shifted = dataset.episodes[0].model_copy(update={
+        "videos": dataset.episodes[1].videos,
+    })
+    assert compute_source_fingerprint(root, shifted) != first
+
+
+def test_shared_v30_parquet_mutation_invalidates_every_referencing_fingerprint(tmp_path: Path) -> None:
+    """Catches shared data shards being fingerprinted by path or metadata alone."""
+    root = make_lerobot_v30_fixture(tmp_path)
+    dataset = inspect_dataset(make_v30_config(root, tmp_path / "work"))
+    before = [compute_source_fingerprint(root, episode) for episode in dataset.episodes]
+    parquet = dataset.episodes[0].data.path
+    original = parquet.read_bytes()
+    parquet.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+
+    after = [compute_source_fingerprint(root, episode) for episode in dataset.episodes]
+    assert all(previous != current for previous, current in zip(before, after))
 
 
 @pytest.mark.parametrize("kind", ["video", "parquet"])
@@ -651,12 +689,132 @@ def test_source_fingerprint_rejects_escape_missing_and_nonfile(tmp_path: Path, k
     episode = index.episodes[0]
     outside = tmp_path / "outside"
     outside.write_bytes(b"x")
-    bad = episode.model_copy(update={"videos": {"cam.eye": outside}}) if kind == "video" else episode.model_copy(update={"parquet": outside})
+    bad = (
+        episode.model_copy(
+            update={
+                "videos": {
+                    "cam.eye": episode.videos["cam.eye"].model_copy(update={"path": outside})
+                }
+            }
+        )
+        if kind == "video"
+        else episode.model_copy(
+            update={"data": episode.data.model_copy(update={"path": outside})}
+        )
+    )
     with pytest.raises(ValueError, match="dataset root"):
         compute_source_fingerprint(index.root, bad)
     outside.unlink()
     with pytest.raises((FileNotFoundError, ValueError)):
         compute_source_fingerprint(index.root, bad)
+
+
+def test_source_fingerprint_rejects_symlinked_dataset_root_before_opening_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Catches a root symlink being resolved before source identity is established."""
+    index = make_index(tmp_path, [10])
+    linked_root = tmp_path / "dataset-link"
+    linked_root.symlink_to(index.root, target_is_directory=True)
+    protected = {
+        (item.data.path.stat().st_dev, item.data.path.stat().st_ino)
+        for item in index.episodes
+    } | {
+        (reference.path.stat().st_dev, reference.path.stat().st_ino)
+        for item in index.episodes
+        for reference in item.videos.values()
+    }
+    opened_protected: list[tuple[int, int]] = []
+    real_open = os.open
+
+    def tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+        kwargs = {} if dir_fd is None else {"dir_fd": dir_fd}
+        descriptor = real_open(path, flags, mode, **kwargs)
+        identity = (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+        if identity in protected:
+            opened_protected.append(identity)
+        return descriptor
+
+    monkeypatch.setattr(workspace_module.os, "open", tracking_open)
+    with pytest.raises(ValueError, match="symbolic link|symlink"):
+        compute_source_fingerprint(linked_root, index.episodes[0])
+    assert opened_protected == []
+
+
+def test_source_fingerprint_rejects_intermediate_symlink_without_opening_target(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Catches source paths that reach an outside file through a directory link."""
+    index = make_index(tmp_path, [10])
+    episode = index.episodes[0]
+    source_data = index.root / "data"
+    preserved_data = tmp_path / "preserved-data"
+    source_data.replace(preserved_data)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / episode.data.path.name
+    outside_file.write_bytes(b"outside source must remain unread")
+    source_data.symlink_to(outside, target_is_directory=True)
+    protected_identity = (outside_file.stat().st_dev, outside_file.stat().st_ino)
+    opened_outside: list[tuple[int, int]] = []
+    real_open = os.open
+
+    def tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+        kwargs = {} if dir_fd is None else {"dir_fd": dir_fd}
+        descriptor = real_open(path, flags, mode, **kwargs)
+        identity = (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+        if identity == protected_identity:
+            opened_outside.append(identity)
+        return descriptor
+
+    monkeypatch.setattr(workspace_module.os, "open", tracking_open)
+    with pytest.raises(ValueError, match="symlink"):
+        compute_source_fingerprint(index.root, episode)
+    assert opened_outside == []
+
+
+def test_source_fingerprint_rejects_component_replacement_race_without_opening_target(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Catches a directory swap after the trusted root is opened but before traversal."""
+    index = make_index(tmp_path, [10])
+    episode = index.episodes[0]
+    source_data = index.root / "data"
+    preserved_data = tmp_path / "preserved-data"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / episode.data.path.name
+    outside_file.write_bytes(b"outside source must remain unread")
+    protected_identity = (outside_file.stat().st_dev, outside_file.stat().st_ino)
+    opened_outside: list[tuple[int, int]] = []
+    replaced = False
+    real_open = os.open
+    real_dup = os.dup
+    root_identity = (index.root.stat().st_dev, index.root.stat().st_ino)
+
+    def tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+        kwargs = {} if dir_fd is None else {"dir_fd": dir_fd}
+        descriptor = real_open(path, flags, mode, **kwargs)
+        identity = (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino)
+        if identity == protected_identity:
+            opened_outside.append(identity)
+        return descriptor
+
+    def replace_after_root_dup(descriptor):
+        nonlocal replaced
+        duplicate = real_dup(descriptor)
+        if not replaced and (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino) == root_identity:
+            source_data.replace(preserved_data)
+            source_data.symlink_to(outside, target_is_directory=True)
+            replaced = True
+        return duplicate
+
+    monkeypatch.setattr(workspace_module.os, "open", tracking_open)
+    monkeypatch.setattr(workspace_module.os, "dup", replace_after_root_dup)
+    with pytest.raises(ValueError, match="symlink|follow|identity"):
+        compute_source_fingerprint(index.root, episode)
+    assert replaced
+    assert opened_outside == []
 
 
 def test_run_fingerprint_dimensions_and_revision_validation(tmp_path: Path) -> None:

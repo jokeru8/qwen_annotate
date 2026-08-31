@@ -19,6 +19,7 @@ from robo_annotate.refine import (
 )
 from robo_annotate.video import FrameSample
 from robo_annotate.workspace import compute_source_fingerprint
+from tests.fixtures import make_episode_info
 
 
 def make_config(
@@ -65,7 +66,14 @@ def make_episode(tmp_path: Path, *, length: int = 41, cameras=("cam.eye", "cam.w
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
         videos[camera] = path
-    return EpisodeInfo(episode_index=7, length=length, task="arrange", parquet=parquet, videos=videos)
+    return make_episode_info(
+        episode_index=7,
+        length=length,
+        task="arrange",
+        parquet=parquet,
+        videos=videos,
+        fps=10.0,
+    )
 
 
 def coarse_result(observed, centers):
@@ -120,15 +128,15 @@ class RecordingSampler:
         self.calls = []
         self.mutate = mutate
 
-    def __call__(self, path, camera, indices, fps):
-        self.calls.append((path, camera, list(indices), fps))
+    def __call__(self, video, camera, indices):
+        self.calls.append((video, camera, list(indices)))
         if self.mutate:
             self.mutate(len(self.calls))
         return [
             FrameSample(
                 camera_key=camera,
                 frame_index=index,
-                timestamp_seconds=index / fps,
+                timestamp_seconds=index / video.fps,
                 jpeg=b"jpeg",
             )
             for index in indices
@@ -648,7 +656,7 @@ async def test_expected_fingerprint_duplicate_metadata_and_symlink_are_rejected(
         await run_refine(config, episode, coarse_decision(), RecordingSampler(), RecordingClient([]))
 
     (config.source / "meta" / "info.json").write_text('{"fps":10}', encoding="utf-8")
-    target = episode.videos["cam.wrist"]
+    target = episode.videos["cam.wrist"].path
     target.unlink()
     real = target.with_suffix(".real.mp4")
     real.touch()
@@ -661,8 +669,8 @@ async def test_expected_fingerprint_duplicate_metadata_and_symlink_are_rejected(
 @pytest.mark.parametrize("corruption", ["order", "camera", "timestamp", "duplicate"])
 async def test_invalid_sampler_evidence_is_rejected(corruption: str, tmp_path: Path) -> None:
     class BadSampler(RecordingSampler):
-        def __call__(self, path, camera, indices, fps):
-            samples = super().__call__(path, camera, indices, fps)
+        def __call__(self, video, camera, indices):
+            samples = super().__call__(video, camera, indices)
             if corruption == "order":
                 return list(reversed(samples))
             if corruption == "camera":

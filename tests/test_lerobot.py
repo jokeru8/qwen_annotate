@@ -9,7 +9,15 @@ import pyarrow.parquet as pq
 import pytest
 from pydantic import ValidationError
 
-from robo_annotate.lerobot import DatasetIndex, VideoProbe, inspect_dataset, probe_video
+from robo_annotate.lerobot import (
+    DatasetIndex,
+    EpisodeDataRef,
+    EpisodeVideoRef,
+    VideoProbe,
+    detect_dataset_version,
+    inspect_dataset,
+    probe_video,
+)
 from tests.fixtures import make_config, make_lerobot_fixture
 
 
@@ -25,6 +33,22 @@ def write_metadata(root: Path, value: dict[str, object]) -> None:
     (root / "meta/info.json").write_text(json.dumps(value), encoding="utf-8")
 
 
+def track_info_target_reads(
+    monkeypatch: pytest.MonkeyPatch, target: Path
+) -> list[Path]:
+    reads: list[Path] = []
+    original = Path.read_text
+    resolved_target = target.resolve()
+
+    def tracked(path: Path, *args, **kwargs) -> str:
+        if path.resolve() == resolved_target:
+            reads.append(path)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", tracked)
+    return reads
+
+
 def test_inspects_valid_v21_dataset_with_resolved_paths(tmp_path: Path) -> None:
     root = make_lerobot_fixture(tmp_path, [12, 12], 5.0, ["cam.eye"])
 
@@ -34,10 +58,94 @@ def test_inspects_valid_v21_dataset_with_resolved_paths(tmp_path: Path) -> None:
     assert index.fps == 5.0
     assert index.camera_keys == ["cam.eye"]
     assert [episode.length for episode in index.episodes] == [12, 12]
-    assert index.episodes[1].parquet == root / "data/chunk-000/episode_000001.parquet"
-    assert index.episodes[0].videos == {
-        "cam.eye": root / "videos/chunk-000/cam.eye/episode_000000.mp4"
-    }
+    assert index.episodes[1].data.path == root / "data/chunk-000/episode_000001.parquet"
+    assert index.episodes[0].videos["cam.eye"].path == (
+        root / "videos/chunk-000/cam.eye/episode_000000.mp4"
+    )
+
+
+def test_v21_is_exposed_through_local_slice_references(tmp_path: Path) -> None:
+    root = make_lerobot_fixture(tmp_path, [12], 5.0, ["cam.eye"])
+    dataset = inspect_dataset(make_config(root, tmp_path / "work"), fixed_probe)
+    episode = dataset.episodes[0]
+
+    assert dataset.version == "v2.1"
+    assert episode.data == EpisodeDataRef(
+        path=root / "data/chunk-000/episode_000000.parquet",
+        dataset_from_index=0,
+        dataset_to_index=12,
+    )
+    assert episode.videos["cam.eye"] == EpisodeVideoRef(
+        path=root / "videos/chunk-000/cam.eye/episode_000000.mp4",
+        from_timestamp=0.0,
+        to_timestamp=12 / 5.0,
+        fps=5.0,
+    )
+
+
+def test_version_detector_rejects_missing_and_unknown_versions(tmp_path: Path) -> None:
+    root = make_lerobot_fixture(tmp_path, [12], 5.0, ["cam.eye"])
+    info_path = root / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    for value in (None, "v4.0"):
+        mutated = {key: item for key, item in info.items() if key != "codebase_version"}
+        if value is not None:
+            mutated["codebase_version"] = value
+        info_path.write_text(json.dumps(mutated))
+        with pytest.raises(ValueError, match="Unsupported LeRobot codebase_version"):
+            detect_dataset_version(root)
+
+
+def test_v21_rejects_symlinked_root_before_reading_info_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_lerobot_fixture(tmp_path, [12], 5.0, ["cam.eye"])
+    target = root / "meta/info.json"
+    alias = tmp_path / "dataset-alias"
+    alias.symlink_to(root, target_is_directory=True)
+    reads = track_info_target_reads(monkeypatch, target)
+
+    with pytest.raises(ValueError, match=r"dataset root.*symbolic link"):
+        inspect_dataset(make_config(alias, tmp_path / "work"), fixed_probe)
+    with pytest.raises(ValueError, match=r"dataset root.*symbolic link"):
+        detect_dataset_version(alias)
+
+    assert reads == []
+
+
+def test_v21_rejects_symlinked_info_before_reading_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_lerobot_fixture(tmp_path, [12], 5.0, ["cam.eye"])
+    info_path = root / "meta/info.json"
+    target = tmp_path / "outside-info.json"
+    target.write_bytes(info_path.read_bytes())
+    info_path.unlink()
+    info_path.symlink_to(target)
+    reads = track_info_target_reads(monkeypatch, target)
+
+    with pytest.raises(ValueError, match=r"info metadata.*symbolic link"):
+        inspect_dataset(make_config(root, tmp_path / "work"), fixed_probe)
+    with pytest.raises(ValueError, match=r"info metadata.*symbolic link"):
+        detect_dataset_version(root)
+
+    assert reads == []
+
+
+def test_v21_rejects_symlinked_meta_before_reading_info_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_lerobot_fixture(tmp_path, [12], 5.0, ["cam.eye"])
+    meta = root / "meta"
+    target_meta = tmp_path / "outside-meta"
+    meta.rename(target_meta)
+    meta.symlink_to(target_meta, target_is_directory=True)
+    reads = track_info_target_reads(monkeypatch, target_meta / "info.json")
+
+    with pytest.raises(ValueError, match=r"meta directory.*symbolic link"):
+        inspect_dataset(make_config(root, tmp_path / "work"), fixed_probe)
+
+    assert reads == []
 
 
 def test_rejects_missing_refine_camera_with_key(tmp_path: Path) -> None:
@@ -50,7 +158,10 @@ def test_rejects_missing_refine_camera_with_key(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
-        (lambda root: metadata(root) | {"codebase_version": "v2.0"}, "v2.1"),
+        (
+            lambda root: metadata(root) | {"codebase_version": "v2.0"},
+            "Unsupported LeRobot codebase_version",
+        ),
         (lambda root: metadata(root) | {"total_episodes": 3}, "total_episodes"),
         (lambda root: metadata(root) | {"total_frames": 99}, "total_frames"),
         (lambda root: metadata(root) | {"total_videos": 99}, "total_videos"),

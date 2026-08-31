@@ -4,6 +4,7 @@ import json
 import math
 import os
 import sys
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
+from robo_annotate.lerobot import EpisodeVideoRef
 from robo_annotate.video import FrameSample, as_data_url, extract_frames, uniform_indices, window_indices
 
 
@@ -123,10 +125,19 @@ def _write_video(path: Path) -> list[tuple[int, int, int]]:
     return colors
 
 
+def _video_ref(path: Path, fps: object = 6.0, frame_count: int = 12) -> EpisodeVideoRef:
+    return EpisodeVideoRef.model_construct(
+        path=path,
+        from_timestamp=0.0,
+        to_timestamp=frame_count / 6.0,
+        fps=fps,
+    )
+
+
 def test_extract_frames_decodes_exact_requested_frames_and_labels_evidence(tmp_path: Path) -> None:
     colors = _write_video(tmp_path / "frames.mp4")
 
-    samples = extract_frames(tmp_path / "frames.mp4", "right_eye", [0, 6, 11], fps=6.0)
+    samples = extract_frames(_video_ref(tmp_path / "frames.mp4"), "right_eye", [0, 6, 11])
 
     assert [sample.frame_index for sample in samples] == [0, 6, 11]
     assert [sample.timestamp_seconds for sample in samples] == [0.0, 1.0, pytest.approx(11 / 6)]
@@ -141,9 +152,9 @@ def test_extract_frames_rejects_duplicate_and_unavailable_requested_indices(tmp_
     _write_video(tmp_path / "frames.mp4")
 
     with pytest.raises(ValueError, match="unique"):
-        extract_frames(tmp_path / "frames.mp4", "right_eye", [1, 1], fps=6.0)
-    with pytest.raises(ValueError, match="missing requested frame"):
-        extract_frames(tmp_path / "frames.mp4", "right_eye", [12], fps=6.0)
+        extract_frames(_video_ref(tmp_path / "frames.mp4"), "right_eye", [1, 1])
+    with pytest.raises(ValueError, match="outside episode video slice"):
+        extract_frames(_video_ref(tmp_path / "frames.mp4"), "right_eye", [12])
 
 
 @pytest.mark.parametrize(
@@ -154,13 +165,16 @@ def test_extract_frames_rejects_invalid_requested_indices_and_fps(
     tmp_path: Path, indices: list[object], fps: object, message: str
 ) -> None:
     with pytest.raises((TypeError, ValueError), match=message):
-        extract_frames(tmp_path / "unused.mp4", "right_eye", indices, fps=fps)  # type: ignore[arg-type]
+        extract_frames(_video_ref(tmp_path / "unused.mp4", fps), "right_eye", indices)  # type: ignore[arg-type]
 
 
 def test_extract_frames_closes_the_container_after_a_decode_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     class FailingContainer:
-        streams = [SimpleNamespace(type="video")]
+        streams = [SimpleNamespace(type="video", average_rate=Fraction(6, 1), time_base=Fraction(1, 6))]
         closed = False
+
+        def seek(self, offset: int, **kwargs: object) -> None:
+            del offset, kwargs
 
         def decode(self, stream: object):
             del stream
@@ -174,7 +188,7 @@ def test_extract_frames_closes_the_container_after_a_decode_error(monkeypatch: p
     monkeypatch.setitem(sys.modules, "av", SimpleNamespace(open=lambda path: container))
 
     with pytest.raises(ValueError, match="Unable to decode video"):
-        extract_frames(tmp_path / "corrupt.mp4", "right_eye", [0], fps=6.0)
+        extract_frames(_video_ref(tmp_path / "corrupt.mp4", frame_count=1), "right_eye", [0])
 
     assert container.closed
 
@@ -193,7 +207,7 @@ def test_extract_frames_reports_a_missing_video_stream_and_closes_container(
     monkeypatch.setitem(sys.modules, "av", SimpleNamespace(open=lambda path: container))
 
     with pytest.raises(ValueError, match="no video stream"):
-        extract_frames(tmp_path / "audio.mp4", "right_eye", [0], fps=6.0)
+        extract_frames(_video_ref(tmp_path / "audio.mp4", frame_count=1), "right_eye", [0])
 
     assert container.closed
 
@@ -211,7 +225,11 @@ def test_reference_right_eye_episode_zero_smoke() -> None:
     )
     fps = float(info["fps"])
 
-    samples = extract_frames(video, camera_key, [0, 1, 2], fps=fps)
+    samples = extract_frames(
+        EpisodeVideoRef(path=video, from_timestamp=0.0, to_timestamp=3 / fps, fps=fps),
+        camera_key,
+        [0, 1, 2],
+    )
 
     assert [sample.frame_index for sample in samples] == [0, 1, 2]
     assert [sample.timestamp_seconds for sample in samples] == [0.0, 1 / fps, 2 / fps]

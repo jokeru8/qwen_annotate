@@ -16,10 +16,10 @@ from robo_annotate.evaluation import (
     evaluate_dagger,
     make_dagger_views,
 )
-from robo_annotate.lerobot import EpisodeInfo, VideoProbe
+from robo_annotate.lerobot import VideoProbe
 from robo_annotate.prompts import PROMPT_VERSION
 from robo_annotate.workspace import WorkspaceStore, compute_run_fingerprint, compute_source_fingerprint
-from tests.fixtures import make_lerobot_fixture
+from tests.fixtures import make_episode_info, make_lerobot_fixture
 
 
 @pytest.fixture(autouse=True)
@@ -238,10 +238,11 @@ def _write_evaluation_fixture(root: Path, *, boundary: int, status: str = "accep
     })
     revision = "b" * 40
     run_sha = compute_run_fingerprint(config, revision)
-    episode_info = EpisodeInfo(
+    episode_info = make_episode_info(
         episode_index=0, length=300, task="task",
         parquet=source / "data/chunk-000/episode_000000.parquet",
         videos={"observation.images.cam": source / "videos/chunk-000/observation.images.cam/episode_000000.mp4"},
+        fps=20.0,
     )
     source_sha = compute_source_fingerprint(source, episode_info)
     manifest = {

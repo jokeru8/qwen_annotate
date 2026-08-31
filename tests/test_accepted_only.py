@@ -10,10 +10,11 @@ import pytest
 
 from robo_annotate.config import AnnotationConfig
 from robo_annotate.converter import convert_dataset
-from robo_annotate.lerobot import DatasetIndex, EpisodeInfo, VideoProbe
+from robo_annotate.lerobot import DatasetIndex, VideoProbe
 from robo_annotate.models import FinalAnnotation
 from robo_annotate.release_validator import validate_release
 from robo_annotate.workspace import EpisodeRecord, WorkspaceStore
+from tests.fixtures import make_episode_info
 
 
 NOW = datetime(2026, 8, 22, 12, tzinfo=UTC)
@@ -70,9 +71,9 @@ def _mixed_workspace(tmp_path: Path) -> tuple[Path, Path, dict]:
             video.parent.mkdir(parents=True)
             video.write_bytes(f"{camera}-source-{source_index}".encode())
             video_paths[camera] = video
-        episodes.append(EpisodeInfo(
+        episodes.append(make_episode_info(
             episode_index=source_index, length=length, task="Arrange.",
-            parquet=parquet, videos=video_paths,
+            parquet=parquet, videos=video_paths, fps=10.0,
         ))
         offset += length
     (meta / "episodes.jsonl").write_text("\n".join(episode_rows) + "\n")
@@ -135,7 +136,7 @@ def _mixed_workspace(tmp_path: Path) -> tuple[Path, Path, dict]:
     services = {
         "probe_video": probe,
         "iter_video_rgb_frames": frames,
-        "extract_frames": lambda path, camera, indices, fps: [
+        "extract_frames": lambda video, camera, indices: [
             type("S", (), {"frame_index": n, "camera_key": camera})() for n in indices
         ],
     }
